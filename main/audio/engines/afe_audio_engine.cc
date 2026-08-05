@@ -254,6 +254,14 @@ void AfeAudioEngine::EnableDeviceAec(bool enable) {
     UpdateAecState();
 }
 
+void AfeAudioEngine::EnableBargeInDetection(bool enable) {
+    const bool changed = barge_in_enabled_.exchange(enable) != enable;
+    barge_in_reset_pending_.store(true);
+    if (changed) {
+        ESP_LOGI("BargeIn", "%s near-end speech detection", enable ? "Enabled" : "Disabled");
+    }
+}
+
 bool AfeAudioEngine::HasWakeWord() const {
     return wake_detector_ != WakeDetector::kNone;
 }
@@ -280,6 +288,10 @@ void AfeAudioEngine::OnOutput(std::function<void(std::vector<int16_t>&& data)> c
 
 void AfeAudioEngine::OnVadStateChange(std::function<void(bool speaking)> callback) {
     vad_state_change_callback_ = std::move(callback);
+}
+
+void AfeAudioEngine::OnBargeInDetected(std::function<void()> callback) {
+    barge_in_detected_callback_ = std::move(callback);
 }
 
 void AfeAudioEngine::UpdateActiveState() {
@@ -423,6 +435,7 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
         ResetAfeDiagnostics();
 #endif
     }
+    HandleBargeInResult(result);
     if (vad_state_change_callback_) {
         if (result->vad_state == VAD_SPEECH && !is_speaking_) {
             is_speaking_ = true;
@@ -450,6 +463,116 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
             output_callback_(std::vector<int16_t>(
                 output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
             output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
+        }
+    }
+}
+
+void AfeAudioEngine::HandleBargeInResult(const afe_fetch_result_t* result) {
+    if (barge_in_reset_pending_.exchange(false)) {
+        barge_in_warmup_samples_ = 0;
+        barge_in_candidate_samples_ = 0;
+        barge_in_correlation_sum_ = 0.0;
+        barge_in_echo_correlation_ = 0.8;
+        barge_in_noise_rms_ = 8.0;
+        barge_in_triggered_ = false;
+        barge_in_last_diagnostic_us_ = 0;
+    }
+    if (!barge_in_enabled_.load() || barge_in_triggered_ || result->data == nullptr || result->data_size <= 0) {
+        return;
+    }
+
+    const uint32_t samples = result->data_size / sizeof(int16_t);
+    uint64_t post_sum_squares = 0;
+    uint32_t post_peak = 0;
+    for (uint32_t i = 0; i < samples; ++i) {
+        const int32_t sample = result->data[i];
+        post_sum_squares += static_cast<int64_t>(sample) * sample;
+        post_peak = std::max(post_peak, static_cast<uint32_t>(std::abs(sample)));
+    }
+    const double post_rms = std::sqrt(static_cast<double>(post_sum_squares) / samples);
+
+    bool has_reference = result->raw_data != nullptr && result->raw_data_channels >= 2;
+    double reference_rms = 0.0;
+    double correlation = 0.0;
+    if (has_reference) {
+        const int channels = result->raw_data_channels;
+        int64_t mic_sum = 0;
+        int64_t reference_sum = 0;
+        uint64_t mic_sum_squares = 0;
+        uint64_t reference_sum_squares = 0;
+        int64_t products = 0;
+        for (uint32_t i = 0; i < samples; ++i) {
+            const int32_t mic = result->raw_data[i * channels];
+            const int32_t reference = result->raw_data[i * channels + channels - 1];
+            mic_sum += mic;
+            reference_sum += reference;
+            mic_sum_squares += static_cast<int64_t>(mic) * mic;
+            reference_sum_squares += static_cast<int64_t>(reference) * reference;
+            products += static_cast<int64_t>(mic) * reference;
+        }
+        const long double count = samples;
+        const long double covariance = products - static_cast<long double>(mic_sum) * reference_sum / count;
+        const long double mic_variance = mic_sum_squares - static_cast<long double>(mic_sum) * mic_sum / count;
+        const long double reference_variance = reference_sum_squares -
+            static_cast<long double>(reference_sum) * reference_sum / count;
+        if (mic_variance > 0 && reference_variance > 0) {
+            correlation = static_cast<double>(covariance / std::sqrt(mic_variance * reference_variance));
+        }
+        reference_rms = std::sqrt(static_cast<double>(reference_sum_squares) / samples);
+        has_reference = reference_rms >= 256.0;
+    }
+
+    if (result->vad_state == VAD_SILENCE) {
+        barge_in_noise_rms_ = barge_in_noise_rms_ * 0.96 + post_rms * 0.04;
+    }
+
+    if (has_reference && barge_in_warmup_samples_ < kBargeInWarmupSamples) {
+        barge_in_correlation_sum_ += std::abs(correlation) * samples;
+        barge_in_warmup_samples_ += samples;
+        if (barge_in_warmup_samples_ >= kBargeInWarmupSamples) {
+            barge_in_echo_correlation_ = barge_in_correlation_sum_ / barge_in_warmup_samples_;
+            ESP_LOGI("BargeIn", "Echo baseline ready: corr=%.3f noise_rms=%.0f",
+                barge_in_echo_correlation_, barge_in_noise_rms_);
+        }
+        return;
+    }
+
+    const double minimum_rms = std::max(20.0, barge_in_noise_rms_ * 2.5);
+    const double correlation_limit = std::clamp(barge_in_echo_correlation_ - 0.15, 0.45, 0.68);
+    const bool near_end_frame = result->vad_state == VAD_SPEECH &&
+        post_rms >= minimum_rms && post_peak >= 150 &&
+        (!has_reference || std::abs(correlation) <= correlation_limit);
+
+    const int64_t now = esp_timer_get_time();
+    if (now - barge_in_last_diagnostic_us_ >= 1000000) {
+        barge_in_last_diagnostic_us_ = now;
+        ESP_LOGI("BargeIn",
+            "candidate: vad=%s post_rms=%.0f peak=%" PRIu32
+            " noise=%.0f ref=%s corr=%.3f limit=%.3f warmup=%" PRIu32 "ms accepted=%s",
+            result->vad_state == VAD_SPEECH ? "speech" : "silence", post_rms, post_peak,
+            barge_in_noise_rms_, has_reference ? "yes" : "no", correlation, correlation_limit,
+            barge_in_warmup_samples_ * 1000 / 16000, near_end_frame ? "yes" : "no");
+    }
+
+    if (near_end_frame) {
+        barge_in_candidate_samples_ += samples;
+    } else if (result->vad_state == VAD_SPEECH) {
+        const uint32_t decay = samples / 2;
+        barge_in_candidate_samples_ = barge_in_candidate_samples_ > decay
+            ? barge_in_candidate_samples_ - decay : 0;
+    } else {
+        barge_in_candidate_samples_ = 0;
+    }
+
+    if (barge_in_candidate_samples_ >= kBargeInMinSpeechSamples) {
+        barge_in_triggered_ = true;
+        ESP_LOGI("BargeIn",
+            "Near-end speech confirmed: post_rms=%.0f peak=%" PRIu32
+            " corr=%.3f limit=%.3f ref_rms=%.0f duration_ms=%" PRIu32,
+            post_rms, post_peak, correlation, correlation_limit, reference_rms,
+            barge_in_candidate_samples_ * 1000 / 16000);
+        if (barge_in_detected_callback_) {
+            barge_in_detected_callback_();
         }
     }
 }

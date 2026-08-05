@@ -99,6 +99,11 @@ void AudioService::Initialize(AudioCodec* codec) {
             callbacks_.on_vad_change(speaking);
         }
     });
+    audio_engine_->OnBargeInDetected([this]() {
+        if (callbacks_.on_barge_in_detected) {
+            callbacks_.on_barge_in_detected();
+        }
+    });
     audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
         if (callbacks_.on_wake_word_detected) {
@@ -700,6 +705,12 @@ void AudioService::EnableDeviceAec(bool enable) {
         audio_engine_->EnableDeviceAec(enable);
     } else {
         ESP_LOGI(TAG, "Deferring AEC change until the audio engine is initialized");
+    }
+}
+
+void AudioService::EnableBargeInDetection(bool enable) {
+    if (audio_engine_initialized_) {
+        audio_engine_->EnableBargeInDetection(enable);
     }
 }
 

@@ -80,6 +80,9 @@ void Application::Initialize() {
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
+    callbacks.on_barge_in_detected = [this]() {
+        xEventGroupSetBits(event_group_, MAIN_EVENT_BARGE_IN_DETECTED);
+    };
     callbacks.on_playback_drained = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     };
@@ -174,7 +177,7 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_BARGE_IN_DETECTED;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -245,6 +248,17 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+            }
+        }
+
+        if (bits & MAIN_EVENT_BARGE_IN_DETECTED) {
+            if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+                ESP_LOGI(TAG, "Barge-in confirmed, stopping playback locally");
+                barge_in_detection_active_.store(false);
+                audio_service_.EnableBargeInDetection(false);
+                AbortSpeaking(kAbortReasonNone);
+                audio_service_.ResetDecoder();
+                SetListeningMode(GetDefaultListeningMode());
             }
         }
 
@@ -516,7 +530,10 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+            if (!barge_in_detection_active_.exchange(true)) {
+                audio_service_.EnableBargeInDetection(true);
+            }
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -909,6 +926,10 @@ void Application::HandleStateChangedEvent() {
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
+    if (new_state != kDeviceStateSpeaking) {
+        barge_in_detection_active_.store(false);
+        audio_service_.EnableBargeInDetection(false);
+    }
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -957,6 +978,8 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();
+            barge_in_detection_active_.store(false);
+            audio_service_.EnableBargeInDetection(false);
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);

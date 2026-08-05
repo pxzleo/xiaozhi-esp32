@@ -23,6 +23,7 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void EnableBargeInDetection(bool enable) override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -33,6 +34,7 @@ public:
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) override;
     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
+    void OnBargeInDetected(std::function<void()> callback) override;
 
     void EncodeWakeWordData() override;
     bool GetWakeWordOpus(std::vector<uint8_t>& opus) override;

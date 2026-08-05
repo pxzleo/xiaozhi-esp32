@@ -31,6 +31,7 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void EnableBargeInDetection(bool enable) override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -41,6 +42,7 @@ public:
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) override;
     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
+    void OnBargeInDetected(std::function<void()> callback) override;
 
     void EncodeWakeWordData() override;
     bool GetWakeWordOpus(std::vector<uint8_t>& opus) override;
@@ -88,6 +90,19 @@ private:
     std::function<void(const std::string&)> wake_word_detected_callback_;
     std::function<void(std::vector<int16_t>&&)> output_callback_;
     std::function<void(bool)> vad_state_change_callback_;
+    std::function<void()> barge_in_detected_callback_;
+
+    static constexpr uint32_t kBargeInWarmupSamples = 8000;
+    static constexpr uint32_t kBargeInMinSpeechSamples = 1920;
+    std::atomic<bool> barge_in_enabled_{false};
+    std::atomic<bool> barge_in_reset_pending_{false};
+    uint32_t barge_in_warmup_samples_ = 0;
+    uint32_t barge_in_candidate_samples_ = 0;
+    double barge_in_correlation_sum_ = 0.0;
+    double barge_in_echo_correlation_ = 0.8;
+    double barge_in_noise_rms_ = 8.0;
+    bool barge_in_triggered_ = false;
+    int64_t barge_in_last_diagnostic_us_ = 0;
 
     TaskHandle_t wake_word_encode_task_ = nullptr;
     StaticTask_t* wake_word_encode_task_buffer_ = nullptr;
@@ -114,6 +129,7 @@ private:
     void OutputRawAudio(const std::vector<int16_t>& data);
     void HandleWakeWordResult(const afe_fetch_result_t* result);
     void HandleVoiceResult(const afe_fetch_result_t* result);
+    void HandleBargeInResult(const afe_fetch_result_t* result);
 #if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
     void ResetAfeDiagnostics();
     void AccumulateAfeDiagnostics(const afe_fetch_result_t* result);

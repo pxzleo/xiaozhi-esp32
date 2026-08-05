@@ -107,6 +107,14 @@ void LiteAudioEngine::OnVadStateChange(std::function<void(bool speaking)> callba
     vad_state_change_callback_ = std::move(callback);
 }
 
+void LiteAudioEngine::EnableBargeInDetection(bool enable) {
+    (void)enable;
+}
+
+void LiteAudioEngine::OnBargeInDetected(std::function<void()> callback) {
+    (void)callback;
+}
+
 void LiteAudioEngine::EncodeWakeWordData() {
     if (wake_word_) {
         wake_word_->EncodeWakeWordData();
