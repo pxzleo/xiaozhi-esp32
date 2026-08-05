@@ -808,6 +808,7 @@ def main():
     parser.add_argument('--sdkconfig', required=True, help='Path to sdkconfig file')
     parser.add_argument('--builtin_text_font', help='Builtin text font name (e.g., font_noto_sans_basic_16_4)')
     parser.add_argument('--emoji_collection', help='Default emoji collection name (e.g., noto-color-emoji_32)')
+    parser.add_argument('--emoji_collection_dir', help='Direct path to a board-local emoji collection')
     parser.add_argument('--output', required=True, help='Output path for assets.bin')
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
     parser.add_argument('--noto_fonts_path', help='Path to noto-fonts component directory')
@@ -831,6 +832,7 @@ def main():
     print(f"  sdkconfig: {args.sdkconfig}")
     print(f"  builtin_text_font: {args.builtin_text_font}")
     print(f"  emoji_collection: {args.emoji_collection}")
+    print(f"  emoji_collection_dir: {args.emoji_collection_dir}")
     print(f"  output: {args.output}")
     
     # Read wake word type configuration from sdkconfig
@@ -882,7 +884,13 @@ def main():
     # Calculate project root from script location for otto-gif support
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    emoji_collection_path = get_emoji_collection_path(args.emoji_collection, args.noto_fonts_path, project_root)
+    if args.emoji_collection_dir:
+        emoji_collection_path = os.path.abspath(args.emoji_collection_dir)
+        if not os.path.isdir(emoji_collection_path):
+            raise ValueError(f"Emoji collection directory not found: {emoji_collection_path}")
+    else:
+        emoji_collection_path = get_emoji_collection_path(
+            args.emoji_collection, args.noto_fonts_path, project_root)
     
     # Get extra files path if provided
     extra_files_path = args.extra_files

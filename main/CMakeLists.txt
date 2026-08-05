@@ -414,7 +414,8 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C)
     set(BOARD_TYPE "esp32-s3-touch-lcd-1.85c")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
     set(BUILTIN_ICON_FONT font_material_symbols_16_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(DEFAULT_EMOJI_COLLECTION_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/custom-emoji-96/png")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-1.85b")
@@ -1219,8 +1220,14 @@ function(build_default_assets_bin)
         endif()
     endif()
 
-    # Add default emoji collection if defined
-    if(DEFAULT_EMOJI_COLLECTION)
+    # Add a board-local emoji collection when supplied, otherwise use xiaozhi-fonts.
+    if(DEFAULT_EMOJI_COLLECTION_DIR)
+        list(APPEND BUILD_ARGS "--emoji_collection_dir" "${DEFAULT_EMOJI_COLLECTION_DIR}")
+        file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
+            "${DEFAULT_EMOJI_COLLECTION_DIR}/*"
+        )
+        list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EMOJI_FILES})
+    elseif(DEFAULT_EMOJI_COLLECTION)
         list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION}")
         file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
             "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"

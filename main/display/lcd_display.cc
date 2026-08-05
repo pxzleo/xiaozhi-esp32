@@ -12,12 +12,109 @@
 #include <noto_emoji.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "board.h"
 
 #define TAG "LcdDisplay"
+
+namespace {
+
+constexpr int kRoundScreenSize = 360;
+constexpr int kRoundChatTop = 196;
+constexpr int kRoundChatLineStep = 20;
+constexpr int kRoundChatLineCount = 7;
+constexpr int kRoundScreenRadius = 169;
+constexpr int kRoundTextMargin = 16;
+
+size_t Utf8CharSize(const char* text) {
+    const auto first = static_cast<unsigned char>(text[0]);
+    if ((first & 0x80) == 0) return 1;
+    if ((first & 0xE0) == 0xC0) return 2;
+    if ((first & 0xF0) == 0xE0) return 3;
+    if ((first & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+bool IsAsciiSpace(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r';
+}
+
+int RoundLineWidth(int line) {
+    const int y = kRoundChatTop + line * kRoundChatLineStep + kRoundChatLineStep / 2;
+    const int dy = y - kRoundScreenSize / 2;
+    const double half_chord = std::sqrt(
+        static_cast<double>(kRoundScreenRadius * kRoundScreenRadius - dy * dy));
+    return static_cast<int>(half_chord * 2) - kRoundTextMargin * 2;
+}
+
+bool TextFits(const std::string& text, const lv_font_t* font, int width) {
+    lv_point_t size{};
+    lv_text_get_size(&size, text.c_str(), font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    return size.x <= width;
+}
+
+std::vector<std::string> WrapRoundText(const char* content, const lv_font_t* font) {
+    std::string text = content != nullptr ? content : "";
+    std::vector<std::string> lines;
+    size_t pos = 0;
+
+    for (int line = 0; line < kRoundChatLineCount && pos < text.size(); ++line) {
+        while (pos < text.size() && (IsAsciiSpace(text[pos]) || text[pos] == '\n')) ++pos;
+        if (pos >= text.size()) break;
+
+        const size_t start = pos;
+        size_t best_end = start;
+        size_t last_space = std::string::npos;
+        bool forced_newline = false;
+        while (pos < text.size()) {
+            if (text[pos] == '\n') {
+                forced_newline = true;
+                break;
+            }
+            const size_t next = std::min(text.size(), pos + Utf8CharSize(text.c_str() + pos));
+            const std::string candidate = text.substr(start, next - start);
+            if (!TextFits(candidate, font, RoundLineWidth(line))) break;
+            if (IsAsciiSpace(text[pos])) last_space = pos;
+            best_end = next;
+            pos = next;
+        }
+
+        if (best_end == start) {
+            best_end = std::min(text.size(), start + Utf8CharSize(text.c_str() + start));
+            pos = best_end;
+        } else if (!forced_newline && pos < text.size() && last_space != std::string::npos &&
+                   last_space > start) {
+            best_end = last_space;
+            pos = last_space + 1;
+        }
+
+        std::string value = text.substr(start, best_end - start);
+        while (!value.empty() && IsAsciiSpace(value.back())) value.pop_back();
+        lines.push_back(std::move(value));
+        if (forced_newline) ++pos;
+    }
+
+    if (pos < text.size() && !lines.empty()) {
+        std::string& last = lines.back();
+        const int width = RoundLineWidth(static_cast<int>(lines.size()) - 1);
+        while (!last.empty() && !TextFits(last + "...", font, width)) {
+            size_t erase_at = last.size() - 1;
+            while (erase_at > 0 &&
+                   (static_cast<unsigned char>(last[erase_at]) & 0xC0) == 0x80) {
+                --erase_at;
+            }
+            last.erase(erase_at);
+        }
+        last += "...";
+    }
+    return lines;
+}
+
+}  // namespace
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
@@ -853,7 +950,9 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    // Keep the avatar in the upper half on the 360x360 Waveshare round display.
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0,
+                 (width_ == kRoundScreenSize && height_ == kRoundScreenSize) ? -64 : 0);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
@@ -944,6 +1043,30 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
+    if (width_ == kRoundScreenSize && height_ == kRoundScreenSize) {
+        /* Round-screen subtitles: one label per line, each sized to the circle chord. */
+        bottom_bar_ = lv_obj_create(screen);
+        lv_obj_set_size(bottom_bar_, LV_HOR_RES, kRoundChatLineCount * kRoundChatLineStep);
+        lv_obj_set_style_radius(bottom_bar_, 0, 0);
+        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bottom_bar_, 0, 0);
+        lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
+        lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(bottom_bar_, LV_ALIGN_TOP_MID, 0, kRoundChatTop);
+
+        for (int line = 0; line < kRoundChatLineCount; ++line) {
+            lv_obj_t* label = lv_label_create(bottom_bar_);
+            lv_label_set_text(label, "");
+            lv_obj_set_size(label, RoundLineWidth(line), kRoundChatLineStep);
+            lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(label, lvgl_theme->text_color(), 0);
+            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, line * kRoundChatLineStep);
+            round_chat_labels_.push_back(label);
+        }
+        chat_message_label_ = round_chat_labels_.front();
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    } else {
 #if CONFIG_USE_MULTILINE_CHAT_MESSAGE
     /* Bottom bar - auto height, grows upward with wrapped text */
     bottom_bar_ = lv_obj_create(screen);
@@ -1000,6 +1123,7 @@ void LcdDisplay::SetupUI() {
                                    LV_PART_MAIN);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
 #endif
+    }
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -1066,8 +1190,16 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         }
         return;
     }
-    lv_anim_delete(chat_message_label_, nullptr);
-    lv_label_set_text(chat_message_label_, content);
+    if (!round_chat_labels_.empty()) {
+        const auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+        const auto lines = WrapRoundText(content, lvgl_theme->text_font()->font());
+        for (size_t i = 0; i < round_chat_labels_.size(); ++i) {
+            lv_label_set_text(round_chat_labels_[i], i < lines.size() ? lines[i].c_str() : "");
+        }
+    } else {
+        lv_anim_delete(chat_message_label_, nullptr);
+        lv_label_set_text(chat_message_label_, content != nullptr ? content : "");
+    }
     // Show bottom_bar_ only when there is content (and subtitle is not globally hidden)
     if (bottom_bar_ != nullptr) {
         if (content == nullptr || content[0] == '\0') {
@@ -1088,7 +1220,9 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
     // In non-wechat mode, just clear the chat message label and hide the bar
-    if (chat_message_label_ != nullptr) {
+    if (!round_chat_labels_.empty()) {
+        for (auto* label : round_chat_labels_) lv_label_set_text(label, "");
+    } else if (chat_message_label_ != nullptr) {
         lv_label_set_text(chat_message_label_, "");
     }
     if (bottom_bar_ != nullptr) {
