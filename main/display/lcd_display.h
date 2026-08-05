@@ -29,6 +29,10 @@ protected:
     lv_obj_t* emoji_image_ = nullptr;
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
+    lv_timer_t* neutral_idle_timer_ = nullptr;
+    bool neutral_idle_active_ = false;
+    int neutral_idle_animation_ = -1;
+    size_t neutral_idle_frame_ = 0;
     lv_obj_t* chat_message_label_ = nullptr;
     std::vector<lv_obj_t*> round_chat_labels_;
     esp_timer_handle_t preview_timer_ = nullptr;
@@ -36,6 +40,10 @@ protected:
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
     void InitializeLcdThemes();
+    void StartNeutralIdleAnimation();
+    void StopNeutralIdleAnimation();
+    void AdvanceNeutralIdleAnimation();
+    void ShowNeutralIdleFrame(const char* emotion, int offset_x, int offset_y);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 

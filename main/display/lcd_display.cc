@@ -30,6 +30,49 @@ constexpr int kRoundChatLineStep = 20;
 constexpr int kRoundChatLineCount = 7;
 constexpr int kRoundScreenRadius = 169;
 constexpr int kRoundTextMargin = 16;
+constexpr uint32_t kNeutralIdleDelayMinMs = 2200;
+constexpr uint32_t kNeutralIdleDelayMaxMs = 5200;
+
+struct NeutralIdleFrame {
+    const char* emotion;
+    int8_t offset_x;
+    int8_t offset_y;
+    uint16_t duration_ms;
+};
+
+struct NeutralIdleSequence {
+    const NeutralIdleFrame* frames;
+    size_t frame_count;
+};
+
+// Reuse the matching custom emoji set as keyframes so idle motion never changes
+// character design or consumes another large group of animation assets.
+constexpr NeutralIdleFrame kLookAroundFrames[] = {
+    {"thinking", -4, 0, 420},
+    {"confident", 4, 0, 460},
+    {"thinking", -3, 0, 380},
+};
+constexpr NeutralIdleFrame kBlinkFrames[] = {
+    {"relaxed", 0, 0, 150},
+    {"neutral", 0, 0, 180},
+    {"relaxed", 0, 0, 120},
+};
+constexpr NeutralIdleFrame kWhistleFrames[] = {
+    {"kissy", 0, -2, 520},
+    {"kissy", 0, 1, 260},
+    {"kissy", 0, -1, 420},
+};
+constexpr NeutralIdleFrame kPonderFrames[] = {
+    {"thinking", -2, 0, 760},
+    {"confused", 1, 1, 520},
+    {"thinking", -1, 0, 680},
+};
+constexpr NeutralIdleSequence kNeutralIdleSequences[] = {
+    {kLookAroundFrames, sizeof(kLookAroundFrames) / sizeof(kLookAroundFrames[0])},
+    {kBlinkFrames, sizeof(kBlinkFrames) / sizeof(kBlinkFrames[0])},
+    {kWhistleFrames, sizeof(kWhistleFrames) / sizeof(kWhistleFrames[0])},
+    {kPonderFrames, sizeof(kPonderFrames) / sizeof(kPonderFrames[0])},
+};
 
 size_t Utf8CharSize(const char* text) {
     const auto first = static_cast<unsigned char>(text[0]);
@@ -389,6 +432,11 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
+
+    if (neutral_idle_timer_ != nullptr) {
+        lv_timer_delete(neutral_idle_timer_);
+        neutral_idle_timer_ = nullptr;
+    }
 
     // Clean up GIF controller
     if (gif_controller_) {
@@ -971,6 +1019,13 @@ void LcdDisplay::SetupUI() {
         // size at 96x96, which can be clipped/refreshed as if it were unscaled.
         lv_obj_set_size(emoji_image_, kRoundAvatarSize, kRoundAvatarSize);
         lv_image_set_inner_align(emoji_image_, LV_IMAGE_ALIGN_STRETCH);
+        neutral_idle_timer_ = lv_timer_create(
+            [](lv_timer_t* timer) {
+                auto* display = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+                display->AdvanceNeutralIdleAnimation();
+            },
+            kNeutralIdleDelayMinMs, this);
+        lv_timer_pause(neutral_idle_timer_);
     }
     lv_obj_center(emoji_image_);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
@@ -1283,6 +1338,10 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     }
 
     DisplayLockGuard lock(this);
+    const bool is_neutral = strcmp(emotion, "neutral") == 0;
+    if (!is_neutral) {
+        StopNeutralIdleAnimation();
+    }
     // Stop any running GIF animation in the same lock scope as setting new image
     // to prevent LVGL from accessing freed image data between operations
     if (gif_controller_) {
@@ -1315,6 +1374,10 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     }
 
+    if (is_neutral) {
+        StartNeutralIdleAnimation();
+    }
+
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
     // In WeChat message style, if emotion is neutral, don't display it
     uint32_t child_count = lv_obj_get_child_cnt(content_);
@@ -1329,6 +1392,69 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 #endif
+}
+
+void LcdDisplay::StartNeutralIdleAnimation() {
+    if (neutral_idle_timer_ == nullptr) return;
+
+    neutral_idle_active_ = true;
+    neutral_idle_animation_ = -1;
+    neutral_idle_frame_ = 0;
+    lv_obj_set_style_translate_x(emoji_box_, 0, 0);
+    lv_obj_set_style_translate_y(emoji_box_, 0, 0);
+    lv_timer_set_period(neutral_idle_timer_,
+                        lv_rand(kNeutralIdleDelayMinMs, kNeutralIdleDelayMaxMs));
+    lv_timer_reset(neutral_idle_timer_);
+    lv_timer_resume(neutral_idle_timer_);
+}
+
+void LcdDisplay::StopNeutralIdleAnimation() {
+    neutral_idle_active_ = false;
+    neutral_idle_animation_ = -1;
+    neutral_idle_frame_ = 0;
+    if (neutral_idle_timer_ != nullptr) lv_timer_pause(neutral_idle_timer_);
+    if (emoji_box_ != nullptr) {
+        lv_obj_set_style_translate_x(emoji_box_, 0, 0);
+        lv_obj_set_style_translate_y(emoji_box_, 0, 0);
+    }
+}
+
+void LcdDisplay::ShowNeutralIdleFrame(const char* emotion, int offset_x, int offset_y) {
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto collection = theme != nullptr ? theme->emoji_collection() : nullptr;
+    const auto* image = collection != nullptr ? collection->GetEmojiImage(emotion) : nullptr;
+    if (image == nullptr || image->IsGif()) return;
+
+    lv_image_set_src(emoji_image_, image->image_dsc());
+    lv_obj_set_style_translate_x(emoji_box_, offset_x, 0);
+    lv_obj_set_style_translate_y(emoji_box_, offset_y, 0);
+}
+
+void LcdDisplay::AdvanceNeutralIdleAnimation() {
+    if (!neutral_idle_active_ || neutral_idle_timer_ == nullptr) return;
+
+    if (neutral_idle_animation_ < 0) {
+        neutral_idle_animation_ =
+            static_cast<int>(lv_rand(0, sizeof(kNeutralIdleSequences) /
+                                           sizeof(kNeutralIdleSequences[0]) - 1));
+        neutral_idle_frame_ = 0;
+    } else {
+        ++neutral_idle_frame_;
+    }
+
+    const auto& sequence = kNeutralIdleSequences[neutral_idle_animation_];
+    if (neutral_idle_frame_ >= sequence.frame_count) {
+        ShowNeutralIdleFrame("neutral", 0, 0);
+        neutral_idle_animation_ = -1;
+        neutral_idle_frame_ = 0;
+        lv_timer_set_period(neutral_idle_timer_,
+                            lv_rand(kNeutralIdleDelayMinMs, kNeutralIdleDelayMaxMs));
+        return;
+    }
+
+    const auto& frame = sequence.frames[neutral_idle_frame_];
+    ShowNeutralIdleFrame(frame.emotion, frame.offset_x, frame.offset_y);
+    lv_timer_set_period(neutral_idle_timer_, frame.duration_ms);
 }
 
 void LcdDisplay::SetTheme(Theme* theme) {
