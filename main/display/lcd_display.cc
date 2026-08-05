@@ -47,31 +47,19 @@ struct NeutralIdleSequence {
 
 // Reuse the matching custom emoji set as keyframes so idle motion never changes
 // character design or consumes another large group of animation assets.
-constexpr NeutralIdleFrame kLookAroundFrames[] = {
-    {"thinking", -4, 0, 420},
-    {"confident", 4, 0, 460},
-    {"thinking", -3, 0, 380},
-};
 constexpr NeutralIdleFrame kBlinkFrames[] = {
     {"relaxed", 0, 0, 150},
     {"neutral", 0, 0, 180},
     {"relaxed", 0, 0, 120},
 };
-constexpr NeutralIdleFrame kWhistleFrames[] = {
+constexpr NeutralIdleFrame kKissFrames[] = {
     {"kissy", 0, -2, 520},
     {"kissy", 0, 1, 260},
     {"kissy", 0, -1, 420},
 };
-constexpr NeutralIdleFrame kPonderFrames[] = {
-    {"thinking", -2, 0, 760},
-    {"confused", 1, 1, 520},
-    {"thinking", -1, 0, 680},
-};
 constexpr NeutralIdleSequence kNeutralIdleSequences[] = {
-    {kLookAroundFrames, sizeof(kLookAroundFrames) / sizeof(kLookAroundFrames[0])},
     {kBlinkFrames, sizeof(kBlinkFrames) / sizeof(kBlinkFrames[0])},
-    {kWhistleFrames, sizeof(kWhistleFrames) / sizeof(kWhistleFrames[0])},
-    {kPonderFrames, sizeof(kPonderFrames) / sizeof(kPonderFrames[0])},
+    {kKissFrames, sizeof(kKissFrames) / sizeof(kKissFrames[0])},
 };
 
 size_t Utf8CharSize(const char* text) {
