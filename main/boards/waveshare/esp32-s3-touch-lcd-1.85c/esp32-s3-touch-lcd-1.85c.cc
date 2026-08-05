@@ -37,6 +37,9 @@ private:
     static constexpr size_t kAfeChannels = 2;
     static constexpr int64_t kPlaybackHoldUs = 250000;
     static constexpr uint32_t kReportSamples = 16000;
+    static constexpr float kMicrophoneGainDb = 9.0f;
+    static constexpr float kReferenceGainDb = 30.0f;
+    static constexpr float kUnusedChannelGainDb = 0.0f;
 
     struct ChannelStats {
         int64_t sum = 0;
@@ -193,11 +196,16 @@ public:
                 .mclk_multiple = 0,
             };
             ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
-            for (int channel = 0; channel < 4; ++channel) {
-                ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
-                    input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(channel), input_gain_));
-            }
-            ESP_LOGI("AecDiag", "Raw four-channel ES7210 capture enabled");
+            ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), kMicrophoneGainDb));
+            ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), kMicrophoneGainDb));
+            ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), kReferenceGainDb));
+            ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3), kUnusedChannelGainDb));
+            ESP_LOGI("AecDiag", "Raw ES7210 capture enabled: MIC1/MIC2=%.0f dB, AEC reference=%.0f dB",
+                kMicrophoneGainDb, kReferenceGainDb);
         } else {
             ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
             ResetDiagnostics();
