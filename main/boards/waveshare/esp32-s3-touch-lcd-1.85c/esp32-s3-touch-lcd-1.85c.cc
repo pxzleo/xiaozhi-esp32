@@ -17,11 +17,195 @@
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
 #define TAG "waveshare_lcd_1_85c"
 
 #define LCD_OPCODE_WRITE_CMD        (0x02ULL)
 #define LCD_OPCODE_READ_CMD         (0x0BULL)
 #define LCD_OPCODE_WRITE_COLOR      (0x32ULL)
+
+#ifdef CONFIG_VERSION_2_0
+class WaveshareV2AecDiagnosticCodec : public BoxAudioCodec {
+private:
+    static constexpr size_t kRawChannels = 4;
+    static constexpr size_t kAfeChannels = 2;
+    static constexpr int64_t kPlaybackHoldUs = 250000;
+    static constexpr uint32_t kReportSamples = 16000;
+
+    struct ChannelStats {
+        int64_t sum = 0;
+        uint64_t sum_squares = 0;
+        uint32_t peak = 0;
+        uint32_t clipped = 0;
+    };
+
+    std::vector<int16_t> raw_buffer_;
+    std::array<ChannelStats, kRawChannels> channel_stats_ = {};
+    std::array<int64_t, kRawChannels - 1> reference_products_ = {};
+    std::atomic<int64_t> playback_active_until_us_ = 0;
+    std::atomic<uint32_t> playback_rms_ = 0;
+    uint32_t diagnostic_samples_ = 0;
+
+    static double CalculateRms(const ChannelStats& stats, uint32_t samples) {
+        return samples == 0 ? 0.0 : std::sqrt(static_cast<double>(stats.sum_squares) / samples);
+    }
+
+    double CalculateCorrelation(size_t channel) const {
+        if (diagnostic_samples_ == 0 || channel == 1 || channel >= kRawChannels) {
+            return channel == 1 ? 1.0 : 0.0;
+        }
+
+        const auto& lhs = channel_stats_[channel];
+        const auto& rhs = channel_stats_[1];
+        const size_t product_index = channel < 1 ? channel : channel - 1;
+        const long double count = diagnostic_samples_;
+        const long double covariance = reference_products_[product_index] -
+            static_cast<long double>(lhs.sum) * rhs.sum / count;
+        const long double lhs_variance = lhs.sum_squares -
+            static_cast<long double>(lhs.sum) * lhs.sum / count;
+        const long double rhs_variance = rhs.sum_squares -
+            static_cast<long double>(rhs.sum) * rhs.sum / count;
+        if (lhs_variance <= 0 || rhs_variance <= 0) {
+            return 0.0;
+        }
+        return static_cast<double>(covariance / std::sqrt(lhs_variance * rhs_variance));
+    }
+
+    void ResetDiagnostics() {
+        channel_stats_ = {};
+        reference_products_ = {};
+        diagnostic_samples_ = 0;
+    }
+
+    void AccumulateDiagnostics(const int16_t* frame) {
+        for (size_t channel = 0; channel < kRawChannels; ++channel) {
+            const int32_t sample = frame[channel];
+            auto& stats = channel_stats_[channel];
+            stats.sum += sample;
+            stats.sum_squares += static_cast<int64_t>(sample) * sample;
+            stats.peak = std::max(stats.peak, static_cast<uint32_t>(std::abs(sample)));
+            if (sample <= -32760 || sample >= 32760) {
+                ++stats.clipped;
+            }
+            if (channel != 1) {
+                const size_t product_index = channel < 1 ? channel : channel - 1;
+                reference_products_[product_index] += static_cast<int64_t>(sample) * frame[1];
+            }
+        }
+        ++diagnostic_samples_;
+    }
+
+    void ReportDiagnostics() {
+        std::array<double, kRawChannels> rms = {};
+        std::array<double, kRawChannels> clipped_percent = {};
+        for (size_t channel = 0; channel < kRawChannels; ++channel) {
+            rms[channel] = CalculateRms(channel_stats_[channel], diagnostic_samples_);
+            clipped_percent[channel] = diagnostic_samples_ == 0 ? 0.0 :
+                100.0 * channel_stats_[channel].clipped / diagnostic_samples_;
+        }
+
+        ESP_LOGI("AecDiag",
+            "playback_rms=%" PRIu32 " raw_rms=[%.0f,%.0f,%.0f,%.0f] "
+            "peak=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] "
+            "clip_pct=[%.2f,%.2f,%.2f,%.2f] corr_to_raw1=[%.3f,1.000,%.3f,%.3f] "
+            "AFE_route=M:raw0,R:raw1 samples=%" PRIu32,
+            playback_rms_.load(), rms[0], rms[1], rms[2], rms[3],
+            channel_stats_[0].peak, channel_stats_[1].peak,
+            channel_stats_[2].peak, channel_stats_[3].peak,
+            clipped_percent[0], clipped_percent[1], clipped_percent[2], clipped_percent[3],
+            CalculateCorrelation(0), CalculateCorrelation(2), CalculateCorrelation(3), diagnostic_samples_);
+        ResetDiagnostics();
+    }
+
+protected:
+    int Read(int16_t* dest, int samples) override {
+        if (!input_enabled_ || samples <= 0) {
+            return samples;
+        }
+
+        const size_t frames = samples / kAfeChannels;
+        raw_buffer_.resize(frames * kRawChannels);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_codec_dev_read(input_dev_, raw_buffer_.data(), raw_buffer_.size() * sizeof(int16_t)));
+
+        const bool playback_active = esp_timer_get_time() <= playback_active_until_us_.load();
+        for (size_t frame_index = 0; frame_index < frames; ++frame_index) {
+            const int16_t* raw_frame = raw_buffer_.data() + frame_index * kRawChannels;
+            // Preserve the current AFE route while observing every ES7210 TDM slot.
+            dest[frame_index * kAfeChannels] = raw_frame[0];
+            dest[frame_index * kAfeChannels + 1] = raw_frame[1];
+            if (playback_active) {
+                AccumulateDiagnostics(raw_frame);
+            }
+        }
+
+        if (diagnostic_samples_ >= kReportSamples) {
+            ReportDiagnostics();
+        }
+        return samples;
+    }
+
+    int Write(const int16_t* data, int samples) override {
+        uint64_t sum_squares = 0;
+        uint32_t peak = 0;
+        for (int i = 0; i < samples; ++i) {
+            const int32_t sample = data[i];
+            sum_squares += static_cast<int64_t>(sample) * sample;
+            peak = std::max(peak, static_cast<uint32_t>(std::abs(sample)));
+        }
+        if (samples > 0) {
+            playback_rms_ = static_cast<uint32_t>(
+                std::sqrt(static_cast<double>(sum_squares) / samples));
+        }
+        if (peak >= 64) {
+            playback_active_until_us_ = esp_timer_get_time() + kPlaybackHoldUs;
+        }
+        return BoxAudioCodec::Write(data, samples);
+    }
+
+public:
+    WaveshareV2AecDiagnosticCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
+        gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
+        gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference)
+        : BoxAudioCodec(i2c_master_handle, input_sample_rate, output_sample_rate,
+              mclk, bclk, ws, dout, din, pa_pin, es8311_addr, es7210_addr, input_reference) {}
+
+    void EnableInput(bool enable) override {
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        if (enable == input_enabled_) {
+            return;
+        }
+        if (enable) {
+            esp_codec_dev_sample_info_t fs = {
+                .bits_per_sample = 16,
+                .channel = 4,
+                .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) |
+                    ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1) |
+                    ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) |
+                    ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3),
+                .sample_rate = static_cast<uint32_t>(output_sample_rate_),
+                .mclk_multiple = 0,
+            };
+            ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+            for (int channel = 0; channel < 4; ++channel) {
+                ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+                    input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(channel), input_gain_));
+            }
+            ESP_LOGI("AecDiag", "Raw four-channel ES7210 capture enabled");
+        } else {
+            ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+            ResetDiagnostics();
+        }
+        AudioCodec::EnableInput(enable);
+    }
+};
+#endif
 
 static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
@@ -387,7 +571,7 @@ public:
 
     #ifdef CONFIG_VERSION_2_0
     virtual AudioCodec* GetAudioCodec() override {
-        static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static WaveshareV2AecDiagnosticCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
             return &audio_codec;
     }

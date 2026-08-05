@@ -9,7 +9,7 @@
 
 
 class BoxAudioCodec : public AudioCodec {
-private:
+protected:
     const audio_codec_data_if_t* data_if_ = nullptr;
     const audio_codec_ctrl_if_t* out_ctrl_if_ = nullptr;
     const audio_codec_if_t* out_codec_if_ = nullptr;
