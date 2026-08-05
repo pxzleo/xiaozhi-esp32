@@ -24,6 +24,7 @@
 namespace {
 
 constexpr int kRoundScreenSize = 360;
+constexpr int kRoundAvatarSize = 128;
 constexpr int kRoundChatTop = 196;
 constexpr int kRoundChatLineStep = 20;
 constexpr int kRoundChatLineCount = 7;
@@ -946,20 +947,31 @@ void LcdDisplay::SetupUI() {
 
     /* Bottom layer: emoji_box_ - centered display */
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    const bool is_round_screen = width_ == kRoundScreenSize && height_ == kRoundScreenSize;
+    lv_obj_set_size(emoji_box_, is_round_screen ? kRoundAvatarSize : LV_SIZE_CONTENT,
+                    is_round_screen ? kRoundAvatarSize : LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     // Keep the avatar in the upper half on the 360x360 Waveshare round display.
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0,
-                 (width_ == kRoundScreenSize && height_ == kRoundScreenSize) ? -64 : 0);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, is_round_screen ? -64 : 0);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    if (is_round_screen) {
+        lv_obj_center(emoji_label_);
+    }
 
     emoji_image_ = lv_img_create(emoji_box_);
+    if (is_round_screen) {
+        // Give LVGL a fixed drawing area and let it resize the 96x96 resource
+        // into it.  A transform scale alone keeps the image object's intrinsic
+        // size at 96x96, which can be clipped/refreshed as if it were unscaled.
+        lv_obj_set_size(emoji_image_, kRoundAvatarSize, kRoundAvatarSize);
+        lv_image_set_inner_align(emoji_image_, LV_IMAGE_ALIGN_STRETCH);
+    }
     lv_obj_center(emoji_image_);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
