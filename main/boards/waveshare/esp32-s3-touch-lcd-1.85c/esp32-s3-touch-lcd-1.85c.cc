@@ -37,7 +37,7 @@ private:
     static constexpr size_t kAfeChannels = 2;
     static constexpr int64_t kPlaybackHoldUs = 250000;
     static constexpr uint32_t kReportSamples = 16000;
-    static constexpr float kMicrophoneGainDb = 9.0f;
+    static constexpr float kMicrophoneGainDb = 12.0f;
     static constexpr float kReferenceGainDb = 30.0f;
     static constexpr float kUnusedChannelGainDb = 0.0f;
 
