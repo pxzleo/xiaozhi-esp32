@@ -4,7 +4,9 @@
     "builds": [
         {
             "name": "esp32-s3-touch-lcd-1.85c",
-            "sdkconfig_append": []
+            "sdkconfig_append": [
+                "CONFIG_OTA_URL=\"http://192.168.100.149/xiaozhi/ota/\""
+            ]
         }
     ]
 }
