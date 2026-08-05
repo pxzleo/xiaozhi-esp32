@@ -1,6 +1,9 @@
 #include "afe_audio_engine.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -416,6 +419,9 @@ void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
 void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
     if (output_reset_pending_.exchange(false)) {
         output_buffer_.clear();
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
+        ResetAfeDiagnostics();
+#endif
     }
     if (vad_state_change_callback_) {
         if (result->vad_state == VAD_SPEECH && !is_speaking_) {
@@ -431,6 +437,9 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
     }
 
     size_t samples = result->data_size / sizeof(int16_t);
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
+    AccumulateAfeDiagnostics(result);
+#endif
     output_buffer_.insert(output_buffer_.end(), result->data, result->data + samples);
     while (output_buffer_.size() >= static_cast<size_t>(frame_samples_)) {
         if (output_buffer_.size() == static_cast<size_t>(frame_samples_)) {
@@ -444,6 +453,50 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
         }
     }
 }
+
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
+void AfeAudioEngine::ResetAfeDiagnostics() {
+    afe_diagnostic_sum_squares_ = 0;
+    afe_diagnostic_samples_ = 0;
+    afe_diagnostic_peak_ = 0;
+    afe_diagnostic_clipped_ = 0;
+    afe_diagnostic_speech_samples_ = 0;
+}
+
+void AfeAudioEngine::AccumulateAfeDiagnostics(const afe_fetch_result_t* result) {
+    const uint32_t samples = result->data_size / sizeof(int16_t);
+    for (uint32_t i = 0; i < samples; ++i) {
+        const int32_t sample = result->data[i];
+        const uint32_t magnitude = static_cast<uint32_t>(std::abs(sample));
+        afe_diagnostic_sum_squares_ += static_cast<int64_t>(sample) * sample;
+        afe_diagnostic_peak_ = std::max(afe_diagnostic_peak_, magnitude);
+        if (sample <= -32760 || sample >= 32760) {
+            ++afe_diagnostic_clipped_;
+        }
+    }
+    afe_diagnostic_samples_ += samples;
+    if (result->vad_state == VAD_SPEECH) {
+        afe_diagnostic_speech_samples_ += samples;
+    }
+
+    if (afe_diagnostic_samples_ < kAfeDiagnosticSamples) {
+        return;
+    }
+
+    const double rms = std::sqrt(
+        static_cast<double>(afe_diagnostic_sum_squares_) / afe_diagnostic_samples_);
+    const double clipped_percent =
+        100.0 * afe_diagnostic_clipped_ / afe_diagnostic_samples_;
+    const double speech_percent =
+        100.0 * afe_diagnostic_speech_samples_ / afe_diagnostic_samples_;
+    ESP_LOGI("AfeDiag",
+        "post_aec_rms=%.0f peak=%" PRIu32 " clip_pct=%.2f "
+        "vad_speech_pct=%.1f vad_state=%s samples=%" PRIu32,
+        rms, afe_diagnostic_peak_, clipped_percent, speech_percent,
+        result->vad_state == VAD_SPEECH ? "speech" : "silence", afe_diagnostic_samples_);
+    ResetAfeDiagnostics();
+}
+#endif
 
 void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
     if (!output_callback_ || codec_ == nullptr) {

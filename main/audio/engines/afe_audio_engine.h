@@ -97,6 +97,15 @@ private:
     std::mutex wake_word_mutex_;
     std::condition_variable wake_word_cv_;
 
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
+    static constexpr uint32_t kAfeDiagnosticSamples = 16000;
+    uint64_t afe_diagnostic_sum_squares_ = 0;
+    uint32_t afe_diagnostic_samples_ = 0;
+    uint32_t afe_diagnostic_peak_ = 0;
+    uint32_t afe_diagnostic_clipped_ = 0;
+    uint32_t afe_diagnostic_speech_samples_ = 0;
+#endif
+
     void ProcessingTask();
     void UpdateActiveState();
     void UpdateAecState();
@@ -105,6 +114,10 @@ private:
     void OutputRawAudio(const std::vector<int16_t>& data);
     void HandleWakeWordResult(const afe_fetch_result_t* result);
     void HandleVoiceResult(const afe_fetch_result_t* result);
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C) && defined(CONFIG_VERSION_2_0)
+    void ResetAfeDiagnostics();
+    void AccumulateAfeDiagnostics(const afe_fetch_result_t* result);
+#endif
 };
 
 #endif
