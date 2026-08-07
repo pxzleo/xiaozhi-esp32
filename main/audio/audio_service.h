@@ -83,6 +83,8 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_audio_testing_queue_full;
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
+    std::function<void(uint32_t lyrics_generation, size_t samples, uint32_t sample_rate,
+                       size_t buffered_samples)> on_pcm_rendered;
 };
 
 
@@ -96,6 +98,7 @@ struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    uint32_t lyrics_generation = 0;
 };
 
 struct DebugStatistics {

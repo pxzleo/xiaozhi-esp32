@@ -340,6 +340,12 @@ void AudioService::AudioOutputTask() {
 
         codec_->OutputData(task->pcm);
 
+        if (callbacks_.on_pcm_rendered) {
+            callbacks_.on_pcm_rendered(task->lyrics_generation, task->pcm.size(),
+                                       codec_->output_sample_rate(),
+                                       AUDIO_CODEC_DMA_DESC_NUM * AUDIO_CODEC_DMA_FRAME_NUM);
+        }
+
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
         debug_statistics_.playback_count++;
@@ -389,6 +395,7 @@ void AudioService::OpusCodecTask() {
             auto task = std::make_unique<AudioTask>();
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
+            task->lyrics_generation = packet->lyrics_generation;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             bool decoded = false;

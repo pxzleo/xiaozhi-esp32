@@ -16,7 +16,9 @@
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <cctype>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <string_view>
 
 #define TAG "Application"
@@ -87,6 +89,93 @@ std::string LocalizeToolStatusMessage(const char* content) {
     return "正在处理，请稍候";
 }
 
+size_t Utf8CodePointCount(const char* value) {
+    size_t count = 0;
+    for (const auto* p = reinterpret_cast<const unsigned char*>(value); *p != 0; ++p) {
+        if ((*p & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool IsAsciiString(const char* value, bool (*predicate)(unsigned char)) {
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    for (const auto* p = reinterpret_cast<const unsigned char*>(value); *p != 0; ++p) {
+        if (!predicate(*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsHex(unsigned char value) { return std::isxdigit(value) != 0; }
+bool IsDigit(unsigned char value) { return std::isdigit(value) != 0; }
+
+bool ParseLyricsStart(const cJSON* params, netease_music::LyricsPlayback& playback) {
+    auto version = cJSON_GetObjectItem(params, "version");
+    auto playback_id = cJSON_GetObjectItem(params, "playback_id");
+    auto track = cJSON_GetObjectItem(params, "track");
+    auto available = cJSON_GetObjectItem(params, "available");
+    auto lines = cJSON_GetObjectItem(params, "lines");
+    if (!cJSON_IsNumber(version) || version->valueint != 1 ||
+        !cJSON_IsString(playback_id) || strlen(playback_id->valuestring) != 32 ||
+        !IsAsciiString(playback_id->valuestring, IsHex) || !cJSON_IsObject(track) ||
+        !cJSON_IsBool(available) || !cJSON_IsArray(lines)) {
+        return false;
+    }
+    auto track_id = cJSON_GetObjectItem(track, "id");
+    auto title = cJSON_GetObjectItem(track, "title");
+    auto artists = cJSON_GetObjectItem(track, "artists");
+    if (!cJSON_IsString(track_id) || !IsAsciiString(track_id->valuestring, IsDigit) ||
+        !cJSON_IsString(title) || Utf8CodePointCount(title->valuestring) > 200 ||
+        !cJSON_IsArray(artists) || cJSON_GetArraySize(artists) > 32) {
+        return false;
+    }
+    playback.playback_id = playback_id->valuestring;
+    playback.track_id = track_id->valuestring;
+    playback.title = title->valuestring;
+    playback.available = cJSON_IsTrue(available);
+    for (int i = 0; i < cJSON_GetArraySize(artists); ++i) {
+        auto artist = cJSON_GetArrayItem(artists, i);
+        if (!cJSON_IsString(artist) || Utf8CodePointCount(artist->valuestring) > 200) {
+            return false;
+        }
+        if (!playback.artists.empty()) {
+            playback.artists += " / ";
+        }
+        playback.artists += artist->valuestring;
+    }
+    const int line_count = cJSON_GetArraySize(lines);
+    if (line_count > 500 || (!playback.available && line_count != 0)) {
+        return false;
+    }
+    size_t total_characters = 0;
+    uint32_t previous_start = 0;
+    for (int i = 0; i < line_count; ++i) {
+        auto line = cJSON_GetArrayItem(lines, i);
+        auto start = cJSON_GetObjectItem(line, "start_ms");
+        auto text = cJSON_GetObjectItem(line, "text");
+        if (!cJSON_IsObject(line) || !cJSON_IsNumber(start) || start->valuedouble < 0 ||
+            start->valuedouble > std::numeric_limits<uint32_t>::max() ||
+            std::floor(start->valuedouble) != start->valuedouble || !cJSON_IsString(text)) {
+            return false;
+        }
+        const uint32_t start_ms = static_cast<uint32_t>(start->valuedouble);
+        const size_t characters = Utf8CodePointCount(text->valuestring);
+        if ((i > 0 && start_ms < previous_start) || characters > 200 ||
+            total_characters + characters > 32000) {
+            return false;
+        }
+        playback.lines.push_back({start_ms, text->valuestring});
+        previous_start = start_ms;
+        total_characters += characters;
+    }
+    return true;
+}
+
 }  // namespace
 
 Application::Application() {
@@ -155,6 +244,17 @@ void Application::Initialize() {
     };
     callbacks.on_playback_drained = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+    };
+    callbacks.on_pcm_rendered = [this](uint32_t generation, size_t samples,
+                                       uint32_t sample_rate, size_t buffered_samples) {
+        auto update = netease_lyrics_.OnPcmRendered(generation, samples, sample_rate,
+                                                    buffered_samples);
+        if (update.has_value()) {
+            Schedule([window = std::move(*update)]() {
+                Board::GetInstance().GetDisplay()->UpdateNeteaseMusicLyrics(
+                    window.previous, window.current, window.next);
+            });
+        }
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -601,6 +701,7 @@ void Application::InitializeProtocol() {
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+            packet->lyrics_generation = netease_lyrics_.Generation();
             if (!barge_in_detection_active_.exchange(true)) {
                 audio_service_.EnableBargeInDetection(true);
             }
@@ -620,8 +721,10 @@ void Application::InitializeProtocol() {
 
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        netease_lyrics_.Clear();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
+            display->CloseNeteaseMusicLyrics();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
         });
@@ -695,7 +798,9 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
-                McpServer::GetInstance().ParseMessage(payload);
+                if (!HandleNeteaseLyricsNotification(payload)) {
+                    McpServer::GetInstance().ParseMessage(payload);
+                }
             }
         } else if (strcmp(type->valuestring, "system") == 0) {
             auto command = cJSON_GetObjectItem(root, "command");
@@ -737,6 +842,76 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->Start();
+}
+
+bool Application::HandleNeteaseLyricsNotification(const cJSON* payload) {
+    auto jsonrpc = cJSON_GetObjectItem(payload, "jsonrpc");
+    auto method = cJSON_GetObjectItem(payload, "method");
+    if (!cJSON_IsString(method) ||
+        strcmp(method->valuestring, "notifications/netease_music/lyrics") != 0) {
+        return false;
+    }
+    if (!cJSON_IsString(jsonrpc) || strcmp(jsonrpc->valuestring, "2.0") != 0) {
+        ESP_LOGW(TAG, "Ignoring malformed NetEase lyrics notification");
+        return true;
+    }
+    auto params = cJSON_GetObjectItem(payload, "params");
+    auto version = cJSON_GetObjectItem(params, "version");
+    auto action = cJSON_GetObjectItem(params, "action");
+    if (!cJSON_IsObject(params) || !cJSON_IsNumber(version) || version->valueint != 1 ||
+        !cJSON_IsString(action)) {
+        ESP_LOGW(TAG, "Ignoring malformed NetEase lyrics notification");
+        return true;
+    }
+    if (strcmp(action->valuestring, "clear") == 0) {
+        auto reason = cJSON_GetObjectItem(params, "reason");
+        if (!cJSON_IsString(reason) ||
+            (strcmp(reason->valuestring, "paused") != 0 &&
+             strcmp(reason->valuestring, "stopped") != 0 &&
+             strcmp(reason->valuestring, "interrupted") != 0 &&
+             strcmp(reason->valuestring, "completed") != 0 &&
+             strcmp(reason->valuestring, "closed") != 0)) {
+            ESP_LOGW(TAG, "Ignoring invalid NetEase lyrics clear notification");
+            return true;
+        }
+        netease_lyrics_.Clear();
+        Schedule([]() { Board::GetInstance().GetDisplay()->CloseNeteaseMusicLyrics(); });
+        ESP_LOGI(TAG, "NetEase lyrics cleared");
+        return true;
+    }
+    if (strcmp(action->valuestring, "start") != 0) {
+        ESP_LOGW(TAG, "Ignoring unknown NetEase lyrics action");
+        return true;
+    }
+
+    netease_music::LyricsPlayback playback;
+    if (!ParseLyricsStart(params, playback)) {
+        ESP_LOGW(TAG, "Ignoring invalid NetEase lyrics start notification");
+        return true;
+    }
+    const auto initial = [&playback]() {
+        netease_music::LyricsWindow window;
+        if (!playback.available) {
+            window.current = "暂无歌词";
+        } else if (!playback.lines.empty()) {
+            window.next = playback.lines.front().text;
+        }
+        return window;
+    }();
+    const auto playback_id = playback.playback_id;
+    const auto track_id = playback.track_id;
+    const size_t line_count = playback.lines.size();
+    auto title = playback.title;
+    auto artists = playback.artists;
+    netease_lyrics_.Start(std::move(playback));
+    Schedule([title = std::move(title), artists = std::move(artists), initial]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->ShowNeteaseMusicLyrics(title, artists, initial.previous, initial.current,
+                                        initial.next);
+    });
+    ESP_LOGI(TAG, "NetEase lyrics started: playback_id=%s track_id=%s lines=%u",
+             playback_id.c_str(), track_id.c_str(), static_cast<unsigned>(line_count));
+    return true;
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {

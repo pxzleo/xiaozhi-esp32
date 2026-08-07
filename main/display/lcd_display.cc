@@ -1275,7 +1275,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (bottom_bar_ != nullptr) {
         if (content == nullptr || content[0] == '\0') {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else if (!hide_subtitle_) {
+        } else if (!hide_subtitle_ && netease_lyrics_page_ == nullptr) {
             lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
     }
@@ -1301,6 +1301,185 @@ void LcdDisplay::ClearChatMessages() {
     }
 }
 #endif
+
+bool LcdDisplay::ShowNeteaseMusicQr(std::unique_ptr<LvglImage> image,
+                                    const std::string& status) {
+    if (image == nullptr || image->image_dsc()->header.w == 0 ||
+        image->image_dsc()->header.h == 0) {
+        return false;
+    }
+    DisplayLockGuard lock(this);
+    if (netease_lyrics_page_ != nullptr) {
+        lv_obj_del(netease_lyrics_page_);
+        netease_lyrics_page_ = nullptr;
+        netease_lyrics_previous_ = nullptr;
+        netease_lyrics_current_ = nullptr;
+        netease_lyrics_next_ = nullptr;
+    }
+    if (netease_qr_page_ != nullptr) {
+        lv_obj_del(netease_qr_page_);
+        netease_qr_page_ = nullptr;
+        netease_qr_image_ = nullptr;
+        netease_qr_status_ = nullptr;
+        netease_qr_image_cached_.reset();
+    }
+
+    auto* screen = lv_screen_active();
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    netease_qr_page_ = lv_obj_create(screen);
+    lv_obj_set_size(netease_qr_page_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_radius(netease_qr_page_, 0, 0);
+    lv_obj_set_style_border_width(netease_qr_page_, 0, 0);
+    lv_obj_set_style_bg_color(netease_qr_page_, theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(netease_qr_page_, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(netease_qr_page_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(netease_qr_page_, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* title = lv_label_create(netease_qr_page_);
+    lv_label_set_text(title, "网易云音乐登录");
+    lv_obj_set_style_text_color(title, theme->text_color(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, theme->spacing(6));
+
+    netease_qr_image_cached_ = std::move(image);
+    const auto* descriptor = netease_qr_image_cached_->image_dsc();
+    netease_qr_image_ = lv_image_create(netease_qr_page_);
+    lv_image_set_src(netease_qr_image_, descriptor);
+    const int available = std::min(width_, height_) * 65 / 100;
+    const int scale = std::min(256, available * 256 /
+                                       std::max<int>(descriptor->header.w, descriptor->header.h));
+    lv_image_set_scale(netease_qr_image_, scale);
+    lv_obj_align(netease_qr_image_, LV_ALIGN_CENTER, 0, -theme->spacing(2));
+
+    netease_qr_status_ = lv_label_create(netease_qr_page_);
+    lv_obj_set_width(netease_qr_status_, LV_HOR_RES * 85 / 100);
+    lv_label_set_long_mode(netease_qr_status_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(netease_qr_status_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(netease_qr_status_, theme->text_color(), 0);
+    lv_label_set_text(netease_qr_status_, status.c_str());
+    lv_obj_align(netease_qr_status_, LV_ALIGN_BOTTOM_MID, 0, -theme->spacing(6));
+    lv_obj_move_foreground(netease_qr_page_);
+    return true;
+}
+
+void LcdDisplay::UpdateNeteaseMusicQrStatus(const std::string& status) {
+    DisplayLockGuard lock(this);
+    if (netease_qr_status_ != nullptr) {
+        lv_label_set_text(netease_qr_status_, status.c_str());
+    }
+}
+
+void LcdDisplay::CloseNeteaseMusicQr() {
+    DisplayLockGuard lock(this);
+    if (netease_qr_page_ != nullptr) {
+        lv_obj_del(netease_qr_page_);
+        netease_qr_page_ = nullptr;
+        netease_qr_image_ = nullptr;
+        netease_qr_status_ = nullptr;
+    }
+    netease_qr_image_cached_.reset();
+}
+
+void LcdDisplay::ShowNeteaseMusicLyrics(const std::string& title,
+                                        const std::string& artists,
+                                        const std::string& previous,
+                                        const std::string& current,
+                                        const std::string& next) {
+    DisplayLockGuard lock(this);
+    if (netease_qr_page_ != nullptr) {
+        lv_obj_del(netease_qr_page_);
+        netease_qr_page_ = nullptr;
+        netease_qr_image_ = nullptr;
+        netease_qr_status_ = nullptr;
+        netease_qr_image_cached_.reset();
+    }
+    if (netease_lyrics_page_ != nullptr) {
+        lv_obj_del(netease_lyrics_page_);
+    }
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto* screen = lv_screen_active();
+    const int page_top = height_ / 2;
+    const int page_height = height_ - page_top;
+    const int text_width = width_ * 78 / 100;
+    netease_lyrics_page_ = lv_obj_create(screen);
+    lv_obj_set_size(netease_lyrics_page_, width_, page_height);
+    lv_obj_align(netease_lyrics_page_, LV_ALIGN_TOP_MID, 0, page_top);
+    lv_obj_set_style_radius(netease_lyrics_page_, 0, 0);
+    lv_obj_set_style_border_width(netease_lyrics_page_, 0, 0);
+    lv_obj_set_style_pad_all(netease_lyrics_page_, 0, 0);
+    lv_obj_set_style_bg_color(netease_lyrics_page_, theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(netease_lyrics_page_, LV_OPA_80, 0);
+    lv_obj_set_scrollbar_mode(netease_lyrics_page_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(netease_lyrics_page_, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto make_label = [&](const char* value, int y, lv_color_t color, lv_opa_t opacity) {
+        auto* label = lv_label_create(netease_lyrics_page_);
+        lv_obj_set_size(label, text_width, theme->text_font()->font()->line_height + 4);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(label, value);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(label, color, 0);
+        lv_obj_set_style_text_opa(label, opacity, 0);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, y);
+        return label;
+    };
+
+    auto* title_label = make_label(title.c_str(), 3, theme->text_color(), LV_OPA_COVER);
+    lv_obj_set_style_text_letter_space(title_label, 1, 0);
+    make_label(artists.c_str(), 23, theme->text_color(), LV_OPA_60);
+    netease_lyrics_previous_ =
+        make_label(previous.c_str(), 53, theme->text_color(), LV_OPA_50);
+    netease_lyrics_current_ =
+        make_label(current.c_str(), 82, lv_palette_main(LV_PALETTE_GREEN), LV_OPA_COVER);
+    lv_obj_set_style_transform_pivot_x(netease_lyrics_current_, text_width / 2, 0);
+    lv_obj_set_style_transform_pivot_y(
+        netease_lyrics_current_, theme->text_font()->font()->line_height / 2 + 2, 0);
+    lv_obj_set_style_transform_scale(netease_lyrics_current_, 288, 0);
+    netease_lyrics_next_ = make_label(next.c_str(), 116, theme->text_color(), LV_OPA_50);
+
+    if (bottom_bar_ != nullptr) {
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(netease_lyrics_page_);
+}
+
+void LcdDisplay::UpdateNeteaseMusicLyrics(const std::string& previous,
+                                          const std::string& current,
+                                          const std::string& next) {
+    DisplayLockGuard lock(this);
+    if (netease_lyrics_page_ == nullptr) {
+        return;
+    }
+    lv_label_set_text(netease_lyrics_previous_, previous.c_str());
+    lv_label_set_text(netease_lyrics_current_, current.c_str());
+    lv_label_set_text(netease_lyrics_next_, next.c_str());
+}
+
+void LcdDisplay::CloseNeteaseMusicLyrics() {
+    DisplayLockGuard lock(this);
+    if (netease_lyrics_page_ != nullptr) {
+        lv_obj_del(netease_lyrics_page_);
+        netease_lyrics_page_ = nullptr;
+        netease_lyrics_previous_ = nullptr;
+        netease_lyrics_current_ = nullptr;
+        netease_lyrics_next_ = nullptr;
+    }
+    if (bottom_bar_ != nullptr && !hide_subtitle_) {
+        bool has_text = false;
+        if (!round_chat_labels_.empty()) {
+            for (auto* label : round_chat_labels_) {
+                const char* text = lv_label_get_text(label);
+                has_text = has_text || (text != nullptr && text[0] != '\0');
+            }
+        } else if (chat_message_label_ != nullptr) {
+            const char* text = lv_label_get_text(chat_message_label_);
+            has_text = text != nullptr && text[0] != '\0';
+        }
+        if (has_text) {
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {
@@ -1618,7 +1797,7 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     if (bottom_bar_ != nullptr) {
         if (hide) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        } else if (netease_lyrics_page_ == nullptr) {
             // Only show if there is actual content to display
             const char* text =
                 (chat_message_label_ != nullptr) ? lv_label_get_text(chat_message_label_) : nullptr;

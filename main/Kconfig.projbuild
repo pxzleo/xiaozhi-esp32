@@ -6,6 +6,13 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config NETEASE_MUSIC_API_BASE_URL
+    string "NetEase Music manager API base URL"
+    default ""
+    help
+        Base URL for the device NetEase Music API, without a trailing slash.
+        When empty, derive it from OTA_URL by removing the trailing /ota path.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

@@ -37,6 +37,14 @@ protected:
     std::vector<lv_obj_t*> round_chat_labels_;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    lv_obj_t* netease_qr_page_ = nullptr;
+    lv_obj_t* netease_qr_image_ = nullptr;
+    lv_obj_t* netease_qr_status_ = nullptr;
+    std::unique_ptr<LvglImage> netease_qr_image_cached_ = nullptr;
+    lv_obj_t* netease_lyrics_page_ = nullptr;
+    lv_obj_t* netease_lyrics_previous_ = nullptr;
+    lv_obj_t* netease_lyrics_current_ = nullptr;
+    lv_obj_t* netease_lyrics_next_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
     void InitializeLcdThemes();
@@ -58,6 +66,19 @@ public:
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
+    virtual bool ShowNeteaseMusicQr(std::unique_ptr<LvglImage> image,
+                                    const std::string& status) override;
+    virtual void UpdateNeteaseMusicQrStatus(const std::string& status) override;
+    virtual void CloseNeteaseMusicQr() override;
+    virtual void ShowNeteaseMusicLyrics(const std::string& title,
+                                        const std::string& artists,
+                                        const std::string& previous,
+                                        const std::string& current,
+                                        const std::string& next) override;
+    virtual void UpdateNeteaseMusicLyrics(const std::string& previous,
+                                          const std::string& current,
+                                          const std::string& next) override;
+    virtual void CloseNeteaseMusicLyrics() override;
     virtual void SetupUI() override;
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;

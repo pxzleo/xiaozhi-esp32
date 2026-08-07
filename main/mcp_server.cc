@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "netease_music_device.h"
 
 #define TAG "MCP"
 
@@ -61,6 +62,26 @@ void McpServer::AddCommonTools() {
             auto codec = board.GetAudioCodec();
             codec->SetOutputVolume(properties["volume"].value<int>());
             return true;
+        });
+
+    auto& netease_music_service = netease_music::GetDeviceService();
+    AddTool(
+        "self.netease_music.login",
+        "Log in to NetEase Cloud Music on this device. Use this tool when the user says "
+        "'我要登录网易云音乐' or otherwise explicitly asks to log in. The tool always checks "
+        "the current server-side login status first; speak its returned Chinese message verbatim.",
+        PropertyList(),
+        [&netease_music_service](const PropertyList&) -> ReturnValue {
+            return netease_music_service.StartLogin();
+        });
+    AddTool(
+        "self.netease_music.logout",
+        "Log out of NetEase Cloud Music on this device. Use this tool when the user says "
+        "'退出网易云音乐' or otherwise explicitly asks to log out; speak its returned Chinese "
+        "message verbatim.",
+        PropertyList(),
+        [&netease_music_service](const PropertyList&) -> ReturnValue {
+            return netease_music_service.Logout();
         });
     
     auto backlight = board.GetBacklight();

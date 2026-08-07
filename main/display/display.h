@@ -46,6 +46,14 @@ public:
     virtual void SetPowerSaveMode(bool on);
     virtual bool AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bpp) { return false; }
     virtual void ClearTextGlyphs() {}
+    virtual void ShowNeteaseMusicLyrics(const std::string& title, const std::string& artists,
+                                        const std::string& previous,
+                                        const std::string& current,
+                                        const std::string& next) {}
+    virtual void UpdateNeteaseMusicLyrics(const std::string& previous,
+                                          const std::string& current,
+                                          const std::string& next) {}
+    virtual void CloseNeteaseMusicLyrics() {}
     virtual void SetEmojiCollection(std::shared_ptr<EmojiCollection>) {}
     virtual void SetupUI() { setup_ui_called_ = true; }
 

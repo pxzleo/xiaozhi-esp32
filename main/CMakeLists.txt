@@ -33,6 +33,9 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
+            "music/netease_music_service.cc"
+            "music/netease_music_device.cc"
+            "music/netease_music_lyrics.cc"
             "system_info.cc"
             "application.cc"
             "ota.cc"
@@ -42,7 +45,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "music")
 
 # Add board common files
 list(APPEND SOURCES

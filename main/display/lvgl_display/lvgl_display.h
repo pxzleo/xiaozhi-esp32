@@ -25,6 +25,14 @@ public:
     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
     virtual void ShowNotification(const std::string& notification, int duration_ms = 3000);
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
+    // Persistent, session-owned view. Unlike SetPreviewImage(), this has no timeout and is
+    // closed only by CloseNeteaseMusicQr().
+    virtual bool ShowNeteaseMusicQr(std::unique_ptr<LvglImage> image,
+                                    const std::string& status) {
+        return false;
+    }
+    virtual void UpdateNeteaseMusicQrStatus(const std::string& status) {}
+    virtual void CloseNeteaseMusicQr() {}
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
