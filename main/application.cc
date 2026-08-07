@@ -460,7 +460,7 @@ void Application::Run() {
                 if (reminder_delivery_.NeedsServerAbort()) {
                     reminder_delivery_.Reset();
                     schedule_reminder_tts_deadline_us_ = 0;
-                    RestoreScheduleAlertVolume();
+                    RestoreScheduleAlertVolumeAfterDelivery();
                 }
                 SetDeviceState(kDeviceStateIdle);
             } else {
@@ -488,7 +488,6 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (schedule_alert_active_ &&
-                active_schedule_task_.kind == schedule::Kind::kReminder &&
                 audio_service_.IsPlaybackIdle() &&
                 reminder_delivery_.OnPlaybackDrained()) {
                 if (NotifyReminderTriggered(active_schedule_task_, std::time(nullptr))) {
@@ -496,7 +495,7 @@ void Application::Run() {
                         kReminderTtsStartTimeoutSeconds * 1000000LL;
                 } else {
                     reminder_delivery_.CancelWaitingForTts();
-                    RestoreScheduleAlertVolume();
+                    RestoreScheduleAlertVolumeAfterDelivery();
                 }
             }
 
@@ -852,7 +851,7 @@ void Application::InitializeProtocol() {
             if (reminder_delivery_.NeedsServerAbort()) {
                 reminder_delivery_.Reset();
                 schedule_reminder_tts_deadline_us_ = 0;
-                RestoreScheduleAlertVolume();
+                RestoreScheduleAlertVolumeAfterDelivery();
             }
             auto display = Board::GetInstance().GetDisplay();
             display->CloseNeteaseMusicLyrics();
@@ -877,6 +876,12 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    if (schedule_alert_active_ &&
+                        reminder_delivery_.state() ==
+                            schedule::ReminderDeliveryState::kWaitingForCue) {
+                        ESP_LOGW(TAG, "Ignoring stale TTS start while schedule cue is playing");
+                        return;
+                    }
                     if (reminder_delivery_.OnTtsStarted()) {
                         schedule_reminder_tts_deadline_us_ = 0;
                     }
@@ -887,7 +892,11 @@ void Application::InitializeProtocol() {
                 Schedule([this]() {
                     if (reminder_delivery_.OnTtsStopped()) {
                         schedule_reminder_tts_deadline_us_ = 0;
-                        RestoreScheduleAlertVolume();
+                        RestoreScheduleAlertVolumeAfterDelivery();
+                        if (schedule_alert_active_ &&
+                            active_schedule_task_.kind == schedule::Kind::kAlarm) {
+                            ShowScheduleAlertPage();
+                        }
                         listening_mode_ = GetDefaultListeningMode();
                         SetDeviceState(kDeviceStateListening);
                         if (!schedule_alert_active_) {
@@ -1336,7 +1345,7 @@ void Application::HandleStateChangedEvent() {
             }
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(!schedule_alert_active_);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1732,7 +1741,7 @@ void Application::CheckSchedules() {
         now_us >= schedule_reminder_tts_deadline_us_ &&
         reminder_delivery_.CancelWaitingForTts()) {
         schedule_reminder_tts_deadline_us_ = 0;
-        RestoreScheduleAlertVolume();
+        RestoreScheduleAlertVolumeAfterDelivery();
     }
     if (!schedule_alert_active_ &&
         reminder_delivery_.state() == schedule::ReminderDeliveryState::kInactive) {
@@ -1749,6 +1758,7 @@ void Application::CheckSchedules() {
             StartNextScheduleAlert();
         }
     } else if (active_schedule_task_.kind == schedule::Kind::kAlarm &&
+               reminder_delivery_.state() == schedule::ReminderDeliveryState::kInactive &&
                audio_service_.IsPlaybackIdle()) {
         audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
     }
@@ -1762,8 +1772,12 @@ void Application::StartNextScheduleAlert() {
     schedule_alert_active_ = true;
     schedule_alert_deadline_us_ = esp_timer_get_time() +
         (active_schedule_task_.kind == schedule::Kind::kAlarm ? 600LL : 60LL) * 1000000;
+    reminder_delivery_.Begin();
 
     AbortSpeaking(kAbortReasonNone);
+    SetDeviceState(kDeviceStateIdle);
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
     audio_service_.ResetDecoder();
     netease_lyrics_.Clear();
     Board::GetInstance().GetDisplay()->CloseNeteaseMusicLyrics();
@@ -1774,17 +1788,20 @@ void Application::StartNextScheduleAlert() {
         codec->SetOutputVolumeTransient(kScheduleAlertMinimumVolume);
     }
 
-    std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
-    page += "  " + FormatLocalDateTime(active_schedule_task_.trigger_at).substr(11, 5) + "\n";
-    page += active_schedule_task_.label;
-    page += "\n按键停止 / 可语音稍后提醒";
-    Board::GetInstance().GetDisplay()->SetChatMessage("system", page.c_str());
+    ShowScheduleAlertPage();
     const bool is_reminder = active_schedule_task_.kind == schedule::Kind::kReminder;
-    reminder_delivery_.Begin(is_reminder);
     const int cue_repeats = is_reminder ? kReminderCueRepeats : 1;
     for (int i = 0; i < cue_repeats; ++i) {
         audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
     }
+}
+
+void Application::ShowScheduleAlertPage() {
+    std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
+    page += "  " + FormatLocalDateTime(active_schedule_task_.trigger_at).substr(11, 5) + "\n";
+    page += active_schedule_task_.label;
+    page += "\n开始收听键停止 / 可语音稍后提醒";
+    Board::GetInstance().GetDisplay()->SetChatMessage("system", page.c_str());
 }
 
 void Application::RestoreScheduleAlertVolume() {
@@ -1796,6 +1813,13 @@ void Application::RestoreScheduleAlertVolume() {
         }
     }
     schedule_saved_volume_ = -1;
+}
+
+void Application::RestoreScheduleAlertVolumeAfterDelivery() {
+    if (!schedule_alert_active_ ||
+        active_schedule_task_.kind == schedule::Kind::kReminder) {
+        RestoreScheduleAlertVolume();
+    }
 }
 
 void Application::FinishScheduleAlert(bool reset_decoder, bool reset_delivery) {
@@ -1904,10 +1928,14 @@ std::string Application::StopScheduleAlert() {
 
 bool Application::TryStopScheduleAlert() {
     if (!schedule_alert_active_) return false;
-    if (reminder_delivery_.NeedsServerAbort()) {
+    const bool aborting_delivery = reminder_delivery_.NeedsServerAbort();
+    if (aborting_delivery) {
         AbortSpeaking(kAbortReasonNone);
     }
     FinishScheduleAlert();
+    if (aborting_delivery) {
+        SetDeviceState(kDeviceStateIdle);
+    }
     StartNextScheduleAlert();
     return true;
 }
@@ -1916,10 +1944,14 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     if (!schedule_alert_active_) throw std::runtime_error("当前没有可稍后提醒的闹铃或提醒");
     const auto previous = active_schedule_task_;
     const auto snoozed = schedule_manager_.Snooze(previous, minutes, std::time(nullptr));
-    if (reminder_delivery_.NeedsServerAbort()) {
+    const bool aborting_delivery = reminder_delivery_.NeedsServerAbort();
+    if (aborting_delivery) {
         AbortSpeaking(kAbortReasonNone);
     }
     FinishScheduleAlert();
+    if (aborting_delivery) {
+        SetDeviceState(kDeviceStateIdle);
+    }
     SaveSchedules();
     StartNextScheduleAlert();
     cJSON* data = cJSON_CreateObject();

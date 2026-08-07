@@ -205,7 +205,7 @@ void TestReminderDeliverySequence() {
     ReminderDeliverySequence sequence;
     assert(sequence.state() == ReminderDeliveryState::kInactive);
 
-    sequence.Begin(true);
+    sequence.Begin();
     assert(sequence.state() == ReminderDeliveryState::kWaitingForCue);
     assert(!sequence.NeedsServerAbort());
     assert(sequence.OnPlaybackDrained());
@@ -215,7 +215,7 @@ void TestReminderDeliverySequence() {
     assert(sequence.state() == ReminderDeliveryState::kInactive);
     assert(!sequence.CancelWaitingForTts());
 
-    sequence.Begin(true);
+    sequence.Begin();
     assert(sequence.OnPlaybackDrained());
     assert(!sequence.OnPlaybackDrained());
     assert(sequence.OnTtsStarted());
@@ -227,8 +227,8 @@ void TestReminderDeliverySequence() {
 
     // An unrelated or stale TTS stop must not activate listening.
     assert(!sequence.OnTtsStopped());
-    sequence.Begin(false);
-    assert(sequence.state() == ReminderDeliveryState::kInactive);
+    sequence.Begin();
+    assert(sequence.state() == ReminderDeliveryState::kWaitingForCue);
 }
 
 int main() {

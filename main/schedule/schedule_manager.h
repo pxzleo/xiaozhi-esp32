@@ -86,7 +86,7 @@ private:
 
 class ReminderDeliverySequence {
 public:
-    void Begin(bool is_reminder);
+    void Begin();
     bool OnPlaybackDrained();
     bool OnTtsStarted();
     bool OnTtsStopped();

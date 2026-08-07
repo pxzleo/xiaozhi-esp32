@@ -61,9 +61,21 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("reminder_delivery_.OnTtsStarted()", application)
         self.assertIn("reminder_delivery_.OnTtsStopped()", application)
         self.assertIn("reminder_delivery_.CancelWaitingForTts()", application)
+        tts_start = application.split(
+            'if (strcmp(state->valuestring, "start") == 0)', 1
+        )[1].split('strcmp(state->valuestring, "stop")', 1)[0]
+        self.assertLess(
+            tts_start.index("ReminderDeliveryState::kWaitingForCue"),
+            tts_start.index("SetDeviceState(kDeviceStateSpeaking)"),
+        )
+        self.assertIn("return;", tts_start)
         drained_handler = application.split(
             "if (bits & MAIN_EVENT_PLAYBACK_DRAINED)", 1
         )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]
+        self.assertNotIn(
+            "active_schedule_task_.kind == schedule::Kind::kReminder",
+            drained_handler,
+        )
         self.assertLess(
             drained_handler.index("reminder_delivery_.OnPlaybackDrained()"),
             drained_handler.index("NotifyReminderTriggered(active_schedule_task_"),
@@ -71,6 +83,22 @@ class ScheduleManagerTest(unittest.TestCase):
         start_alert = application.split("void Application::StartNextScheduleAlert()", 1)[1]
         start_alert = start_alert.split("void Application::RestoreScheduleAlertVolume()", 1)[0]
         self.assertNotIn("NotifyReminderTriggered", start_alert)
+        self.assertLess(
+            start_alert.index("reminder_delivery_.Begin()"),
+            start_alert.index("SetDeviceState(kDeviceStateIdle)"),
+        )
+        self.assertLess(
+            start_alert.index("SetDeviceState(kDeviceStateIdle)"),
+            start_alert.index("audio_service_.PlaySound"),
+        )
+        self.assertLess(
+            start_alert.index("EnableVoiceProcessing(false)"),
+            start_alert.index("audio_service_.PlaySound"),
+        )
+        self.assertLess(
+            start_alert.index("EnableWakeWordDetection(false)"),
+            start_alert.index("audio_service_.PlaySound"),
+        )
         self.assertIn("FinishScheduleAlert(active_schedule_task_.kind == schedule::Kind::kAlarm,", application)
         self.assertIn("!reminder_delivery_pending", application)
         self.assertIn(
@@ -83,16 +111,39 @@ class ScheduleManagerTest(unittest.TestCase):
             stop_alert.index("AbortSpeaking(kAbortReasonNone)"),
             stop_alert.index("FinishScheduleAlert()"),
         )
+        self.assertLess(
+            stop_alert.index("FinishScheduleAlert()"),
+            stop_alert.index("SetDeviceState(kDeviceStateIdle)"),
+        )
         snooze_alert = application.split("std::string Application::SnoozeScheduleAlert", 1)[1]
         snooze_alert = snooze_alert.split("void Application::ResetProtocol", 1)[0]
         self.assertLess(
             snooze_alert.index("AbortSpeaking(kAbortReasonNone)"),
             snooze_alert.index("FinishScheduleAlert()"),
         )
+        self.assertLess(
+            snooze_alert.index("FinishScheduleAlert()"),
+            snooze_alert.index("SetDeviceState(kDeviceStateIdle)"),
+        )
         self.assertIn("netease_lyrics_.Clear()", application)
         self.assertIn("CloseNeteaseMusicLyrics()", application)
         self.assertIn("TryStopScheduleAlert", board)
         self.assertNotIn("IsScheduleAlertActive", board)
+        self.assertIn("开始收听键停止", application)
+        idle_state = application.split("case kDeviceStateIdle:", 1)[1]
+        idle_state = idle_state.split("case kDeviceStateConnecting:", 1)[0]
+        self.assertIn("EnableWakeWordDetection(!schedule_alert_active_)", idle_state)
+        boot_click = board.split("boot_button_.OnClick", 1)[1]
+        boot_click = boot_click.split("pwr_button_.OnLongPress", 1)[0]
+        self.assertLess(
+            boot_click.index("TryStopScheduleAlert"),
+            boot_click.index("ToggleChatState"),
+        )
+
+        alarm_repeat = application.split(
+            "active_schedule_task_.kind == schedule::Kind::kAlarm &&", 1
+        )[1].split("void Application::StartNextScheduleAlert", 1)[0]
+        self.assertIn("ReminderDeliveryState::kInactive", alarm_repeat)
 
         audio = (ROOT / "main" / "audio" / "audio_codec.cc").read_text(encoding="utf-8")
         transient = audio.split("void AudioCodec::SetOutputVolumeTransient", 1)[1]

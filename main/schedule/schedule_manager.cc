@@ -365,9 +365,8 @@ const Task& AlertQueue::current() const {
     return *active_;
 }
 
-void ReminderDeliverySequence::Begin(bool is_reminder) {
-    state_ = is_reminder ? ReminderDeliveryState::kWaitingForCue
-                         : ReminderDeliveryState::kInactive;
+void ReminderDeliverySequence::Begin() {
+    state_ = ReminderDeliveryState::kWaitingForCue;
 }
 
 bool ReminderDeliverySequence::OnPlaybackDrained() {

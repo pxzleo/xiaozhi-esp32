@@ -193,8 +193,10 @@ private:
     void SaveSchedules() const;
     void CheckSchedules();
     void StartNextScheduleAlert();
+    void ShowScheduleAlertPage();
     void FinishScheduleAlert(bool reset_decoder = true, bool reset_delivery = true);
     void RestoreScheduleAlertVolume();
+    void RestoreScheduleAlertVolumeAfterDelivery();
     bool NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
 
     // Activation task (runs in background)
