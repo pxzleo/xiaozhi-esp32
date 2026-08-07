@@ -195,6 +195,12 @@ std::string ResponseEnvelope(const std::string& response, cJSON* data) {
     return JsonString(root);
 }
 
+const char* KindFilterChinese(schedule::KindFilter filter) {
+    if (filter == schedule::KindFilter::kAlarm) return "闹铃";
+    if (filter == schedule::KindFilter::kReminder) return "提醒";
+    return "闹铃和提醒";
+}
+
 bool ParseLyricsStart(const cJSON* params, netease_music::LyricsPlayback& playback) {
     auto version = cJSON_GetObjectItem(params, "version");
     auto playback_id = cJSON_GetObjectItem(params, "playback_id");
@@ -1547,15 +1553,11 @@ void Application::LoadSchedules() {
         schedule_manager_.Restore({}, 1);
         return;
     }
-    cJSON* root = cJSON_Parse(saved.c_str());
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        throw std::runtime_error("NVS中的定时任务JSON损坏");
-    }
-    cJSON* next_id = cJSON_GetObjectItem(root, "next_id");
-    cJSON* tasks = cJSON_GetObjectItem(root, "tasks");
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(saved.c_str()), cJSON_Delete);
+    if (!cJSON_IsObject(root.get())) throw std::runtime_error("NVS中的定时任务JSON损坏");
+    cJSON* next_id = cJSON_GetObjectItem(root.get(), "next_id");
+    cJSON* tasks = cJSON_GetObjectItem(root.get(), "tasks");
     if (!cJSON_IsNumber(next_id) || next_id->valuedouble < 1 || !cJSON_IsArray(tasks)) {
-        cJSON_Delete(root);
         throw std::runtime_error("NVS中的定时任务字段无效");
     }
     std::vector<schedule::Task> restored;
@@ -1569,7 +1571,6 @@ void Application::LoadSchedules() {
         cJSON* weekdays = cJSON_GetObjectItem(item, "weekdays");
         if (!cJSON_IsNumber(id) || id->valuedouble < 1 || !cJSON_IsString(kind) ||
             !cJSON_IsString(repeat) || !cJSON_IsString(label) || !cJSON_IsNumber(trigger_at)) {
-            cJSON_Delete(root);
             throw std::runtime_error("NVS中的定时任务条目无效");
         }
         schedule::Task task;
@@ -1580,13 +1581,11 @@ void Application::LoadSchedules() {
         task.trigger_at = static_cast<std::time_t>(trigger_at->valuedouble);
         if (weekdays != nullptr) {
             if (!cJSON_IsArray(weekdays)) {
-                cJSON_Delete(root);
                 throw std::runtime_error("NVS中的weekdays无效");
             }
             cJSON* day = nullptr;
             cJSON_ArrayForEach(day, weekdays) {
                 if (!cJSON_IsNumber(day) || day->valueint < 1 || day->valueint > 7) {
-                    cJSON_Delete(root);
                     throw std::runtime_error("NVS中的weekday超出1到7");
                 }
                 task.weekdays.push_back(day->valueint);
@@ -1595,7 +1594,6 @@ void Application::LoadSchedules() {
         restored.push_back(std::move(task));
     }
     const uint32_t restored_next_id = static_cast<uint32_t>(next_id->valuedouble);
-    cJSON_Delete(root);
     schedule_manager_.Restore(std::move(restored), restored_next_id);
 }
 
@@ -1726,46 +1724,77 @@ std::string Application::CreateSchedule(const std::string& kind, const std::stri
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(task));
-    return ResponseEnvelope("已创建定时任务，以data.task为准。", data);
+    return ResponseEnvelope("已创建" + schedule::Manager::DescribeTask(task) + "。", data);
 }
 
-std::string Application::ListSchedules() const {
+std::string Application::ListSchedules(const std::string& kind) const {
+    const auto filter = schedule::Manager::ParseKindFilter(kind);
+    const auto filtered = schedule_manager_.List(filter);
     cJSON* data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "kind", kind.c_str());
     cJSON* tasks = cJSON_AddArrayToObject(data, "tasks");
-    for (const auto& task : schedule_manager_.tasks()) {
+    std::string response;
+    for (const auto& task : filtered) {
         cJSON_AddItemToArray(tasks, ScheduleTaskJson(task));
+        if (!response.empty()) response += "；";
+        response += schedule::Manager::DescribeTask(task);
     }
-    cJSON_AddBoolToObject(data, "alert_active", schedule_alert_active_);
-    if (schedule_alert_active_) {
+    const bool active_matches = schedule_alert_active_ &&
+        (filter == schedule::KindFilter::kAll ||
+         (filter == schedule::KindFilter::kAlarm &&
+          active_schedule_task_.kind == schedule::Kind::kAlarm) ||
+         (filter == schedule::KindFilter::kReminder &&
+          active_schedule_task_.kind == schedule::Kind::kReminder));
+    cJSON_AddBoolToObject(data, "alert_active", active_matches);
+    if (active_matches) {
         cJSON_AddItemToObject(data, "active", ScheduleTaskJson(active_schedule_task_));
+        if (!response.empty()) response += "；";
+        response += "当前正在响铃的" + schedule::Manager::DescribeTask(active_schedule_task_);
     }
-    return ResponseEnvelope("已列出全部定时任务，以data为准。", data);
+    if (response.empty()) {
+        response = std::string("当前没有未触发的") + KindFilterChinese(filter) + "。";
+    } else {
+        response = std::string("当前") + KindFilterChinese(filter) + "有：" + response + "。";
+    }
+    return ResponseEnvelope(response, data);
 }
 
 std::string Application::DeleteSchedule(uint32_t id) {
+    const auto* found = schedule_manager_.Find(id);
+    if (found == nullptr) throw std::invalid_argument("未找到指定id的定时任务");
+    const auto deleted = *found;
     if (!schedule_manager_.Delete(id)) throw std::invalid_argument("未找到指定id的定时任务");
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "deleted_id", id);
-    return ResponseEnvelope("已删除定时任务。", data);
+    cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(deleted.kind));
+    return ResponseEnvelope("已删除" + schedule::Manager::DescribeTask(deleted) + "。", data);
 }
 
-std::string Application::ClearSchedules() {
-    const size_t count = schedule_manager_.Clear();
+std::string Application::ClearSchedules(const std::string& kind) {
+    const auto filter = schedule::Manager::ParseKindFilter(kind);
+    const size_t count = schedule_manager_.Clear(filter);
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "kind", kind.c_str());
     cJSON_AddNumberToObject(data, "cleared", count);
-    return ResponseEnvelope("已清空全部未触发的定时任务。", data);
+    return ResponseEnvelope("已清空" + std::to_string(count) + "个未触发的" +
+                                KindFilterChinese(filter) + "。",
+                            data);
 }
 
 std::string Application::StopScheduleAlert() {
     if (!schedule_alert_active_) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
-    const uint32_t stopped_id = active_schedule_task_.id;
+    const auto stopped = active_schedule_task_;
     FinishScheduleAlert();
     StartNextScheduleAlert();
     cJSON* data = cJSON_CreateObject();
-    cJSON_AddNumberToObject(data, "stopped_id", stopped_id);
-    return ResponseEnvelope("已停止当前闹铃或提醒。", data);
+    cJSON_AddNumberToObject(data, "stopped_id", stopped.id);
+    cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(stopped.kind));
+    return ResponseEnvelope("已停止任务ID " + std::to_string(stopped.id) + "，类型" +
+                                (stopped.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒") +
+                                "。",
+                            data);
 }
 
 std::string Application::SnoozeScheduleAlert(int minutes) {
@@ -1778,7 +1807,9 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", previous.id);
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(snoozed));
-    return ResponseEnvelope("已稍后提醒，以data.task为准。", data);
+    return ResponseEnvelope("已将任务ID " + std::to_string(previous.id) + "稍后处理，新建" +
+                                schedule::Manager::DescribeTask(snoozed) + "。",
+                            data);
 }
 
 void Application::ResetProtocol() {

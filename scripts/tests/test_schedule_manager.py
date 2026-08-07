@@ -45,6 +45,12 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("speak", application)
         for tool in ("create", "list", "delete", "clear", "stop", "snooze"):
             self.assertIn(f'"self.schedule.{tool}"', mcp)
+        self.assertGreaterEqual(
+            mcp.count('Property("kind", kPropertyTypeString, std::string("all"))'), 2
+        )
+        self.assertIn("Manager::DescribeTask", application)
+        self.assertIn("ParseKindFilter", application)
+        self.assertIn("std::unique_ptr<cJSON, decltype(&cJSON_Delete)>", application)
         self.assertIn("IsScheduleAlertActive", board)
 
 

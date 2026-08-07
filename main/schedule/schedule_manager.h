@@ -11,6 +11,7 @@
 namespace schedule {
 
 enum class Kind { kAlarm, kReminder };
+enum class KindFilter { kAll, kAlarm, kReminder };
 enum class Repeat { kOnce, kDaily, kWeekdays, kWeekends, kWeekly };
 
 struct Task {
@@ -48,14 +49,18 @@ public:
     Task Create(const CreateRequest& request, std::time_t now);
     Task Snooze(const Task& source, int minutes, std::time_t now);
     bool Delete(uint32_t id);
-    size_t Clear();
+    const Task* Find(uint32_t id) const;
+    std::vector<Task> List(KindFilter filter) const;
+    size_t Clear(KindFilter filter = KindFilter::kAll);
     TickResult Tick(std::time_t now, bool time_valid);
 
     static std::time_t NextOccurrence(const Task& task, std::time_t after);
     static const char* KindName(Kind kind);
     static const char* RepeatName(Repeat repeat);
     static Kind ParseKind(const std::string& value);
+    static KindFilter ParseKindFilter(const std::string& value);
     static Repeat ParseRepeat(const std::string& value);
+    static std::string DescribeTask(const Task& task);
 
 private:
     std::vector<Task> tasks_;

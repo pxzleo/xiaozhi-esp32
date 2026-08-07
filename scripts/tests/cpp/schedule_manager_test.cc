@@ -48,16 +48,69 @@ void TestLimitDeleteAndClear() {
 void TestFiveRepeatsAndCrossDay() {
     Manager manager;
     const auto friday = At(2026, 8, 7, 9);
+    const auto saturday = At(2026, 8, 8, 9);
     auto once = Add(manager, Kind::kReminder, Repeat::kOnce, friday);
     auto daily = Add(manager, Kind::kReminder, Repeat::kDaily, friday);
     auto weekdays = Add(manager, Kind::kReminder, Repeat::kWeekdays, friday);
-    auto weekends = Add(manager, Kind::kReminder, Repeat::kWeekends, friday);
-    auto weekly = Add(manager, Kind::kReminder, Repeat::kWeekly, friday, {1, 3});
+    auto weekends = Add(manager, Kind::kReminder, Repeat::kWeekends, saturday);
+    auto weekly = Add(manager, Kind::kReminder, Repeat::kWeekly, friday, {1, 3, 5});
     assert(Manager::NextOccurrence(once, friday) == 0);
     assert(Manager::NextOccurrence(daily, friday) == At(2026, 8, 8, 9));
     assert(Manager::NextOccurrence(weekdays, friday) == At(2026, 8, 10, 9));
-    assert(Manager::NextOccurrence(weekends, friday) == At(2026, 8, 8, 9));
+    assert(Manager::NextOccurrence(weekends, saturday) == At(2026, 8, 9, 9));
     assert(Manager::NextOccurrence(weekly, friday) == At(2026, 8, 10, 9));
+}
+
+void TestKindFiltersAndScopedClear() {
+    Manager manager;
+    Add(manager, Kind::kAlarm, Repeat::kOnce, At(2026, 8, 8, 8));
+    Add(manager, Kind::kReminder, Repeat::kOnce, At(2026, 8, 8, 9));
+    Add(manager, Kind::kAlarm, Repeat::kOnce, At(2026, 8, 8, 10));
+    assert(manager.List(KindFilter::kAll).size() == 3);
+    assert(manager.List(KindFilter::kAlarm).size() == 2);
+    assert(manager.List(KindFilter::kReminder).size() == 1);
+    assert(manager.Clear(KindFilter::kAlarm) == 2);
+    assert(manager.List(KindFilter::kAll).size() == 1);
+    assert(manager.Clear(KindFilter::kReminder) == 1);
+    assert(manager.Clear(KindFilter::kAll) == 0);
+    assert(Manager::ParseKindFilter("all") == KindFilter::kAll);
+}
+
+void TestFirstRepeatConstraintAndFirstTick() {
+    const auto friday = At(2026, 8, 7, 9);
+    const auto saturday = At(2026, 8, 8, 9);
+    Manager manager;
+    auto expect_rejected = [&manager](Repeat repeat, std::time_t when,
+                                      std::vector<int> weekdays = {}) {
+        bool rejected = false;
+        try {
+            Add(manager, Kind::kReminder, repeat, when, std::move(weekdays));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected);
+    };
+    expect_rejected(Repeat::kWeekdays, saturday);
+    expect_rejected(Repeat::kWeekends, friday);
+    expect_rejected(Repeat::kWeekly, friday, {1, 3});
+
+    manager.Tick(friday - 1, true);
+    auto task = Add(manager, Kind::kAlarm, Repeat::kWeekdays, friday);
+    auto first = manager.Tick(friday, true);
+    assert(first.triggered.size() == 1 && first.triggered[0].id == task.id);
+    assert(manager.tasks().size() == 1);
+    assert(manager.tasks()[0].trigger_at == At(2026, 8, 10, 9));
+}
+
+void TestNaturalTaskDescription() {
+    Manager manager;
+    auto task = Add(manager, Kind::kAlarm, Repeat::kWeekly, At(2026, 8, 7, 9), {1, 5});
+    const auto response = Manager::DescribeTask(task);
+    assert(response.find("任务ID 1") != std::string::npos);
+    assert(response.find("类型闹铃") != std::string::npos);
+    assert(response.find("2026-08-07T09:00:00") != std::string::npos);
+    assert(response.find("重复规则每周1、5") != std::string::npos);
+    assert(response.find("内容“测试提醒”") != std::string::npos);
 }
 
 void TestRecoveryAndOrderingAndDeduplication() {
@@ -115,6 +168,9 @@ int main() {
     tzset();
     TestLimitDeleteAndClear();
     TestFiveRepeatsAndCrossDay();
+    TestKindFiltersAndScopedClear();
+    TestFirstRepeatConstraintAndFirstTick();
+    TestNaturalTaskDescription();
     TestRecoveryAndOrderingAndDeduplication();
     TestInvalidTimeStopAndSnooze();
     return 0;

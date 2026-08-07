@@ -122,9 +122,9 @@ public:
     std::string CreateSchedule(const std::string& kind, const std::string& repeat,
                                const std::string& label, const std::string& trigger_at,
                                int delay_seconds, const std::string& weekdays);
-    std::string ListSchedules() const;
+    std::string ListSchedules(const std::string& kind) const;
     std::string DeleteSchedule(uint32_t id);
-    std::string ClearSchedules();
+    std::string ClearSchedules(const std::string& kind);
     std::string StopScheduleAlert();
     std::string SnoozeScheduleAlert(int minutes);
     bool IsScheduleAlertActive() const { return schedule_alert_active_.load(); }

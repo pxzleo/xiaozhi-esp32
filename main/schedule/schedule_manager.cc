@@ -44,6 +44,12 @@ bool ContainsDay(const std::vector<int>& days, int day) {
 
 int IsoWeekday(const std::tm& local) { return local.tm_wday == 0 ? 7 : local.tm_wday; }
 
+bool MatchesFilter(const Task& task, KindFilter filter) {
+    return filter == KindFilter::kAll ||
+        (filter == KindFilter::kAlarm && task.kind == Kind::kAlarm) ||
+        (filter == KindFilter::kReminder && task.kind == Kind::kReminder);
+}
+
 }  // namespace
 
 void Manager::Restore(std::vector<Task> tasks, uint32_t next_id) {
@@ -99,12 +105,25 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
         throw std::invalid_argument("只有weekly任务可以提供weekdays");
     }
 
+    const std::time_t first_trigger = has_delay ? now + request.delay_seconds : request.trigger_at;
+    std::tm first_local{};
+    if (localtime_r(&first_trigger, &first_local) == nullptr) {
+        throw std::invalid_argument("trigger_at不是有效本地时间");
+    }
+    const int first_weekday = IsoWeekday(first_local);
+    if ((request.repeat == Repeat::kWeekdays && first_weekday > 5) ||
+        (request.repeat == Repeat::kWeekends && first_weekday < 6) ||
+        (request.repeat == Repeat::kWeekly &&
+         !ContainsDay(request.weekdays, first_weekday))) {
+        throw std::invalid_argument("首次trigger_at不符合repeat重复规则");
+    }
+
     Task task;
     task.id = next_id_++;
     task.kind = request.kind;
     task.repeat = request.repeat;
     task.label = request.label;
-    task.trigger_at = has_delay ? now + request.delay_seconds : request.trigger_at;
+    task.trigger_at = first_trigger;
     task.weekdays = request.weekdays;
     std::sort(task.weekdays.begin(), task.weekdays.end());
     task.weekdays.erase(std::unique(task.weekdays.begin(), task.weekdays.end()),
@@ -133,10 +152,28 @@ bool Manager::Delete(uint32_t id) {
     return tasks_.size() != old_size;
 }
 
-size_t Manager::Clear() {
-    const size_t count = tasks_.size();
-    tasks_.clear();
-    return count;
+const Task* Manager::Find(uint32_t id) const {
+    auto found = std::find_if(tasks_.begin(), tasks_.end(),
+                              [id](const Task& task) { return task.id == id; });
+    return found == tasks_.end() ? nullptr : &*found;
+}
+
+std::vector<Task> Manager::List(KindFilter filter) const {
+    std::vector<Task> result;
+    for (const auto& task : tasks_) {
+        if (MatchesFilter(task, filter)) result.push_back(task);
+    }
+    return result;
+}
+
+size_t Manager::Clear(KindFilter filter) {
+    const size_t old_size = tasks_.size();
+    tasks_.erase(std::remove_if(tasks_.begin(), tasks_.end(),
+                                [filter](const Task& task) {
+                                    return MatchesFilter(task, filter);
+                                }),
+                 tasks_.end());
+    return old_size - tasks_.size();
 }
 
 std::time_t Manager::NextOccurrence(const Task& task, std::time_t after) {
@@ -234,6 +271,13 @@ Kind Manager::ParseKind(const std::string& value) {
     throw std::invalid_argument("kind必须是alarm或reminder");
 }
 
+KindFilter Manager::ParseKindFilter(const std::string& value) {
+    if (value == "all") return KindFilter::kAll;
+    if (value == "alarm") return KindFilter::kAlarm;
+    if (value == "reminder") return KindFilter::kReminder;
+    throw std::invalid_argument("kind必须是all/alarm/reminder之一");
+}
+
 Repeat Manager::ParseRepeat(const std::string& value) {
     if (value == "once") return Repeat::kOnce;
     if (value == "daily") return Repeat::kDaily;
@@ -241,6 +285,32 @@ Repeat Manager::ParseRepeat(const std::string& value) {
     if (value == "weekends") return Repeat::kWeekends;
     if (value == "weekly") return Repeat::kWeekly;
     throw std::invalid_argument("repeat必须是once/daily/weekdays/weekends/weekly之一");
+}
+
+std::string Manager::DescribeTask(const Task& task) {
+    std::tm local{};
+    if (localtime_r(&task.trigger_at, &local) == nullptr) {
+        throw std::runtime_error("无法格式化任务本地时间");
+    }
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &local);
+    const char* kind = task.kind == Kind::kAlarm ? "闹铃" : "提醒";
+    std::string repeat;
+    switch (task.repeat) {
+        case Repeat::kOnce: repeat = "单次"; break;
+        case Repeat::kDaily: repeat = "每天"; break;
+        case Repeat::kWeekdays: repeat = "工作日"; break;
+        case Repeat::kWeekends: repeat = "周末"; break;
+        case Repeat::kWeekly:
+            repeat = "每周";
+            for (size_t i = 0; i < task.weekdays.size(); ++i) {
+                if (i > 0) repeat += "、";
+                repeat += std::to_string(task.weekdays[i]);
+            }
+            break;
+    }
+    return "任务ID " + std::to_string(task.id) + "，类型" + kind + "，时间" + timestamp +
+        "，重复规则" + repeat + "，内容“" + task.label + "”";
 }
 
 const Task* AlertQueue::StartNext() {

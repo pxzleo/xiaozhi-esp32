@@ -271,12 +271,12 @@ sequenceDiagram
 ## 设备端定时闹铃与提醒
 
 设备公开以下普通 MCP 工具，均返回 JSON 字符串 envelope：
-`{"action":"RESPONSE","response":"...","data":{...}}`。调用方必须把 `data` 视为权威结果。
+`{"action":"RESPONSE","response":"...","data":{...}}`。`response` 是可直接播报的权威结果，`data` 提供同一结果的结构化表示。
 
 - `self.schedule.create`：创建闹铃或提醒。`kind` 为 `alarm/reminder`，`repeat` 为 `once/daily/weekdays/weekends/weekly`，`label` 为 1–80 个 Unicode 字符。`trigger_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`）与 `delay_seconds` 必须二选一；相对延时仅支持 `once`；`weekly` 用 `weekdays` 传 1–7（周一至周日）的逗号分隔列表。
-- `self.schedule.list`：列出全部任务和当前活动提醒。
+- `self.schedule.list`：按可选 `kind=all/alarm/reminder` 列出任务和匹配的当前活动提醒，默认 `all`。
 - `self.schedule.delete`：按任务 `id` 删除。
-- `self.schedule.clear`：清空全部尚未触发任务。
+- `self.schedule.clear`：按可选 `kind=all/alarm/reminder` 清空尚未触发任务，默认 `all`。
 - `self.schedule.stop`：停止当前提醒或闹铃。
 - `self.schedule.snooze`：当前提醒稍后再响，`minutes` 默认 5，范围 1–60。
 
@@ -298,3 +298,5 @@ sequenceDiagram
 ```
 
 该通知通过共享 `Protocol::SendMcpMessage` 发送，因此 WebSocket 与 MQTT/UDP 使用相同语义。
+
+所有调度工具 envelope 中的 `response` 都必须是可直接向用户播报的权威结果，不能要求主模型再次读取 `data` 才能确认。创建和稍后提醒结果包含任务 id、规范化本地时间、重复规则与内容；查询会自然枚举这些字段或明确说明为空；删除、清空和停止结果包含具体 id、类型或数量。`data` 仍保留供结构化处理。
