@@ -15,6 +15,7 @@ bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revi
 enum class Kind { kAlarm, kReminder };
 enum class KindFilter { kAll, kAlarm, kReminder };
 enum class Repeat { kOnce, kDaily, kWeekdays, kWeekends, kWeekly };
+enum class ReminderDeliveryState { kInactive, kWaitingForCue, kWaitingForTts, kSpeaking };
 
 struct Task {
     uint32_t id = 0;
@@ -81,6 +82,21 @@ public:
 private:
     std::deque<Task> pending_;
     std::optional<Task> active_;
+};
+
+class ReminderDeliverySequence {
+public:
+    void Begin(bool is_reminder);
+    bool OnPlaybackDrained();
+    bool OnTtsStarted();
+    bool OnTtsStopped();
+    bool CancelWaitingForTts();
+    bool NeedsServerAbort() const;
+    void Reset() { state_ = ReminderDeliveryState::kInactive; }
+    ReminderDeliveryState state() const { return state_; }
+
+private:
+    ReminderDeliveryState state_ = ReminderDeliveryState::kInactive;
 };
 
 }  // namespace schedule

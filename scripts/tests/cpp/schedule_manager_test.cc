@@ -201,6 +201,36 @@ void TestInvalidTimeStopAndSnooze() {
     assert(rejected);
 }
 
+void TestReminderDeliverySequence() {
+    ReminderDeliverySequence sequence;
+    assert(sequence.state() == ReminderDeliveryState::kInactive);
+
+    sequence.Begin(true);
+    assert(sequence.state() == ReminderDeliveryState::kWaitingForCue);
+    assert(!sequence.NeedsServerAbort());
+    assert(sequence.OnPlaybackDrained());
+    assert(sequence.state() == ReminderDeliveryState::kWaitingForTts);
+    assert(sequence.NeedsServerAbort());
+    assert(sequence.CancelWaitingForTts());
+    assert(sequence.state() == ReminderDeliveryState::kInactive);
+    assert(!sequence.CancelWaitingForTts());
+
+    sequence.Begin(true);
+    assert(sequence.OnPlaybackDrained());
+    assert(!sequence.OnPlaybackDrained());
+    assert(sequence.OnTtsStarted());
+    assert(sequence.state() == ReminderDeliveryState::kSpeaking);
+    assert(sequence.NeedsServerAbort());
+    assert(sequence.OnTtsStopped());
+    assert(sequence.state() == ReminderDeliveryState::kInactive);
+    assert(!sequence.NeedsServerAbort());
+
+    // An unrelated or stale TTS stop must not activate listening.
+    assert(!sequence.OnTtsStopped());
+    sequence.Begin(false);
+    assert(sequence.state() == ReminderDeliveryState::kInactive);
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -213,5 +243,6 @@ int main() {
     TestWhitespaceLabels();
     TestRecoveryAndOrderingAndDeduplication();
     TestInvalidTimeStopAndSnooze();
+    TestReminderDeliverySequence();
     return 0;
 }

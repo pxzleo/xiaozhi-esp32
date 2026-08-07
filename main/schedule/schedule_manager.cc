@@ -365,4 +365,38 @@ const Task& AlertQueue::current() const {
     return *active_;
 }
 
+void ReminderDeliverySequence::Begin(bool is_reminder) {
+    state_ = is_reminder ? ReminderDeliveryState::kWaitingForCue
+                         : ReminderDeliveryState::kInactive;
+}
+
+bool ReminderDeliverySequence::OnPlaybackDrained() {
+    if (state_ != ReminderDeliveryState::kWaitingForCue) return false;
+    state_ = ReminderDeliveryState::kWaitingForTts;
+    return true;
+}
+
+bool ReminderDeliverySequence::OnTtsStarted() {
+    if (state_ != ReminderDeliveryState::kWaitingForTts) return false;
+    state_ = ReminderDeliveryState::kSpeaking;
+    return true;
+}
+
+bool ReminderDeliverySequence::OnTtsStopped() {
+    if (state_ != ReminderDeliveryState::kSpeaking) return false;
+    state_ = ReminderDeliveryState::kInactive;
+    return true;
+}
+
+bool ReminderDeliverySequence::CancelWaitingForTts() {
+    if (state_ != ReminderDeliveryState::kWaitingForTts) return false;
+    state_ = ReminderDeliveryState::kInactive;
+    return true;
+}
+
+bool ReminderDeliverySequence::NeedsServerAbort() const {
+    return state_ == ReminderDeliveryState::kWaitingForTts ||
+           state_ == ReminderDeliveryState::kSpeaking;
+}
+
 }  // namespace schedule

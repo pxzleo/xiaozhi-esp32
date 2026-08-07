@@ -155,9 +155,11 @@ private:
     std::unique_ptr<Ota> ota_;
     schedule::Manager schedule_manager_;
     schedule::AlertQueue schedule_alert_queue_;
+    schedule::ReminderDeliverySequence reminder_delivery_;
     schedule::Task active_schedule_task_;
     std::atomic<bool> schedule_alert_active_{false};
     int64_t schedule_alert_deadline_us_ = 0;
+    int64_t schedule_reminder_tts_deadline_us_ = 0;
     int schedule_saved_volume_ = -1;
     uint32_t schedule_volume_revision_ = 0;
 
@@ -191,7 +193,8 @@ private:
     void SaveSchedules() const;
     void CheckSchedules();
     void StartNextScheduleAlert();
-    void FinishScheduleAlert();
+    void FinishScheduleAlert(bool reset_decoder = true, bool reset_delivery = true);
+    void RestoreScheduleAlertVolume();
     void NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
 
     // Activation task (runs in background)

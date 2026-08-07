@@ -26,6 +26,10 @@
 
 namespace {
 
+constexpr int kScheduleAlertMinimumVolume = 80;
+constexpr int kReminderCueRepeats = 2;
+constexpr int kReminderTtsStartTimeoutSeconds = 15;
+
 struct ToolStatusTranslation {
     std::string_view keyword;
     const char* message;
@@ -473,6 +477,15 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+            if (schedule_alert_active_ &&
+                active_schedule_task_.kind == schedule::Kind::kReminder &&
+                audio_service_.IsPlaybackIdle() &&
+                reminder_delivery_.OnPlaybackDrained()) {
+                schedule_reminder_tts_deadline_us_ = esp_timer_get_time() +
+                    kReminderTtsStartTimeoutSeconds * 1000000LL;
+                NotifyReminderTriggered(active_schedule_task_, std::time(nullptr));
+            }
+
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
             if (pending_listening_start_ && GetDeviceState() == kDeviceStateListening &&
@@ -843,11 +856,24 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    if (reminder_delivery_.OnTtsStarted()) {
+                        schedule_reminder_tts_deadline_us_ = 0;
+                    }
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    if (reminder_delivery_.OnTtsStopped()) {
+                        schedule_reminder_tts_deadline_us_ = 0;
+                        RestoreScheduleAlertVolume();
+                        listening_mode_ = GetDefaultListeningMode();
+                        SetDeviceState(kDeviceStateListening);
+                        if (!schedule_alert_active_) {
+                            StartNextScheduleAlert();
+                        }
+                        return;
+                    }
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -1665,11 +1691,27 @@ void Application::CheckSchedules() {
         settings.SetString("last_missed", JsonString(missed));
     }
     for (const auto& task : result.triggered) schedule_alert_queue_.Enqueue(task);
-    if (!schedule_alert_active_) StartNextScheduleAlert();
-    if (!schedule_alert_active_) return;
-    if (esp_timer_get_time() >= schedule_alert_deadline_us_) {
-        FinishScheduleAlert();
+    const int64_t now_us = esp_timer_get_time();
+    if (schedule_reminder_tts_deadline_us_ > 0 &&
+        now_us >= schedule_reminder_tts_deadline_us_ &&
+        reminder_delivery_.CancelWaitingForTts()) {
+        schedule_reminder_tts_deadline_us_ = 0;
+        RestoreScheduleAlertVolume();
+    }
+    if (!schedule_alert_active_ &&
+        reminder_delivery_.state() == schedule::ReminderDeliveryState::kInactive) {
         StartNextScheduleAlert();
+    }
+    if (!schedule_alert_active_) return;
+    if (now_us >= schedule_alert_deadline_us_) {
+        const bool reminder_delivery_pending =
+            active_schedule_task_.kind == schedule::Kind::kReminder &&
+            reminder_delivery_.state() != schedule::ReminderDeliveryState::kInactive;
+        FinishScheduleAlert(active_schedule_task_.kind == schedule::Kind::kAlarm,
+                            !reminder_delivery_pending);
+        if (!reminder_delivery_pending) {
+            StartNextScheduleAlert();
+        }
     } else if (active_schedule_task_.kind == schedule::Kind::kAlarm &&
                audio_service_.IsPlaybackIdle()) {
         audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
@@ -1682,7 +1724,6 @@ void Application::StartNextScheduleAlert() {
     if (next == nullptr) return;
     active_schedule_task_ = *next;
     schedule_alert_active_ = true;
-    const std::time_t now = std::time(nullptr);
     schedule_alert_deadline_us_ = esp_timer_get_time() +
         (active_schedule_task_.kind == schedule::Kind::kAlarm ? 600LL : 60LL) * 1000000;
 
@@ -1693,32 +1734,45 @@ void Application::StartNextScheduleAlert() {
     auto codec = Board::GetInstance().GetAudioCodec();
     schedule_saved_volume_ = codec ? codec->output_volume() : -1;
     schedule_volume_revision_ = codec ? codec->output_volume_revision() : 0;
-    if (codec && schedule_saved_volume_ < 60) codec->SetOutputVolumeTransient(60);
+    if (codec && schedule_saved_volume_ < kScheduleAlertMinimumVolume) {
+        codec->SetOutputVolumeTransient(kScheduleAlertMinimumVolume);
+    }
 
     std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
     page += "  " + FormatLocalDateTime(active_schedule_task_.trigger_at).substr(11, 5) + "\n";
     page += active_schedule_task_.label;
     page += "\n按键停止 / 可语音稍后提醒";
     Board::GetInstance().GetDisplay()->SetChatMessage("system", page.c_str());
-    audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
-    if (active_schedule_task_.kind == schedule::Kind::kReminder) {
-        NotifyReminderTriggered(active_schedule_task_, now);
+    const bool is_reminder = active_schedule_task_.kind == schedule::Kind::kReminder;
+    reminder_delivery_.Begin(is_reminder);
+    const int cue_repeats = is_reminder ? kReminderCueRepeats : 1;
+    for (int i = 0; i < cue_repeats; ++i) {
+        audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
     }
 }
 
-void Application::FinishScheduleAlert() {
-    if (!schedule_alert_active_) return;
-    audio_service_.ResetDecoder();
-    if (schedule_saved_volume_ >= 0) {
-        if (auto codec = Board::GetInstance().GetAudioCodec()) {
-            if (schedule::ShouldRestoreTemporaryVolume(schedule_volume_revision_,
-                                                       codec->output_volume_revision())) {
-                codec->SetOutputVolumeTransient(schedule_saved_volume_);
-            }
+void Application::RestoreScheduleAlertVolume() {
+    if (schedule_saved_volume_ < 0) return;
+    if (auto codec = Board::GetInstance().GetAudioCodec()) {
+        if (schedule::ShouldRestoreTemporaryVolume(schedule_volume_revision_,
+                                                   codec->output_volume_revision())) {
+            codec->SetOutputVolumeTransient(schedule_saved_volume_);
         }
     }
-    Board::GetInstance().GetDisplay()->ClearChatMessages();
     schedule_saved_volume_ = -1;
+}
+
+void Application::FinishScheduleAlert(bool reset_decoder, bool reset_delivery) {
+    if (!schedule_alert_active_) return;
+    if (reset_decoder) {
+        audio_service_.ResetDecoder();
+    }
+    if (reset_delivery) {
+        reminder_delivery_.Reset();
+        schedule_reminder_tts_deadline_us_ = 0;
+    }
+    RestoreScheduleAlertVolume();
+    Board::GetInstance().GetDisplay()->ClearChatMessages();
     schedule_alert_queue_.Stop();
     schedule_alert_active_ = false;
 }
@@ -1814,6 +1868,9 @@ std::string Application::StopScheduleAlert() {
 
 bool Application::TryStopScheduleAlert() {
     if (!schedule_alert_active_) return false;
+    if (reminder_delivery_.NeedsServerAbort()) {
+        AbortSpeaking(kAbortReasonNone);
+    }
     FinishScheduleAlert();
     StartNextScheduleAlert();
     return true;
@@ -1823,6 +1880,9 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     if (!schedule_alert_active_) throw std::runtime_error("当前没有可稍后提醒的闹铃或提醒");
     const auto previous = active_schedule_task_;
     const auto snoozed = schedule_manager_.Snooze(previous, minutes, std::time(nullptr));
+    if (reminder_delivery_.NeedsServerAbort()) {
+        AbortSpeaking(kAbortReasonNone);
+    }
     FinishScheduleAlert();
     SaveSchedules();
     StartNextScheduleAlert();
