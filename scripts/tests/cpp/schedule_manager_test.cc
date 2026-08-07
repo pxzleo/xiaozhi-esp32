@@ -118,6 +118,39 @@ void TestTemporaryVolumeRestoreDecision() {
     assert(!ShouldRestoreTemporaryVolume(7, 8));
 }
 
+void TestWhitespaceLabels() {
+    const auto when = At(2026, 8, 8, 8);
+    auto create = [when](const std::string& label) {
+        Manager manager;
+        CreateRequest request;
+        request.kind = Kind::kReminder;
+        request.repeat = Repeat::kOnce;
+        request.label = label;
+        request.trigger_at = when;
+        return manager.Create(request, when - 1);
+    };
+    for (const auto& label : {std::string(" \t\r\n"), std::string("　　")}) {
+        bool rejected = false;
+        try {
+            create(label);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+    const std::string padded = "　 喝水 \t";
+    assert(create(padded).label == padded);
+
+    Manager restored;
+    bool rejected_restore = false;
+    try {
+        restored.Restore({{1, Kind::kReminder, Repeat::kOnce, "　", when, {}}}, 2);
+    } catch (const std::invalid_argument&) {
+        rejected_restore = true;
+    }
+    assert(rejected_restore);
+}
+
 void TestRecoveryAndOrderingAndDeduplication() {
     const auto now = At(2026, 8, 7, 10);
     Manager recovery;
@@ -177,6 +210,7 @@ int main() {
     TestFirstRepeatConstraintAndFirstTick();
     TestNaturalTaskDescription();
     TestTemporaryVolumeRestoreDecision();
+    TestWhitespaceLabels();
     TestRecoveryAndOrderingAndDeduplication();
     TestInvalidTimeStopAndSnooze();
     return 0;

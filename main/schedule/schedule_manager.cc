@@ -11,8 +11,22 @@ bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revi
 
 namespace {
 
-size_t Utf8CodePoints(const std::string& value) {
+struct Utf8Stats {
     size_t count = 0;
+    bool valid = true;
+    bool has_non_whitespace = false;
+};
+
+bool IsUnicodeWhitespace(uint32_t codepoint) {
+    return (codepoint >= 0x0009 && codepoint <= 0x000d) || codepoint == 0x0020 ||
+        codepoint == 0x0085 || codepoint == 0x00a0 || codepoint == 0x1680 ||
+        (codepoint >= 0x2000 && codepoint <= 0x200a) || codepoint == 0x2028 ||
+        codepoint == 0x2029 || codepoint == 0x202f || codepoint == 0x205f ||
+        codepoint == 0x3000;
+}
+
+Utf8Stats AnalyzeUtf8(const std::string& value) {
+    Utf8Stats stats;
     for (size_t i = 0; i < value.size();) {
         const auto first = static_cast<unsigned char>(value[i]);
         size_t length = 0;
@@ -25,22 +39,36 @@ size_t Utf8CodePoints(const std::string& value) {
         } else if (first >= 0xf0 && first <= 0xf4) {
             length = 4;
         } else {
-            return 0;
+            stats.valid = false;
+            return stats;
         }
-        if (i + length > value.size()) return 0;
+        if (i + length > value.size()) {
+            stats.valid = false;
+            return stats;
+        }
         for (size_t j = 1; j < length; ++j) {
-            if ((static_cast<unsigned char>(value[i + j]) & 0xc0) != 0x80) return 0;
+            if ((static_cast<unsigned char>(value[i + j]) & 0xc0) != 0x80) {
+                stats.valid = false;
+                return stats;
+            }
         }
         if ((first == 0xe0 && static_cast<unsigned char>(value[i + 1]) < 0xa0) ||
             (first == 0xed && static_cast<unsigned char>(value[i + 1]) >= 0xa0) ||
             (first == 0xf0 && static_cast<unsigned char>(value[i + 1]) < 0x90) ||
             (first == 0xf4 && static_cast<unsigned char>(value[i + 1]) >= 0x90)) {
-            return 0;
+            stats.valid = false;
+            return stats;
         }
+        uint32_t codepoint = first;
+        if (length > 1) codepoint &= (1u << (7 - length)) - 1;
+        for (size_t j = 1; j < length; ++j) {
+            codepoint = (codepoint << 6) | (static_cast<unsigned char>(value[i + j]) & 0x3f);
+        }
+        stats.has_non_whitespace = stats.has_non_whitespace || !IsUnicodeWhitespace(codepoint);
         i += length;
-        ++count;
+        ++stats.count;
     }
-    return count;
+    return stats;
 }
 
 bool ContainsDay(const std::vector<int>& days, int day) {
@@ -63,8 +91,9 @@ void Manager::Restore(std::vector<Task> tasks, uint32_t next_id) {
     }
     uint32_t max_id = 0;
     for (const auto& task : tasks) {
-        const size_t label_length = Utf8CodePoints(task.label);
-        if (task.id == 0 || task.trigger_at <= 0 || label_length < 1 || label_length > 80) {
+        const auto label = AnalyzeUtf8(task.label);
+        if (task.id == 0 || task.trigger_at <= 0 || !label.valid || label.count < 1 ||
+            label.count > 80 || !label.has_non_whitespace) {
             throw std::invalid_argument("保存的定时任务字段无效");
         }
         if (task.repeat == Repeat::kWeekly && task.weekdays.empty()) {
@@ -85,9 +114,9 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
     if (tasks_.size() >= kMaxTasks) {
         throw std::runtime_error("定时任务已达16项上限");
     }
-    const size_t label_length = Utf8CodePoints(request.label);
-    if (label_length < 1 || label_length > 80) {
-        throw std::invalid_argument("内容长度必须为1到80个Unicode字符");
+    const auto label = AnalyzeUtf8(request.label);
+    if (!label.valid || label.count < 1 || label.count > 80 || !label.has_non_whitespace) {
+        throw std::invalid_argument("内容必须是1到80个Unicode字符且不能全为空白");
     }
     const bool has_absolute = request.trigger_at > 0;
     const bool has_delay = request.delay_seconds > 0;
