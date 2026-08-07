@@ -539,9 +539,12 @@ void AfeAudioEngine::HandleBargeInResult(const afe_fetch_result_t* result) {
 
     const double minimum_rms = std::max(20.0, barge_in_noise_rms_ * 2.5);
     const double correlation_limit = std::clamp(barge_in_echo_correlation_ - 0.15, 0.45, 0.68);
-    const bool near_end_frame = result->vad_state == VAD_SPEECH &&
+    // Without a valid playback reference, loudspeaker leakage cannot be
+    // distinguished reliably from near-end speech. Never let that degraded
+    // path abort long-form audio such as music.
+    const bool near_end_frame = has_reference && result->vad_state == VAD_SPEECH &&
         post_rms >= minimum_rms && post_peak >= 150 &&
-        (!has_reference || std::abs(correlation) <= correlation_limit);
+        std::abs(correlation) <= correlation_limit;
 
     const int64_t now = esp_timer_get_time();
     if (now - barge_in_last_diagnostic_us_ >= 1000000) {
