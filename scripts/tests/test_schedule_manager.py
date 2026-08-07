@@ -154,7 +154,12 @@ class ScheduleManagerTest(unittest.TestCase):
         alarm_repeat = application.split(
             "active_schedule_task_.kind == schedule::Kind::kAlarm &&", 1
         )[1].split("void Application::StartNextScheduleAlert", 1)[0]
-        self.assertIn("ReminderDeliveryState::kInactive", alarm_repeat)
+        self.assertIn(
+            "reminder_delivery_.state() != schedule::ReminderDeliveryState::kSpeaking",
+            alarm_repeat,
+        )
+        self.assertIn("GetDeviceState() != kDeviceStateSpeaking", alarm_repeat)
+        self.assertNotIn("ReminderDeliveryState::kInactive", alarm_repeat)
 
         audio = (ROOT / "main" / "audio" / "audio_codec.cc").read_text(encoding="utf-8")
         transient = audio.split("void AudioCodec::SetOutputVolumeTransient", 1)[1]

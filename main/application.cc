@@ -1758,7 +1758,8 @@ void Application::CheckSchedules() {
             StartNextScheduleAlert();
         }
     } else if (active_schedule_task_.kind == schedule::Kind::kAlarm &&
-               reminder_delivery_.state() == schedule::ReminderDeliveryState::kInactive &&
+               reminder_delivery_.state() != schedule::ReminderDeliveryState::kSpeaking &&
+               GetDeviceState() != kDeviceStateSpeaking &&
                audio_service_.IsPlaybackIdle()) {
         audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
     }
