@@ -51,7 +51,19 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("Manager::DescribeTask", application)
         self.assertIn("ParseKindFilter", application)
         self.assertIn("std::unique_ptr<cJSON, decltype(&cJSON_Delete)>", application)
-        self.assertIn("IsScheduleAlertActive", board)
+        self.assertIn("last_load_error", application)
+        self.assertIn("schedule_manager_.Restore({}, 1)", application)
+        self.assertIn("esp_timer_get_time() >= schedule_alert_deadline_us_", application)
+        self.assertIn("netease_lyrics_.Clear()", application)
+        self.assertIn("CloseNeteaseMusicLyrics()", application)
+        self.assertIn("TryStopScheduleAlert", board)
+        self.assertNotIn("IsScheduleAlertActive", board)
+
+        audio = (ROOT / "main" / "audio" / "audio_codec.cc").read_text(encoding="utf-8")
+        transient = audio.split("void AudioCodec::SetOutputVolumeTransient", 1)[1]
+        transient = transient.split("void AudioCodec::SetInputGain", 1)[0]
+        self.assertNotIn("Settings", transient)
+        self.assertIn("suppress_volume_persistence_", transient)
 
 
 if __name__ == "__main__":

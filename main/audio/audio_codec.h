@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <atomic>
 
 #include "board.h"
 
@@ -46,6 +47,7 @@ public:
     inline int input_channels() const { return input_channels_; }
     inline int output_channels() const { return output_channels_; }
     inline int output_volume() const { return output_volume_; }
+    inline uint32_t output_volume_revision() const { return output_volume_revision_.load(); }
     inline float input_gain() const { return input_gain_; }
     inline bool input_enabled() const { return input_enabled_; }
     inline bool output_enabled() const { return output_enabled_; }
@@ -63,6 +65,8 @@ protected:
     int input_channels_ = 1;
     int output_channels_ = 1;
     int output_volume_ = 70;
+    std::atomic<uint32_t> output_volume_revision_{0};
+    std::atomic<bool> suppress_volume_persistence_{false};
     float input_gain_ = 0.0;
 
     virtual int Read(int16_t* dest, int samples) = 0;

@@ -10,6 +10,8 @@
 
 namespace schedule {
 
+bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revision);
+
 enum class Kind { kAlarm, kReminder };
 enum class KindFilter { kAll, kAlarm, kReminder };
 enum class Repeat { kOnce, kDaily, kWeekdays, kWeekends, kWeekly };

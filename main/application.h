@@ -126,6 +126,7 @@ public:
     std::string DeleteSchedule(uint32_t id);
     std::string ClearSchedules(const std::string& kind);
     std::string StopScheduleAlert();
+    bool TryStopScheduleAlert();
     std::string SnoozeScheduleAlert(int minutes);
     bool IsScheduleAlertActive() const { return schedule_alert_active_.load(); }
     
@@ -156,8 +157,9 @@ private:
     schedule::AlertQueue schedule_alert_queue_;
     schedule::Task active_schedule_task_;
     std::atomic<bool> schedule_alert_active_{false};
-    std::time_t schedule_alert_deadline_ = 0;
+    int64_t schedule_alert_deadline_us_ = 0;
     int schedule_saved_volume_ = -1;
+    uint32_t schedule_volume_revision_ = 0;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 

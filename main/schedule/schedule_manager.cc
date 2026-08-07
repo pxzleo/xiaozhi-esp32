@@ -4,6 +4,11 @@
 #include <stdexcept>
 
 namespace schedule {
+
+bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revision) {
+    return start_revision == current_revision;
+}
+
 namespace {
 
 size_t Utf8CodePoints(const std::string& value) {

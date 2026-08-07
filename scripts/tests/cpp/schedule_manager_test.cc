@@ -113,6 +113,11 @@ void TestNaturalTaskDescription() {
     assert(response.find("内容“测试提醒”") != std::string::npos);
 }
 
+void TestTemporaryVolumeRestoreDecision() {
+    assert(ShouldRestoreTemporaryVolume(7, 7));
+    assert(!ShouldRestoreTemporaryVolume(7, 8));
+}
+
 void TestRecoveryAndOrderingAndDeduplication() {
     const auto now = At(2026, 8, 7, 10);
     Manager recovery;
@@ -171,6 +176,7 @@ int main() {
     TestKindFiltersAndScopedClear();
     TestFirstRepeatConstraintAndFirstTick();
     TestNaturalTaskDescription();
+    TestTemporaryVolumeRestoreDecision();
     TestRecoveryAndOrderingAndDeduplication();
     TestInvalidTimeStopAndSnooze();
     return 0;

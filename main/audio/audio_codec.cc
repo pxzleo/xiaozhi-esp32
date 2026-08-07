@@ -40,17 +40,22 @@ void AudioCodec::Start() {
 void AudioCodec::SetOutputVolume(int volume) {
     output_volume_ = volume;
     ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
-    
+
+    if (suppress_volume_persistence_.load()) return;
+    output_volume_revision_.fetch_add(1);
     Settings settings("audio", true);
     settings.SetInt("output_volume", output_volume_);
 }
 
 void AudioCodec::SetOutputVolumeTransient(int volume) {
-    Settings settings("audio");
-    const int persisted_volume = settings.GetInt("output_volume", output_volume_);
-    SetOutputVolume(volume);
-    Settings writable_settings("audio", true);
-    writable_settings.SetInt("output_volume", persisted_volume);
+    suppress_volume_persistence_.store(true);
+    try {
+        SetOutputVolume(volume);
+    } catch (...) {
+        suppress_volume_persistence_.store(false);
+        throw;
+    }
+    suppress_volume_persistence_.store(false);
 }
 
 void AudioCodec::SetInputGain(float gain) {

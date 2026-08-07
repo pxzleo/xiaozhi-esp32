@@ -354,7 +354,17 @@ void Application::Initialize() {
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
     // Add MCP common tools (only once during initialization)
-    LoadSchedules();
+    try {
+        LoadSchedules();
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "Failed to load schedules; quarantining damaged data: %s", error.what());
+        Settings settings("schedule", true);
+        settings.SetString("last_load_error", error.what());
+        settings.SetInt("chunks", 0);
+        settings.EraseKey("tasks");
+        for (int i = 0; i < 8; ++i) settings.EraseKey("data" + std::to_string(i));
+        schedule_manager_.Restore({}, 1);
+    }
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
@@ -1657,7 +1667,7 @@ void Application::CheckSchedules() {
     for (const auto& task : result.triggered) schedule_alert_queue_.Enqueue(task);
     if (!schedule_alert_active_) StartNextScheduleAlert();
     if (!schedule_alert_active_) return;
-    if (now >= schedule_alert_deadline_) {
+    if (esp_timer_get_time() >= schedule_alert_deadline_us_) {
         FinishScheduleAlert();
         StartNextScheduleAlert();
     } else if (active_schedule_task_.kind == schedule::Kind::kAlarm &&
@@ -1673,13 +1683,16 @@ void Application::StartNextScheduleAlert() {
     active_schedule_task_ = *next;
     schedule_alert_active_ = true;
     const std::time_t now = std::time(nullptr);
-    schedule_alert_deadline_ = now +
-        (active_schedule_task_.kind == schedule::Kind::kAlarm ? 600 : 60);
+    schedule_alert_deadline_us_ = esp_timer_get_time() +
+        (active_schedule_task_.kind == schedule::Kind::kAlarm ? 600LL : 60LL) * 1000000;
 
     AbortSpeaking(kAbortReasonNone);
     audio_service_.ResetDecoder();
+    netease_lyrics_.Clear();
+    Board::GetInstance().GetDisplay()->CloseNeteaseMusicLyrics();
     auto codec = Board::GetInstance().GetAudioCodec();
     schedule_saved_volume_ = codec ? codec->output_volume() : -1;
+    schedule_volume_revision_ = codec ? codec->output_volume_revision() : 0;
     if (codec && schedule_saved_volume_ < 60) codec->SetOutputVolumeTransient(60);
 
     std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
@@ -1698,7 +1711,10 @@ void Application::FinishScheduleAlert() {
     audio_service_.ResetDecoder();
     if (schedule_saved_volume_ >= 0) {
         if (auto codec = Board::GetInstance().GetAudioCodec()) {
-            codec->SetOutputVolumeTransient(schedule_saved_volume_);
+            if (schedule::ShouldRestoreTemporaryVolume(schedule_volume_revision_,
+                                                       codec->output_volume_revision())) {
+                codec->SetOutputVolumeTransient(schedule_saved_volume_);
+            }
         }
     }
     Board::GetInstance().GetDisplay()->ClearChatMessages();
@@ -1786,8 +1802,7 @@ std::string Application::ClearSchedules(const std::string& kind) {
 std::string Application::StopScheduleAlert() {
     if (!schedule_alert_active_) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
     const auto stopped = active_schedule_task_;
-    FinishScheduleAlert();
-    StartNextScheduleAlert();
+    if (!TryStopScheduleAlert()) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "stopped_id", stopped.id);
     cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(stopped.kind));
@@ -1795,6 +1810,13 @@ std::string Application::StopScheduleAlert() {
                                 (stopped.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒") +
                                 "。",
                             data);
+}
+
+bool Application::TryStopScheduleAlert() {
+    if (!schedule_alert_active_) return false;
+    FinishScheduleAlert();
+    StartNextScheduleAlert();
+    return true;
 }
 
 std::string Application::SnoozeScheduleAlert(int minutes) {
