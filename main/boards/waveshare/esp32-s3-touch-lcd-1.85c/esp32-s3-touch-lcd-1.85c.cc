@@ -37,7 +37,8 @@ private:
     static constexpr size_t kAfeChannels = 2;
     static constexpr int64_t kPlaybackHoldUs = 250000;
     static constexpr uint32_t kReportSamples = 16000;
-    static constexpr float kMicrophoneGainDb = 9.0f;
+    static constexpr float kIdleMicrophoneGainDb = 30.0f;
+    static constexpr float kPlaybackMicrophoneGainDb = 9.0f;
     static constexpr float kReferenceGainDb = 30.0f;
     static constexpr float kUnusedChannelGainDb = 0.0f;
 
@@ -54,6 +55,22 @@ private:
     std::atomic<int64_t> playback_active_until_us_ = 0;
     std::atomic<uint32_t> playback_rms_ = 0;
     uint32_t diagnostic_samples_ = 0;
+    float microphone_gain_db_ = kIdleMicrophoneGainDb;
+
+    void UpdateMicrophoneGain(bool playback_active) {
+        const float target_gain_db = playback_active
+            ? kPlaybackMicrophoneGainDb : kIdleMicrophoneGainDb;
+        if (target_gain_db == microphone_gain_db_) {
+            return;
+        }
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+            input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), target_gain_db));
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+            input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), target_gain_db));
+        microphone_gain_db_ = target_gain_db;
+        ESP_LOGI("AecDiag", "Microphone gain changed to %.0f dB (%s)",
+            microphone_gain_db_, playback_active ? "answering" : "idle");
+    }
 
     static double CalculateRms(const ChannelStats& stats, uint32_t samples) {
         return samples == 0 ? 0.0 : std::sqrt(static_cast<double>(stats.sum_squares) / samples);
@@ -132,12 +149,14 @@ protected:
             return samples;
         }
 
+        const bool playback_active = esp_timer_get_time() <= playback_active_until_us_.load();
+        UpdateMicrophoneGain(playback_active);
+
         const size_t frames = samples / kAfeChannels;
         raw_buffer_.resize(frames * kRawChannels);
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             esp_codec_dev_read(input_dev_, raw_buffer_.data(), raw_buffer_.size() * sizeof(int16_t)));
 
-        const bool playback_active = esp_timer_get_time() <= playback_active_until_us_.load();
         for (size_t frame_index = 0; frame_index < frames; ++frame_index) {
             const int16_t* raw_frame = raw_buffer_.data() + frame_index * kRawChannels;
             // Preserve the current AFE route while observing every ES7210 TDM slot.
@@ -197,15 +216,17 @@ public:
             };
             ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
             ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
-                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), kMicrophoneGainDb));
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), kIdleMicrophoneGainDb));
             ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
-                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), kMicrophoneGainDb));
+                input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), kIdleMicrophoneGainDb));
             ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
                 input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), kReferenceGainDb));
             ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
                 input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3), kUnusedChannelGainDb));
-            ESP_LOGI("AecDiag", "Raw ES7210 capture enabled: MIC1/MIC2=%.0f dB, AEC reference=%.0f dB",
-                kMicrophoneGainDb, kReferenceGainDb);
+            microphone_gain_db_ = kIdleMicrophoneGainDb;
+            ESP_LOGI("AecDiag",
+                "Raw ES7210 capture enabled: MIC1/MIC2=%.0f dB idle, %.0f dB answering, AEC reference=%.0f dB",
+                kIdleMicrophoneGainDb, kPlaybackMicrophoneGainDb, kReferenceGainDb);
         } else {
             ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
             ResetDiagnostics();

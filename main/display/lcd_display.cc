@@ -33,6 +33,16 @@ constexpr int kRoundTextMargin = 16;
 constexpr uint32_t kNeutralIdleDelayMinMs = 2200;
 constexpr uint32_t kNeutralIdleDelayMaxMs = 5200;
 
+bool UseRoundChatLayout(int width, int height) {
+#if defined(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C)
+    // This board is always the 360x360 round panel. Keep its subtitle layout
+    // independent from any runtime resolution/rotation reporting differences.
+    return true;
+#else
+    return width == kRoundScreenSize && height == kRoundScreenSize;
+#endif
+}
+
 struct NeutralIdleFrame {
     const char* emotion;
     int8_t offset_x;
@@ -983,7 +993,7 @@ void LcdDisplay::SetupUI() {
 
     /* Bottom layer: emoji_box_ - centered display */
     emoji_box_ = lv_obj_create(screen);
-    const bool is_round_screen = width_ == kRoundScreenSize && height_ == kRoundScreenSize;
+    const bool is_round_screen = UseRoundChatLayout(width_, height_);
     lv_obj_set_size(emoji_box_, is_round_screen ? kRoundAvatarSize : LV_SIZE_CONTENT,
                     is_round_screen ? kRoundAvatarSize : LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
@@ -1098,7 +1108,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
-    if (width_ == kRoundScreenSize && height_ == kRoundScreenSize) {
+    if (is_round_screen) {
         /* Round-screen subtitles: one label per line, each sized to the circle chord. */
         bottom_bar_ = lv_obj_create(screen);
         lv_obj_set_size(bottom_bar_, LV_HOR_RES, kRoundChatLineCount * kRoundChatLineStep);
@@ -1107,6 +1117,7 @@ void LcdDisplay::SetupUI() {
         lv_obj_set_style_border_width(bottom_bar_, 0, 0);
         lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
         lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_align(bottom_bar_, LV_ALIGN_TOP_MID, 0, kRoundChatTop);
 
         for (int line = 0; line < kRoundChatLineCount; ++line) {
@@ -1114,6 +1125,7 @@ void LcdDisplay::SetupUI() {
             lv_label_set_text(label, "");
             lv_obj_set_size(label, RoundLineWidth(line), kRoundChatLineStep);
             lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_font(label, text_font, 0);
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_color(label, lvgl_theme->text_color(), 0);
             lv_obj_align(label, LV_ALIGN_TOP_MID, 0, line * kRoundChatLineStep);
@@ -1121,6 +1133,8 @@ void LcdDisplay::SetupUI() {
         }
         chat_message_label_ = round_chat_labels_.front();
         lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Round subtitle layout enabled: %d lines at y=%d", kRoundChatLineCount,
+                 kRoundChatTop);
     } else {
 #if CONFIG_USE_MULTILINE_CHAT_MESSAGE
     /* Bottom bar - auto height, grows upward with wrapped text */
@@ -1248,6 +1262,8 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!round_chat_labels_.empty()) {
         const auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
         const auto lines = WrapRoundText(content, lvgl_theme->text_font()->font());
+        ESP_LOGI(TAG, "Round subtitle wrapped into %u line(s)",
+                 static_cast<unsigned>(lines.size()));
         for (size_t i = 0; i < round_chat_labels_.size(); ++i) {
             lv_label_set_text(round_chat_labels_[i], i < lines.size() ? lines[i].c_str() : "");
         }
@@ -1567,7 +1583,12 @@ void LcdDisplay::SetTheme(Theme* theme) {
     }
 #else
     // Simple UI mode - just update the main chat message
-    if (chat_message_label_ != nullptr) {
+    if (!round_chat_labels_.empty()) {
+        for (auto* label : round_chat_labels_) {
+            lv_obj_set_style_text_color(label, lvgl_theme->text_color(), 0);
+            lv_obj_set_style_text_font(label, lvgl_theme->text_font()->font(), 0);
+        }
+    } else if (chat_message_label_ != nullptr) {
         lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
     }
 

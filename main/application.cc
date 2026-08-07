@@ -15,9 +15,79 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <cctype>
 #include <cstring>
+#include <string_view>
 
 #define TAG "Application"
+
+namespace {
+
+struct ToolStatusTranslation {
+    std::string_view keyword;
+    const char* message;
+};
+
+// The server uses a leading "%" to mark display-only tool-call notifications,
+// for example "% web_search". Keep raw function names out of the user-facing UI.
+std::string LocalizeToolStatusMessage(const char* content) {
+    if (content == nullptr) {
+        return {};
+    }
+
+    std::string message(content);
+    const auto marker = message.find_first_not_of(" \t\r\n");
+    if (marker == std::string::npos || message[marker] != '%') {
+        return message;
+    }
+
+    std::string tool_name = message.substr(marker + 1);
+    const auto name_start = tool_name.find_first_not_of(" \t\r\n");
+    if (name_start != std::string::npos) {
+        tool_name.erase(0, name_start);
+    }
+    for (char& ch : tool_name) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+
+    static constexpr ToolStatusTranslation kTranslations[] = {
+        {"call_device", "呼叫设备"},  {"change_role", "切换角色"},
+        {"hass_", "控制智能家居"},    {"home_assistant", "控制智能家居"},
+        {"exit_intent", "结束对话"}, {"lunar", "查询日期"},
+        {"music", "播放音乐"},       {"song", "播放音乐"},
+        {"search", "开始搜索"},      {"find", "开始搜索"},
+        {"weather", "查询天气"},     {"forecast", "查询天气"},
+        {"news", "查询资讯"},        {"calendar", "查询日程"},
+        {"schedule", "查询日程"},    {"reminder", "设置提醒"},
+        {"alarm", "设置提醒"},       {"timer", "设置计时器"},
+        {"email", "处理邮件"},       {"mail", "处理邮件"},
+        {"navigation", "查询路线"},  {"route", "查询路线"},
+        {"map", "查询地点"},         {"location", "查询地点"},
+        {"camera", "查看画面"},      {"photo", "拍摄照片"},
+        {"image", "查看图片"},       {"vision", "查看画面"},
+        {"device_status", "检查设备状态"},
+        {"system_info", "查看设备信息"},
+        {"volume", "调整音量"},      {"brightness", "调整亮度"},
+        {"backlight", "调整亮度"},   {"theme", "切换主题"},
+        {"screen", "调整屏幕"},      {"display", "调整屏幕"},
+        {"light", "控制灯光"},       {"lamp", "控制灯光"},
+        {"led", "控制灯光"},         {"reboot", "重启设备"},
+        {"restart", "重启设备"},     {"upgrade", "升级设备"},
+        {"update", "更新设备"},      {"download", "下载内容"},
+        {"upload", "上传内容"},      {"phone", "拨打电话"},
+        {"message", "发送消息"},
+        {"time", "查询时间"},        {"date", "查询日期"},
+    };
+
+    for (const auto& translation : kTranslations) {
+        if (tool_name.find(translation.keyword) != std::string::npos) {
+            return translation.message;
+        }
+    }
+    return "正在处理，请稍候";
+}
+
+}  // namespace
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -593,7 +663,7 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([display, message = LocalizeToolStatusMessage(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
@@ -609,7 +679,7 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([display, message = LocalizeToolStatusMessage(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
