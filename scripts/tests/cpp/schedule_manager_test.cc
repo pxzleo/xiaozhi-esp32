@@ -113,6 +113,21 @@ void TestNaturalTaskDescription() {
     assert(response.find("内容“测试提醒”") != std::string::npos);
 }
 
+void TestShortCreationDescription() {
+    Manager manager;
+    const auto now = At(2026, 8, 7, 20);
+    auto today = Add(manager, Kind::kAlarm, Repeat::kOnce, At(2026, 8, 7, 21));
+    auto tomorrow = Add(manager, Kind::kReminder, Repeat::kOnce, At(2026, 8, 8, 8, 30));
+    auto day_after = Add(manager, Kind::kAlarm, Repeat::kOnce, At(2026, 8, 9, 9));
+    assert(Manager::DescribeCreation(today, now) == "已设置今天21点的闹铃。");
+    assert(Manager::DescribeCreation(tomorrow, now) == "已设置明天8点30分提醒你测试提醒。");
+    assert(Manager::DescribeCreation(day_after, now) == "已设置后天9点的闹铃。");
+    assert(Manager::DescribeCreation(tomorrow, now).find("任务ID") == std::string::npos);
+
+    Task weekly{9, Kind::kReminder, Repeat::kWeekly, "吃药", At(2026, 8, 7, 9), {1, 5}};
+    assert(Manager::DescribeCreation(weekly, now) == "已设置每周一、五9点提醒你吃药。");
+}
+
 void TestTemporaryVolumeRestoreDecision() {
     assert(ShouldRestoreTemporaryVolume(7, 7));
     assert(!ShouldRestoreTemporaryVolume(7, 8));
@@ -239,6 +254,7 @@ int main() {
     TestKindFiltersAndScopedClear();
     TestFirstRepeatConstraintAndFirstTick();
     TestNaturalTaskDescription();
+    TestShortCreationDescription();
     TestTemporaryVolumeRestoreDecision();
     TestWhitespaceLabels();
     TestRecoveryAndOrderingAndDeduplication();

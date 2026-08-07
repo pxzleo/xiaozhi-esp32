@@ -83,6 +83,21 @@ bool MatchesFilter(const Task& task, KindFilter filter) {
         (filter == KindFilter::kReminder && task.kind == Kind::kReminder);
 }
 
+const char* WeekdayChinese(int weekday) {
+    static constexpr const char* kWeekdays[] = {
+        "日", "一", "二", "三", "四", "五", "六",
+    };
+    return weekday >= 0 && weekday <= 6 ? kWeekdays[weekday] : "";
+}
+
+std::string FormatClock(std::time_t timestamp) {
+    std::tm local{};
+    localtime_r(&timestamp, &local);
+    std::string result = std::to_string(local.tm_hour) + "点";
+    if (local.tm_min != 0) result += std::to_string(local.tm_min) + "分";
+    return result;
+}
+
 }  // namespace
 
 void Manager::Restore(std::vector<Task> tasks, uint32_t next_id) {
@@ -345,6 +360,56 @@ std::string Manager::DescribeTask(const Task& task) {
     }
     return "任务ID " + std::to_string(task.id) + "，类型" + kind + "，时间" + timestamp +
         "，重复规则" + repeat + "，内容“" + task.label + "”";
+}
+
+std::string Manager::DescribeCreation(const Task& task, std::time_t now) {
+    std::tm trigger_local{};
+    std::tm now_local{};
+    localtime_r(&task.trigger_at, &trigger_local);
+    localtime_r(&now, &now_local);
+
+    std::string when;
+    switch (task.repeat) {
+        case Repeat::kDaily:
+            when = "每天";
+            break;
+        case Repeat::kWeekdays:
+            when = "工作日";
+            break;
+        case Repeat::kWeekends:
+            when = "周末";
+            break;
+        case Repeat::kWeekly:
+            when = "每周";
+            for (size_t i = 0; i < task.weekdays.size(); ++i) {
+                if (i != 0) when += "、";
+                when += WeekdayChinese(task.weekdays[i] % 7);
+            }
+            break;
+        case Repeat::kOnce: {
+            std::tm trigger_day = trigger_local;
+            std::tm current_day = now_local;
+            trigger_day.tm_hour = trigger_day.tm_min = trigger_day.tm_sec = 0;
+            current_day.tm_hour = current_day.tm_min = current_day.tm_sec = 0;
+            trigger_day.tm_isdst = current_day.tm_isdst = -1;
+            const int day_offset = static_cast<int>(
+                std::difftime(std::mktime(&trigger_day), std::mktime(&current_day)) / 86400);
+            if (day_offset == 0) {
+                when = "今天";
+            } else if (day_offset == 1) {
+                when = "明天";
+            } else if (day_offset == 2) {
+                when = "后天";
+            } else {
+                when = std::to_string(trigger_local.tm_mon + 1) + "月" +
+                    std::to_string(trigger_local.tm_mday) + "日";
+            }
+            break;
+        }
+    }
+    when += FormatClock(task.trigger_at);
+    if (task.kind == Kind::kAlarm) return "已设置" + when + "的闹铃。";
+    return "已设置" + when + "提醒你" + task.label + "。";
 }
 
 const Task* AlertQueue::StartNext() {

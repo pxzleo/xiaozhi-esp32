@@ -56,6 +56,7 @@ class ScheduleManagerTest(unittest.TestCase):
             mcp.count('Property("kind", kPropertyTypeString, std::string("all"))'), 2
         )
         self.assertIn("Manager::DescribeTask", application)
+        self.assertIn("Manager::DescribeCreation(task, now)", application)
         self.assertIn("ParseKindFilter", application)
         self.assertIn("std::unique_ptr<cJSON, decltype(&cJSON_Delete)>", application)
         self.assertIn("last_load_error", application)
@@ -124,6 +125,8 @@ class ScheduleManagerTest(unittest.TestCase):
         )
         snooze_alert = application.split("std::string Application::SnoozeScheduleAlert", 1)[1]
         snooze_alert = snooze_alert.split("void Application::ResetProtocol", 1)[0]
+        self.assertIn('"已延后" + std::to_string(minutes) + "分钟。"', snooze_alert)
+        self.assertNotIn("DescribeTask", snooze_alert)
         self.assertLess(
             snooze_alert.index("AbortSpeaking(kAbortReasonNone)"),
             snooze_alert.index("FinishScheduleAlert()"),

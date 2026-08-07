@@ -274,6 +274,7 @@ sequenceDiagram
 `{"action":"RESPONSE","response":"...","data":{...}}`。`response` 是可直接播报的权威结果，`data` 提供同一结果的结构化表示。
 
 - `self.schedule.create`：创建闹铃或提醒。`kind` 为 `alarm/reminder`，`repeat` 为 `once/daily/weekdays/weekends/weekly`，`label` 为 1–80 个 Unicode 字符。`trigger_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`）与 `delay_seconds` 必须二选一；相对延时仅支持 `once`；`weekly` 用 `weekdays` 传 1–7（周一至周日）的逗号分隔列表。
+  - 创建成功的语音确认采用简短表达：今天、明天、后天的任务不播报完整日期，且不播报任务 ID；任务 ID 仍保留在结构化 `data` 中。超过后天的一次性任务才播报月日，重复任务播报每天、工作日、周末或每周几。稍后提醒只确认延后分钟数。
 - `self.schedule.list`：按可选 `kind=all/alarm/reminder` 列出任务和匹配的当前活动提醒，默认 `all`。
 - `self.schedule.delete`：按任务 `id` 删除。
 - `self.schedule.clear`：按可选 `kind=all/alarm/reminder` 清空尚未触发任务，默认 `all`。

@@ -1850,11 +1850,12 @@ std::string Application::CreateSchedule(const std::string& kind, const std::stri
     request.trigger_at = trigger_at.empty() ? 0 : ParseLocalDateTime(trigger_at);
     request.delay_seconds = delay_seconds;
     request.weekdays = ParseWeekdays(weekdays);
-    const auto task = schedule_manager_.Create(request, std::time(nullptr));
+    const auto now = std::time(nullptr);
+    const auto task = schedule_manager_.Create(request, now);
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(task));
-    return ResponseEnvelope("已创建" + schedule::Manager::DescribeTask(task) + "。", data);
+    return ResponseEnvelope(schedule::Manager::DescribeCreation(task, now), data);
 }
 
 std::string Application::ListSchedules(const std::string& kind) const {
@@ -1957,9 +1958,7 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", previous.id);
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(snoozed));
-    return ResponseEnvelope("已将任务ID " + std::to_string(previous.id) + "稍后处理，新建" +
-                                schedule::Manager::DescribeTask(snoozed) + "。",
-                            data);
+    return ResponseEnvelope("已延后" + std::to_string(minutes) + "分钟。", data);
 }
 
 void Application::ResetProtocol() {
