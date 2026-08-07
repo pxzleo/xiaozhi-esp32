@@ -36,11 +36,18 @@ class ScheduleManagerTest(unittest.TestCase):
     def test_device_integration_contract(self):
         application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
         mcp = (ROOT / "main" / "mcp_server.cc").read_text(encoding="utf-8")
-        board = (
-            ROOT
-            / "main/boards/waveshare/esp32-s3-touch-amoled-1.32"
-            / "esp32-s3-touch-amoled-1.32.cc"
-        ).read_text(encoding="utf-8")
+        boards = [
+            (
+                ROOT
+                / "main/boards/waveshare/esp32-s3-touch-amoled-1.32"
+                / "esp32-s3-touch-amoled-1.32.cc"
+            ).read_text(encoding="utf-8"),
+            (
+                ROOT
+                / "main/boards/waveshare/esp32-s3-touch-lcd-1.85c"
+                / "esp32-s3-touch-lcd-1.85c.cc"
+            ).read_text(encoding="utf-8"),
+        ]
         self.assertIn('"notifications/schedule/triggered"', application)
         self.assertIn("speak", application)
         for tool in ("create", "list", "delete", "clear", "stop", "snooze"):
@@ -127,18 +134,19 @@ class ScheduleManagerTest(unittest.TestCase):
         )
         self.assertIn("netease_lyrics_.Clear()", application)
         self.assertIn("CloseNeteaseMusicLyrics()", application)
-        self.assertIn("TryStopScheduleAlert", board)
-        self.assertNotIn("IsScheduleAlertActive", board)
+        for board in boards:
+            self.assertIn("TryStopScheduleAlert", board)
+            self.assertNotIn("IsScheduleAlertActive", board)
         self.assertIn("开始收听键停止", application)
         idle_state = application.split("case kDeviceStateIdle:", 1)[1]
         idle_state = idle_state.split("case kDeviceStateConnecting:", 1)[0]
         self.assertIn("EnableWakeWordDetection(!schedule_alert_active_)", idle_state)
-        boot_click = board.split("boot_button_.OnClick", 1)[1]
-        boot_click = boot_click.split("pwr_button_.OnLongPress", 1)[0]
-        self.assertLess(
-            boot_click.index("TryStopScheduleAlert"),
-            boot_click.index("ToggleChatState"),
-        )
+        for board in boards:
+            boot_click = board.split("boot_button_.OnClick", 1)[1]
+            self.assertLess(
+                boot_click.index("TryStopScheduleAlert"),
+                boot_click.index("ToggleChatState"),
+            )
 
         alarm_repeat = application.split(
             "active_schedule_task_.kind == schedule::Kind::kAlarm &&", 1

@@ -574,7 +574,9 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            if (!app.TryStopScheduleAlert()) {
+                app.ToggleChatState();
+            }
         });
     }
 
