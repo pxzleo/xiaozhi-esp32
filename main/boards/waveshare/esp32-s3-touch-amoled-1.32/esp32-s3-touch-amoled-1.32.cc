@@ -112,6 +112,10 @@ class CustomBoard : public WifiBoard {
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto &app = Application::GetInstance();
+            if (app.IsScheduleAlertActive()) {
+                app.Schedule([&app]() { app.StopScheduleAlert(); });
+                return;
+            }
             // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();

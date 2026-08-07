@@ -45,6 +45,14 @@ void AudioCodec::SetOutputVolume(int volume) {
     settings.SetInt("output_volume", output_volume_);
 }
 
+void AudioCodec::SetOutputVolumeTransient(int volume) {
+    Settings settings("audio");
+    const int persisted_volume = settings.GetInt("output_volume", output_volume_);
+    SetOutputVolume(volume);
+    Settings writable_settings("audio", true);
+    writable_settings.SetInt("output_volume", persisted_volume);
+}
+
 void AudioCodec::SetInputGain(float gain) {
     input_gain_ = gain;
     ESP_LOGI(TAG, "Set input gain to %.1f", input_gain_);

@@ -30,6 +30,7 @@ public:
     virtual ~AudioCodec();
     
     virtual void SetOutputVolume(int volume);
+    void SetOutputVolumeTransient(int volume);
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);

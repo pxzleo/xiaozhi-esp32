@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <string_view>
 
 #define TAG "Application"
@@ -113,6 +114,86 @@ bool IsAsciiString(const char* value, bool (*predicate)(unsigned char)) {
 
 bool IsHex(unsigned char value) { return std::isxdigit(value) != 0; }
 bool IsDigit(unsigned char value) { return std::isdigit(value) != 0; }
+
+std::string JsonString(cJSON* json) {
+    char* raw = cJSON_PrintUnformatted(json);
+    if (raw == nullptr) {
+        cJSON_Delete(json);
+        throw std::runtime_error("JSON序列化失败");
+    }
+    std::string result(raw);
+    cJSON_free(raw);
+    cJSON_Delete(json);
+    return result;
+}
+
+std::time_t ParseLocalDateTime(const std::string& value) {
+    std::tm local{};
+    char tail = 0;
+    if (sscanf(value.c_str(), "%d-%d-%dT%d:%d:%d%c", &local.tm_year, &local.tm_mon,
+               &local.tm_mday, &local.tm_hour, &local.tm_min, &local.tm_sec, &tail) != 6) {
+        throw std::invalid_argument("trigger_at必须是本地时间YYYY-MM-DDTHH:MM:SS");
+    }
+    local.tm_year -= 1900;
+    local.tm_mon -= 1;
+    local.tm_isdst = -1;
+    const std::time_t timestamp = std::mktime(&local);
+    if (timestamp <= 0) {
+        throw std::invalid_argument("trigger_at不是有效本地时间");
+    }
+    std::tm check{};
+    localtime_r(&timestamp, &check);
+    char formatted[20];
+    strftime(formatted, sizeof(formatted), "%Y-%m-%dT%H:%M:%S", &check);
+    if (value != formatted) {
+        throw std::invalid_argument("trigger_at不是有效本地时间");
+    }
+    return timestamp;
+}
+
+std::vector<int> ParseWeekdays(const std::string& value) {
+    std::vector<int> days;
+    if (value.empty()) return days;
+    std::istringstream input(value);
+    std::string part;
+    while (std::getline(input, part, ',')) {
+        if (part.size() != 1 || part[0] < '1' || part[0] > '7') {
+            throw std::invalid_argument("weekdays必须是1到7的逗号分隔列表，例如1,3,5");
+        }
+        days.push_back(part[0] - '0');
+    }
+    return days;
+}
+
+std::string FormatLocalDateTime(std::time_t timestamp) {
+    std::tm local{};
+    localtime_r(&timestamp, &local);
+    char formatted[20];
+    strftime(formatted, sizeof(formatted), "%Y-%m-%dT%H:%M:%S", &local);
+    return formatted;
+}
+
+cJSON* ScheduleTaskJson(const schedule::Task& task) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "id", task.id);
+    cJSON_AddStringToObject(json, "kind", schedule::Manager::KindName(task.kind));
+    cJSON_AddStringToObject(json, "repeat", schedule::Manager::RepeatName(task.repeat));
+    cJSON_AddStringToObject(json, "label", task.label.c_str());
+    cJSON_AddStringToObject(json, "trigger_at", FormatLocalDateTime(task.trigger_at).c_str());
+    if (!task.weekdays.empty()) {
+        cJSON* weekdays = cJSON_AddArrayToObject(json, "weekdays");
+        for (int day : task.weekdays) cJSON_AddItemToArray(weekdays, cJSON_CreateNumber(day));
+    }
+    return json;
+}
+
+std::string ResponseEnvelope(const std::string& response, cJSON* data) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "action", "RESPONSE");
+    cJSON_AddStringToObject(root, "response", response.c_str());
+    cJSON_AddItemToObject(root, "data", data);
+    return JsonString(root);
+}
 
 bool ParseLyricsStart(const cJSON* params, netease_music::LyricsPlayback& playback) {
     auto version = cJSON_GetObjectItem(params, "version");
@@ -267,6 +348,7 @@ void Application::Initialize() {
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
     // Add MCP common tools (only once during initialization)
+    LoadSchedules();
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
@@ -443,6 +525,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            CheckSchedules();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -1446,6 +1529,257 @@ void Application::SetAecMode(AecMode mode) {
 }
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
+
+void Application::LoadSchedules() {
+    Settings settings("schedule");
+    std::string saved;
+    const int chunk_count = settings.GetInt("chunks", 0);
+    if (chunk_count < 0 || chunk_count > 8) {
+        throw std::runtime_error("NVS中的定时任务分片数无效");
+    }
+    for (int i = 0; i < chunk_count; ++i) {
+        const std::string chunk = settings.GetString("data" + std::to_string(i));
+        if (chunk.empty()) throw std::runtime_error("NVS中的定时任务分片缺失");
+        saved += chunk;
+    }
+    if (saved.empty()) saved = settings.GetString("tasks");
+    if (saved.empty()) {
+        schedule_manager_.Restore({}, 1);
+        return;
+    }
+    cJSON* root = cJSON_Parse(saved.c_str());
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        throw std::runtime_error("NVS中的定时任务JSON损坏");
+    }
+    cJSON* next_id = cJSON_GetObjectItem(root, "next_id");
+    cJSON* tasks = cJSON_GetObjectItem(root, "tasks");
+    if (!cJSON_IsNumber(next_id) || next_id->valuedouble < 1 || !cJSON_IsArray(tasks)) {
+        cJSON_Delete(root);
+        throw std::runtime_error("NVS中的定时任务字段无效");
+    }
+    std::vector<schedule::Task> restored;
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, tasks) {
+        cJSON* id = cJSON_GetObjectItem(item, "id");
+        cJSON* kind = cJSON_GetObjectItem(item, "kind");
+        cJSON* repeat = cJSON_GetObjectItem(item, "repeat");
+        cJSON* label = cJSON_GetObjectItem(item, "label");
+        cJSON* trigger_at = cJSON_GetObjectItem(item, "trigger_at");
+        cJSON* weekdays = cJSON_GetObjectItem(item, "weekdays");
+        if (!cJSON_IsNumber(id) || id->valuedouble < 1 || !cJSON_IsString(kind) ||
+            !cJSON_IsString(repeat) || !cJSON_IsString(label) || !cJSON_IsNumber(trigger_at)) {
+            cJSON_Delete(root);
+            throw std::runtime_error("NVS中的定时任务条目无效");
+        }
+        schedule::Task task;
+        task.id = static_cast<uint32_t>(id->valuedouble);
+        task.kind = schedule::Manager::ParseKind(kind->valuestring);
+        task.repeat = schedule::Manager::ParseRepeat(repeat->valuestring);
+        task.label = label->valuestring;
+        task.trigger_at = static_cast<std::time_t>(trigger_at->valuedouble);
+        if (weekdays != nullptr) {
+            if (!cJSON_IsArray(weekdays)) {
+                cJSON_Delete(root);
+                throw std::runtime_error("NVS中的weekdays无效");
+            }
+            cJSON* day = nullptr;
+            cJSON_ArrayForEach(day, weekdays) {
+                if (!cJSON_IsNumber(day) || day->valueint < 1 || day->valueint > 7) {
+                    cJSON_Delete(root);
+                    throw std::runtime_error("NVS中的weekday超出1到7");
+                }
+                task.weekdays.push_back(day->valueint);
+            }
+        }
+        restored.push_back(std::move(task));
+    }
+    const uint32_t restored_next_id = static_cast<uint32_t>(next_id->valuedouble);
+    cJSON_Delete(root);
+    schedule_manager_.Restore(std::move(restored), restored_next_id);
+}
+
+void Application::SaveSchedules() const {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "next_id", schedule_manager_.next_id());
+    cJSON* tasks = cJSON_AddArrayToObject(root, "tasks");
+    for (const auto& task : schedule_manager_.tasks()) {
+        cJSON* item = ScheduleTaskJson(task);
+        cJSON_ReplaceItemInObject(item, "trigger_at", cJSON_CreateNumber(task.trigger_at));
+        cJSON_AddItemToArray(tasks, item);
+    }
+    const std::string saved = JsonString(root);
+    static constexpr size_t kChunkSize = 1800;
+    const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
+    if (chunk_count > 8) throw std::runtime_error("定时任务JSON超过NVS容量限制");
+    Settings settings("schedule", true);
+    const int old_chunk_count = settings.GetInt("chunks", 0);
+    settings.SetInt("chunks", chunk_count);
+    for (int i = 0; i < chunk_count; ++i) {
+        settings.SetString("data" + std::to_string(i),
+                           saved.substr(i * kChunkSize, kChunkSize));
+    }
+    for (int i = chunk_count; i < old_chunk_count && i < 8; ++i) {
+        settings.EraseKey("data" + std::to_string(i));
+    }
+    settings.EraseKey("tasks");
+}
+
+void Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", "notifications/schedule/triggered");
+    cJSON* params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddNumberToObject(params, "version", 1);
+    cJSON_AddNumberToObject(params, "id", task.id);
+    cJSON_AddStringToObject(params, "kind", schedule::Manager::KindName(task.kind));
+    cJSON_AddStringToObject(params, "label", task.label.c_str());
+    cJSON_AddStringToObject(params, "triggered_at", FormatLocalDateTime(now).c_str());
+    cJSON_AddBoolToObject(params, "speak", true);
+    SendMcpMessage(JsonString(root));
+}
+
+void Application::CheckSchedules() {
+    const std::time_t now = std::time(nullptr);
+    auto result = schedule_manager_.Tick(now, has_server_time_.load());
+    if (result.changed) SaveSchedules();
+    if (!result.missed.empty()) {
+        cJSON* missed = cJSON_CreateArray();
+        for (const auto& task : result.missed) {
+            ESP_LOGW(TAG, "Missed schedule id=%lu label=%s", static_cast<unsigned long>(task.id),
+                     task.label.c_str());
+            cJSON* record = cJSON_CreateObject();
+            cJSON_AddNumberToObject(record, "id", task.id);
+            cJSON_AddNumberToObject(record, "trigger_at", task.trigger_at);
+            cJSON_AddItemToArray(missed, record);
+        }
+        Settings settings("schedule", true);
+        settings.SetString("last_missed", JsonString(missed));
+    }
+    for (const auto& task : result.triggered) schedule_alert_queue_.Enqueue(task);
+    if (!schedule_alert_active_) StartNextScheduleAlert();
+    if (!schedule_alert_active_) return;
+    if (now >= schedule_alert_deadline_) {
+        FinishScheduleAlert();
+        StartNextScheduleAlert();
+    } else if (active_schedule_task_.kind == schedule::Kind::kAlarm &&
+               audio_service_.IsPlaybackIdle()) {
+        audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+    }
+}
+
+void Application::StartNextScheduleAlert() {
+    if (schedule_alert_active_) return;
+    const auto* next = schedule_alert_queue_.StartNext();
+    if (next == nullptr) return;
+    active_schedule_task_ = *next;
+    schedule_alert_active_ = true;
+    const std::time_t now = std::time(nullptr);
+    schedule_alert_deadline_ = now +
+        (active_schedule_task_.kind == schedule::Kind::kAlarm ? 600 : 60);
+
+    AbortSpeaking(kAbortReasonNone);
+    audio_service_.ResetDecoder();
+    auto codec = Board::GetInstance().GetAudioCodec();
+    schedule_saved_volume_ = codec ? codec->output_volume() : -1;
+    if (codec && schedule_saved_volume_ < 60) codec->SetOutputVolumeTransient(60);
+
+    std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
+    page += "  " + FormatLocalDateTime(active_schedule_task_.trigger_at).substr(11, 5) + "\n";
+    page += active_schedule_task_.label;
+    page += "\n按键停止 / 可语音稍后提醒";
+    Board::GetInstance().GetDisplay()->SetChatMessage("system", page.c_str());
+    audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+    if (active_schedule_task_.kind == schedule::Kind::kReminder) {
+        NotifyReminderTriggered(active_schedule_task_, now);
+    }
+}
+
+void Application::FinishScheduleAlert() {
+    if (!schedule_alert_active_) return;
+    audio_service_.ResetDecoder();
+    if (schedule_saved_volume_ >= 0) {
+        if (auto codec = Board::GetInstance().GetAudioCodec()) {
+            codec->SetOutputVolumeTransient(schedule_saved_volume_);
+        }
+    }
+    Board::GetInstance().GetDisplay()->ClearChatMessages();
+    schedule_saved_volume_ = -1;
+    schedule_alert_queue_.Stop();
+    schedule_alert_active_ = false;
+}
+
+std::string Application::CreateSchedule(const std::string& kind, const std::string& repeat,
+                                        const std::string& label,
+                                        const std::string& trigger_at, int delay_seconds,
+                                        const std::string& weekdays) {
+    if (!has_server_time_.load()) throw std::runtime_error("设备时间尚未同步，请稍后重试");
+    schedule::CreateRequest request;
+    request.kind = schedule::Manager::ParseKind(kind);
+    request.repeat = schedule::Manager::ParseRepeat(repeat);
+    request.label = label;
+    if (delay_seconds < 0) throw std::invalid_argument("delay_seconds必须大于0");
+    request.trigger_at = trigger_at.empty() ? 0 : ParseLocalDateTime(trigger_at);
+    request.delay_seconds = delay_seconds;
+    request.weekdays = ParseWeekdays(weekdays);
+    const auto task = schedule_manager_.Create(request, std::time(nullptr));
+    SaveSchedules();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddItemToObject(data, "task", ScheduleTaskJson(task));
+    return ResponseEnvelope("已创建定时任务，以data.task为准。", data);
+}
+
+std::string Application::ListSchedules() const {
+    cJSON* data = cJSON_CreateObject();
+    cJSON* tasks = cJSON_AddArrayToObject(data, "tasks");
+    for (const auto& task : schedule_manager_.tasks()) {
+        cJSON_AddItemToArray(tasks, ScheduleTaskJson(task));
+    }
+    cJSON_AddBoolToObject(data, "alert_active", schedule_alert_active_);
+    if (schedule_alert_active_) {
+        cJSON_AddItemToObject(data, "active", ScheduleTaskJson(active_schedule_task_));
+    }
+    return ResponseEnvelope("已列出全部定时任务，以data为准。", data);
+}
+
+std::string Application::DeleteSchedule(uint32_t id) {
+    if (!schedule_manager_.Delete(id)) throw std::invalid_argument("未找到指定id的定时任务");
+    SaveSchedules();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "deleted_id", id);
+    return ResponseEnvelope("已删除定时任务。", data);
+}
+
+std::string Application::ClearSchedules() {
+    const size_t count = schedule_manager_.Clear();
+    SaveSchedules();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "cleared", count);
+    return ResponseEnvelope("已清空全部未触发的定时任务。", data);
+}
+
+std::string Application::StopScheduleAlert() {
+    if (!schedule_alert_active_) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
+    const uint32_t stopped_id = active_schedule_task_.id;
+    FinishScheduleAlert();
+    StartNextScheduleAlert();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "stopped_id", stopped_id);
+    return ResponseEnvelope("已停止当前闹铃或提醒。", data);
+}
+
+std::string Application::SnoozeScheduleAlert(int minutes) {
+    if (!schedule_alert_active_) throw std::runtime_error("当前没有可稍后提醒的闹铃或提醒");
+    const auto previous = active_schedule_task_;
+    const auto snoozed = schedule_manager_.Snooze(previous, minutes, std::time(nullptr));
+    FinishScheduleAlert();
+    SaveSchedules();
+    StartNextScheduleAlert();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "source_id", previous.id);
+    cJSON_AddItemToObject(data, "task", ScheduleTaskJson(snoozed));
+    return ResponseEnvelope("已稍后提醒，以data.task为准。", data);
+}
 
 void Application::ResetProtocol() {
     Schedule([this]() {

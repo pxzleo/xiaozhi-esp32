@@ -267,3 +267,34 @@ sequenceDiagram
 ```
 
 这份文档概述了该项目中 MCP 协议的主要交互流程。具体的参数细节和工具功能需要参考 `main/mcp_server.cc` 中 `McpServer::AddCommonTools` 以及各个工具的实现。
+
+## 设备端定时闹铃与提醒
+
+设备公开以下普通 MCP 工具，均返回 JSON 字符串 envelope：
+`{"action":"RESPONSE","response":"...","data":{...}}`。调用方必须把 `data` 视为权威结果。
+
+- `self.schedule.create`：创建闹铃或提醒。`kind` 为 `alarm/reminder`，`repeat` 为 `once/daily/weekdays/weekends/weekly`，`label` 为 1–80 个 Unicode 字符。`trigger_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`）与 `delay_seconds` 必须二选一；相对延时仅支持 `once`；`weekly` 用 `weekdays` 传 1–7（周一至周日）的逗号分隔列表。
+- `self.schedule.list`：列出全部任务和当前活动提醒。
+- `self.schedule.delete`：按任务 `id` 删除。
+- `self.schedule.clear`：清空全部尚未触发任务。
+- `self.schedule.stop`：停止当前提醒或闹铃。
+- `self.schedule.snooze`：当前提醒稍后再响，`minutes` 默认 5，范围 1–60。
+
+当日期、时间、上午/下午、重复方式、内容或待删除目标存在歧义时，主模型必须先追问，不能猜测；信息完整后直接调用工具，不应先播报“我来处理一下”。普通提醒触发时，设备发送无 `id` 的 JSON-RPC 通知：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/schedule/triggered",
+  "params": {
+    "version": 1,
+    "id": 7,
+    "kind": "reminder",
+    "label": "喝水",
+    "triggered_at": "2026-08-07T15:30:00",
+    "speak": true
+  }
+}
+```
+
+该通知通过共享 `Protocol::SendMcpMessage` 发送，因此 WebSocket 与 MQTT/UDP 使用相同语义。

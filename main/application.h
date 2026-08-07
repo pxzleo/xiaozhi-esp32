@@ -19,6 +19,7 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "netease_music_lyrics.h"
+#include "schedule/schedule_manager.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -118,6 +119,15 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    std::string CreateSchedule(const std::string& kind, const std::string& repeat,
+                               const std::string& label, const std::string& trigger_at,
+                               int delay_seconds, const std::string& weekdays);
+    std::string ListSchedules() const;
+    std::string DeleteSchedule(uint32_t id);
+    std::string ClearSchedules();
+    std::string StopScheduleAlert();
+    std::string SnoozeScheduleAlert(int minutes);
+    bool IsScheduleAlertActive() const { return schedule_alert_active_.load(); }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -142,10 +152,16 @@ private:
     AudioService audio_service_;
     netease_music::LyricsTimeline netease_lyrics_;
     std::unique_ptr<Ota> ota_;
+    schedule::Manager schedule_manager_;
+    schedule::AlertQueue schedule_alert_queue_;
+    schedule::Task active_schedule_task_;
+    std::atomic<bool> schedule_alert_active_{false};
+    std::time_t schedule_alert_deadline_ = 0;
+    int schedule_saved_volume_ = -1;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
-    bool has_server_time_ = false;
+    std::atomic<bool> has_server_time_{false};
     std::atomic<bool> aborted_{false};
     std::atomic<bool> barge_in_detection_active_{false};
     bool assets_version_checked_ = false;
@@ -169,6 +185,12 @@ private:
     void ContinueWakeWordInvoke(const std::string& wake_word);
     void StartListeningAudio();
     void ConfigureWakeWordForListening();
+    void LoadSchedules();
+    void SaveSchedules() const;
+    void CheckSchedules();
+    void StartNextScheduleAlert();
+    void FinishScheduleAlert();
+    void NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
 
     // Activation task (runs in background)
     void ActivationTask();
