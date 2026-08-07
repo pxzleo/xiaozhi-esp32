@@ -195,7 +195,7 @@ private:
     void StartNextScheduleAlert();
     void FinishScheduleAlert(bool reset_decoder = true, bool reset_delivery = true);
     void RestoreScheduleAlertVolume();
-    void NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
+    bool NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
 
     // Activation task (runs in background)
     void ActivationTask();

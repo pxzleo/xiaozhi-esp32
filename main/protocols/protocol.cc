@@ -91,10 +91,10 @@ void Protocol::SendStopListening() {
     SendText(message);
 }
 
-void Protocol::SendMcpMessage(const std::string& payload) {
+bool Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
-    SendText(message);
+    return SendText(message);
 }
 
 bool Protocol::IsTimeout() const {

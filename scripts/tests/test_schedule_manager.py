@@ -100,6 +100,45 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertNotIn("Settings", transient)
         self.assertIn("suppress_volume_persistence_", transient)
 
+    def test_reminder_reopens_channel_before_notification(self):
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        protocol_h = (ROOT / "main" / "protocols" / "protocol.h").read_text(
+            encoding="utf-8"
+        )
+        protocol_cc = (ROOT / "main" / "protocols" / "protocol.cc").read_text(
+            encoding="utf-8"
+        )
+        websocket = (
+            ROOT / "main" / "protocols" / "websocket_protocol.cc"
+        ).read_text(encoding="utf-8")
+        notify = application.split("Application::NotifyReminderTriggered", 1)[1]
+        notify = notify.split("void Application::CheckSchedules", 1)[0]
+        self.assertIn("protocol_->IsAudioChannelOpened()", notify)
+        self.assertIn("protocol_->OpenAudioChannel()", notify)
+        self.assertLess(
+            notify.index("protocol_->OpenAudioChannel()"),
+            notify.index("protocol_->SendMcpMessage("),
+        )
+        self.assertIn("bool SendMcpMessage", protocol_h)
+        self.assertIn("return SendText(message);", protocol_cc)
+        self.assertIn("return protocol_->SendMcpMessage(", notify)
+
+        error_handler = application.split("if (bits & MAIN_EVENT_ERROR)", 1)[1]
+        error_handler = error_handler.split("if (bits & MAIN_EVENT_NETWORK_CONNECTED)", 1)[0]
+        self.assertIn("schedule_alert_active_", error_handler)
+        self.assertIn("Reminder network error", error_handler)
+
+        closed_handler = application.split("protocol_->OnAudioChannelClosed", 1)[1]
+        closed_handler = closed_handler.split("protocol_->OnIncomingJson", 1)[0]
+        self.assertIn("reminder_delivery_.Reset()", closed_handler)
+        self.assertIn("if (!schedule_alert_active_)", closed_handler)
+
+        open_channel = websocket.split("bool WebsocketProtocol::OpenAudioChannel()", 1)[1]
+        open_channel = open_channel.split("std::string WebsocketProtocol::GetHelloMessage", 1)[0]
+        self.assertIn("session_id_.clear()", open_channel)
+        self.assertIn("xEventGroupClearBits", open_channel)
+        self.assertIn("connection_generation_", open_channel)
+
 
 if __name__ == "__main__":
     unittest.main()

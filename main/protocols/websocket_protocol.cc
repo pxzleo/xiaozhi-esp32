@@ -14,7 +14,11 @@
 
 WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
 
-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+WebsocketProtocol::~WebsocketProtocol() {
+    ++connection_generation_;
+    websocket_.reset();
+    vEventGroupDelete(event_group_handle_);
+}
 
 bool WebsocketProtocol::Start() {
     // Only connect to server when audio channel is needed
@@ -73,7 +77,14 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+    const bool had_channel = websocket_ != nullptr;
+    ++connection_generation_;
     websocket_.reset();
+    session_id_.clear();
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+    if (had_channel && on_audio_channel_closed_ != nullptr) {
+        on_audio_channel_closed_();
+    }
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
@@ -86,6 +97,18 @@ bool WebsocketProtocol::OpenAudioChannel() {
     }
 
     error_occurred_ = false;
+    session_id_.clear();
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+    const uint32_t generation = ++connection_generation_;
+    websocket_.reset();
+
+    const auto discard_connection = [this, generation]() {
+        if (connection_generation_.load() != generation) {
+            return;
+        }
+        ++connection_generation_;
+        websocket_.reset();
+    };
 
     auto network = Board::GetInstance().GetNetwork();
     websocket_ = network->CreateWebSocket(1);
@@ -105,7 +128,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+    websocket_->OnData([this, generation](const char* data, size_t len, bool binary) {
+        if (connection_generation_.load() != generation) {
+            return;
+        }
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
@@ -158,7 +184,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
-    websocket_->OnDisconnected([this]() {
+    websocket_->OnDisconnected([this, generation]() {
+        if (connection_generation_.load() != generation) {
+            return;
+        }
         ESP_LOGI(TAG, "Websocket disconnected");
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
@@ -169,12 +198,14 @@ bool WebsocketProtocol::OpenAudioChannel() {
     if (!websocket_->Connect(url.c_str())) {
         ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        discard_connection();
         return false;
     }
 
     // Send hello message to describe the client
     auto message = GetHelloMessage();
     if (!SendText(message)) {
+        discard_connection();
         return false;
     }
 
@@ -185,6 +216,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
     if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
         SetError(Lang::Strings::SERVER_TIMEOUT);
+        discard_connection();
         return false;
     }
 

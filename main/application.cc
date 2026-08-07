@@ -455,9 +455,19 @@ void Application::Run() {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
-            SetDeviceState(kDeviceStateIdle);
-            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
-                  Lang::Sounds::OGG_EXCLAMATION);
+            if (schedule_alert_active_) {
+                ESP_LOGE(TAG, "Reminder network error: %s", last_error_message_.c_str());
+                if (reminder_delivery_.NeedsServerAbort()) {
+                    reminder_delivery_.Reset();
+                    schedule_reminder_tts_deadline_us_ = 0;
+                    RestoreScheduleAlertVolume();
+                }
+                SetDeviceState(kDeviceStateIdle);
+            } else {
+                SetDeviceState(kDeviceStateIdle);
+                Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
+                      Lang::Sounds::OGG_EXCLAMATION);
+            }
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
@@ -481,9 +491,13 @@ void Application::Run() {
                 active_schedule_task_.kind == schedule::Kind::kReminder &&
                 audio_service_.IsPlaybackIdle() &&
                 reminder_delivery_.OnPlaybackDrained()) {
-                schedule_reminder_tts_deadline_us_ = esp_timer_get_time() +
-                    kReminderTtsStartTimeoutSeconds * 1000000LL;
-                NotifyReminderTriggered(active_schedule_task_, std::time(nullptr));
+                if (NotifyReminderTriggered(active_schedule_task_, std::time(nullptr))) {
+                    schedule_reminder_tts_deadline_us_ = esp_timer_get_time() +
+                        kReminderTtsStartTimeoutSeconds * 1000000LL;
+                } else {
+                    reminder_delivery_.CancelWaitingForTts();
+                    RestoreScheduleAlertVolume();
+                }
             }
 
             // Deferred listening start (auto mode): the playback queue has
@@ -835,9 +849,16 @@ void Application::InitializeProtocol() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         netease_lyrics_.Clear();
         Schedule([this]() {
+            if (reminder_delivery_.NeedsServerAbort()) {
+                reminder_delivery_.Reset();
+                schedule_reminder_tts_deadline_us_ = 0;
+                RestoreScheduleAlertVolume();
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->CloseNeteaseMusicLyrics();
-            display->SetChatMessage("system", "");
+            if (!schedule_alert_active_) {
+                display->SetChatMessage("system", "");
+            }
             SetDeviceState(kDeviceStateIdle);
         });
     });
@@ -1310,7 +1331,9 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();    // Clear messages first
+            if (!schedule_alert_active_) {
+                display->ClearChatMessages();  // Clear messages first
+            }
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
@@ -1659,7 +1682,20 @@ void Application::SaveSchedules() const {
     settings.EraseKey("tasks");
 }
 
-void Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
+bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
+    if (protocol_ == nullptr) {
+        ESP_LOGE(TAG, "Cannot deliver reminder notification: protocol is not initialized");
+        return false;
+    }
+    if (!protocol_->IsAudioChannelOpened()) {
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        if (!protocol_->OpenAudioChannel()) {
+            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            ESP_LOGE(TAG, "Cannot deliver reminder notification: failed to open audio channel");
+            return false;
+        }
+    }
+
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
     cJSON_AddStringToObject(root, "method", "notifications/schedule/triggered");
@@ -1670,7 +1706,7 @@ void Application::NotifyReminderTriggered(const schedule::Task& task, std::time_
     cJSON_AddStringToObject(params, "label", task.label.c_str());
     cJSON_AddStringToObject(params, "triggered_at", FormatLocalDateTime(now).c_str());
     cJSON_AddBoolToObject(params, "speak", true);
-    SendMcpMessage(JsonString(root));
+    return protocol_->SendMcpMessage(JsonString(root));
 }
 
 void Application::CheckSchedules() {

@@ -4,6 +4,7 @@
 
 #include "protocol.h"
 
+#include <atomic>
 #include <web_socket.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -24,6 +25,7 @@ public:
 private:
     EventGroupHandle_t event_group_handle_;
     std::unique_ptr<WebSocket> websocket_;
+    std::atomic<uint32_t> connection_generation_{0};
     int version_ = 1;
 
     void ParseServerHello(const cJSON* root);
