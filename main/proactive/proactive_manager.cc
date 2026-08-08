@@ -27,6 +27,97 @@ void ValidateHealthKind(const std::string& kind) {
 
 }  // namespace
 
+std::vector<uint8_t> StateCodec::Compress(const std::string& input) {
+    uint32_t checksum = 2166136261u;
+    for (uint8_t value : input) checksum = (checksum ^ value) * 16777619u;
+    std::vector<uint8_t> output{'P', 'Z', '1', 0};
+    auto append_u32 = [&output](uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            output.push_back(static_cast<uint8_t>(value >> shift));
+        }
+    };
+    append_u32(static_cast<uint32_t>(input.size()));
+    append_u32(checksum);
+    size_t cursor = 0;
+    while (cursor < input.size()) {
+        const size_t flags_index = output.size();
+        output.push_back(0);
+        for (int bit = 0; bit < 8 && cursor < input.size(); ++bit) {
+            size_t best_length = 0;
+            size_t best_offset = 0;
+            const size_t window_start = cursor > 255 ? cursor - 255 : 0;
+            for (size_t candidate = window_start; candidate < cursor; ++candidate) {
+                size_t length = 0;
+                while (length < 255 && cursor + length < input.size() &&
+                       input[candidate + length] == input[cursor + length]) {
+                    ++length;
+                }
+                if (length >= 3 && length > best_length) {
+                    best_length = length;
+                    best_offset = cursor - candidate;
+                }
+            }
+            if (best_length >= 3) {
+                output[flags_index] |= static_cast<uint8_t>(1u << bit);
+                output.push_back(static_cast<uint8_t>(best_offset));
+                output.push_back(static_cast<uint8_t>(best_length));
+                cursor += best_length;
+            } else {
+                output.push_back(static_cast<uint8_t>(input[cursor++]));
+            }
+        }
+    }
+    return output;
+}
+
+std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_output) {
+    if (data == nullptr || size < 12 || data[0] != 'P' || data[1] != 'Z' ||
+        data[2] != '1' || data[3] != 0) {
+        throw std::runtime_error("主动状态压缩头无效");
+    }
+    auto read_u32 = [data](size_t offset) {
+        return static_cast<uint32_t>(data[offset]) |
+            (static_cast<uint32_t>(data[offset + 1]) << 8) |
+            (static_cast<uint32_t>(data[offset + 2]) << 16) |
+            (static_cast<uint32_t>(data[offset + 3]) << 24);
+    };
+    const size_t expected_size = read_u32(4);
+    const uint32_t expected_checksum = read_u32(8);
+    if (expected_size == 0 || expected_size > max_output) {
+        throw std::runtime_error("主动状态解压长度无效");
+    }
+    std::string output;
+    output.reserve(expected_size);
+    size_t cursor = 12;
+    while (cursor < size && output.size() < expected_size) {
+        const uint8_t flags = data[cursor++];
+        for (int bit = 0; bit < 8 && output.size() < expected_size; ++bit) {
+            if ((flags & (1u << bit)) != 0) {
+                if (cursor + 2 > size) throw std::runtime_error("主动状态压缩引用截断");
+                const size_t offset = data[cursor++];
+                const size_t length = data[cursor++];
+                if (offset == 0 || length < 3 || offset > output.size() ||
+                    output.size() + length > expected_size) {
+                    throw std::runtime_error("主动状态压缩引用无效");
+                }
+                for (size_t i = 0; i < length; ++i) {
+                    output.push_back(output[output.size() - offset]);
+                }
+            } else {
+                if (cursor >= size) throw std::runtime_error("主动状态压缩字面量截断");
+                output.push_back(static_cast<char>(data[cursor++]));
+            }
+        }
+    }
+    if (output.size() != expected_size || cursor != size) {
+        throw std::runtime_error("主动状态压缩数据长度不一致");
+    }
+    uint32_t checksum = 2166136261u;
+    for (uint8_t value : output) checksum = (checksum ^ value) * 16777619u;
+    if (checksum != expected_checksum) throw std::runtime_error("主动状态校验失败");
+    return output;
+}
+
 void Manager::Restore(Config config, RuntimeState state) {
     const Mode effective_mode = config.mode == Mode::kTodaySilent ?
         config.mode_before_silent : config.mode;

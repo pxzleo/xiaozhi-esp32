@@ -334,6 +334,26 @@ void TestTopicRuleMigrationAtCapacity() {
     assert(manager.config().allowed_topics.empty());
 }
 
+void TestStateCodec() {
+    const std::string state = std::string("{\"config\":{") +
+        std::string(1800, 'x') + "},\"queue\":[" + std::string(1800, 'y') + "]}";
+    const auto compressed = StateCodec::Compress(state);
+    assert(compressed.size() < 3600);
+    assert(StateCodec::Decompress(compressed.data(), compressed.size(), 7200) == state);
+    auto corrupted = compressed;
+    corrupted.back() ^= 1;
+    bool checksum_failed = false;
+    try {
+        StateCodec::Decompress(corrupted.data(), corrupted.size(), 7200);
+    } catch (const std::runtime_error&) { checksum_failed = true; }
+    assert(checksum_failed);
+    bool limit_failed = false;
+    try {
+        StateCodec::Decompress(compressed.data(), compressed.size(), state.size() - 1);
+    } catch (const std::runtime_error&) { limit_failed = true; }
+    assert(limit_failed);
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -345,5 +365,6 @@ int main() {
     TestRetryBackoffIsBounded();
     TestPersistentCapacityLimits();
     TestTopicRuleMigrationAtCapacity();
+    TestStateCodec();
     return 0;
 }

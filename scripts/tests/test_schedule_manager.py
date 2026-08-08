@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 
 
@@ -10,30 +11,34 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduleManagerTest(unittest.TestCase):
+    def test_deferred_edge_actions_preserve_fifo(self):
+        actions = deque()
+        expected = ["stop", "start", "toggle", "toggle", "wake:first", "wake:second"]
+        for action in expected:
+            actions.append(action)
+        replayed = []
+        while actions:
+            replayed.append(actions.popleft())
+        self.assertEqual(replayed, expected)
+
     def test_proactive_nvs_replacement_peak_model(self):
-        chunk_size = 1800
         safety_entries = 16
 
-        def entry_cost(serialized_bytes):
-            lengths = [
-                min(chunk_size, serialized_bytes - offset)
-                for offset in range(0, serialized_bytes, chunk_size)
-            ]
-            chunk_entries = [2 + (length + 32) // 32 for length in lengths]
-            return 1 + sum(chunk_entries), max(chunk_entries)
+        def entry_cost(compressed_bytes):
+            return 8 + (compressed_bytes + 31) // 32
 
-        def can_replace(global_available, proactive_used, serialized_bytes):
-            required, largest_chunk = entry_cost(serialized_bytes)
+        def can_replace(global_available, proactive_used, compressed_bytes):
+            required = entry_cost(compressed_bytes)
             return (global_available + proactive_used >=
-                    required + largest_chunk + safety_entries)
+                    required + proactive_used + safety_entries)
 
-        max_required, _ = entry_cost(7200)
-        half_required, _ = entry_cost(3600)
-        self.assertTrue(can_replace(504, 0, 7200))  # 16KB target first save.
-        self.assertTrue(can_replace(142, max_required, 7200))  # Same-size rewrite.
-        self.assertTrue(can_replace(142, max_required, 3600))  # Shrink rewrite.
-        self.assertTrue(can_replace(260, half_required, 7200))  # Grow back to max.
-        self.assertFalse(can_replace(32, max_required, 7200))  # Other namespaces full.
+        max_required = entry_cost(3600)
+        half_required = entry_cost(1800)
+        self.assertTrue(can_replace(378, 0, 3600))  # 16KB target first save.
+        self.assertTrue(can_replace(142, max_required, 3600))  # Same-size rewrite.
+        self.assertTrue(can_replace(142, max_required, 1800))  # Shrink rewrite.
+        self.assertTrue(can_replace(142, half_required, 3600))  # Grow back to max.
+        self.assertFalse(can_replace(100, max_required, 3600))  # Other namespaces full.
 
     def test_maximum_proactive_state_fits_persistence_budget(self):
         topic = lambda index: f"topic-{index}-" + "x" * 56
@@ -98,15 +103,51 @@ class ScheduleManagerTest(unittest.TestCase):
             for kind in kinds
         ]
         queue += [
-            event(f"follow-up-{i + 1}-1786159600", "follow_up", "high",
-                  f"follow-up:{i + 1}", {"source_id": str(i + 1), "cue_played": "true"})
+            event(f"proactive-{i + 1}-1786159600", topic(i), "high",
+                  f"proactive:{i + 1}", {})
             for i in range(4)
         ]
+        pending = event("follow-up-pending-1786159600", "follow_up", "high",
+                        "follow-up:pending", {"source_id": "4", "cue_played": "true"})
         state = {"config": config, "follow_ups": follow_ups,
-                 "health": health, "queue": queue}
+                 "health": health, "queue": queue, "pending": pending}
         encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+
+        def production_lzss(data):
+            output = bytearray(b"PZ1\0" + len(data).to_bytes(4, "little") + b"\0\0\0\0")
+            checksum = 2166136261
+            for value in data:
+                checksum = ((checksum ^ value) * 16777619) & 0xffffffff
+            output[8:12] = checksum.to_bytes(4, "little")
+            cursor = 0
+            while cursor < len(data):
+                flags_index = len(output)
+                output.append(0)
+                for bit in range(8):
+                    if cursor >= len(data):
+                        break
+                    best_length = best_offset = 0
+                    for candidate in range(max(0, cursor - 255), cursor):
+                        length = 0
+                        while (length < 255 and cursor + length < len(data) and
+                               data[candidate + length] == data[cursor + length]):
+                            length += 1
+                        if length >= 3 and length > best_length:
+                            best_length, best_offset = length, cursor - candidate
+                    if best_length >= 3:
+                        output[flags_index] |= 1 << bit
+                        output.extend((best_offset, best_length))
+                        cursor += best_length
+                    else:
+                        output.append(data[cursor])
+                        cursor += 1
+            return bytes(output)
+
+        compressed = production_lzss(encoded)
         self.assertGreater(len(encoded), 3600)
         self.assertLess(len(encoded), 7200)
+        self.assertLessEqual(len(compressed), 3600)
+        self.assertLessEqual(2 * (8 + (len(compressed) + 31) // 32) + 16, 378)
 
     def test_host_schedule_core(self):
         if not shutil.which("g++"):
@@ -247,7 +288,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("nvs_get_stats(nullptr, &nvs_stats)", application)
         self.assertIn("nvs_get_used_entry_count(handle, &namespace_used_entries)", application)
         self.assertIn("nvs_stats.available_entries + namespace_used_entries", application)
-        self.assertIn("required_entries + max_chunk_entries + kNvsSafetyEntries", application)
+        self.assertIn("required_entries + namespace_used_entries +", application)
         self.assertIn("kNvsSafetyEntries = 16", application)
         self.assertIn("TrySaveProactive", application)
         self.assertIn("proactive_save_pending_ = true", application)
@@ -265,7 +306,12 @@ class ScheduleManagerTest(unittest.TestCase):
         wake_invoke = wake_invoke.split("bool Application::CanEnterSleepMode", 1)[0]
         self.assertLess(wake_invoke.index("Schedule([this, wake_word]"),
                         wake_invoke.index("IsProactiveConnectionBusy()"))
-        self.assertIn("proactive_deferred_wake_word_ = wake_word", wake_invoke)
+        self.assertIn('DeferProactiveAction("external wake invoke"', wake_invoke)
+        self.assertIn("std::deque<std::function<void()>> proactive_deferred_actions_", application_h)
+        self.assertIn("kMaxDeferredProactiveActions = 16", application_h)
+        finish_fifo = finish.split("while (!proactive_deferred_actions_.empty())", 1)[1]
+        self.assertLess(finish_fifo.index("front()"), finish_fifo.index("pop_front()"))
+        self.assertLess(finish_fifo.index("pop_front()"), finish_fifo.index("action()"))
         network_callback = application.split("case NetworkEvent::Scanning:", 1)[1]
         scanning = network_callback.split("case NetworkEvent::Connecting", 1)[0]
         self.assertNotIn("MAIN_EVENT_NETWORK_DISCONNECTED", scanning)

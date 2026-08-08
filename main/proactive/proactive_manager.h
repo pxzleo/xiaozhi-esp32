@@ -161,6 +161,12 @@ private:
     int64_t retry_after_us_ = 0;
 };
 
+class StateCodec {
+public:
+    static std::vector<uint8_t> Compress(const std::string& input);
+    static std::string Decompress(const uint8_t* data, size_t size, size_t max_output);
+};
+
 }  // namespace proactive
 
 #endif

@@ -209,9 +209,9 @@ private:
     bool proactive_reset_pending_ = false;
     bool proactive_close_pending_ = false;
     bool proactive_reboot_pending_ = false;
-    std::optional<ListeningMode> proactive_deferred_open_mode_;
-    std::optional<std::string> proactive_deferred_wake_word_;
     std::deque<std::string> proactive_deferred_mcp_messages_;
+    std::deque<std::function<void()>> proactive_deferred_actions_;
+    static constexpr size_t kMaxDeferredProactiveActions = 16;
     EventBits_t proactive_deferred_event_bits_ = 0;
     bool proactive_finish_pending_ = false;
     bool proactive_finish_success_ = false;
@@ -229,6 +229,9 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    void HandleWakeWordDetectedValue(const std::string& wake_word);
+    void HandleExternalWakeWordInvoke(const std::string& wake_word);
+    bool DeferProactiveAction(const char* name, std::function<void()>&& action);
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);

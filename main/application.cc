@@ -530,6 +530,7 @@ void Application::Initialize() {
         schedule_follow_ups_.Restore({});
         health_tracker_.Restore({});
         proactive_queue_.Restore({});
+        pending_proactive_event_.reset();
     }
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
@@ -1376,7 +1377,7 @@ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_
 
 void Application::HandleToggleChatEvent() {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_event_bits_ |= MAIN_EVENT_TOGGLE_CHAT;
+        DeferProactiveAction("toggle", [this]() { HandleToggleChatEvent(); });
         return;
     }
     auto state = GetDeviceState();
@@ -1421,7 +1422,9 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         return;
     }
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_open_mode_ = mode;
+        DeferProactiveAction("continue open channel", [this, mode]() {
+            ContinueOpenAudioChannel(mode);
+        });
         return;
     }
 
@@ -1443,7 +1446,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
 void Application::HandleStartListeningEvent() {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_event_bits_ |= MAIN_EVENT_START_LISTENING;
+        DeferProactiveAction("start listening", [this]() { HandleStartListeningEvent(); });
         return;
     }
     auto state = GetDeviceState();
@@ -1478,7 +1481,7 @@ void Application::HandleStartListeningEvent() {
 
 void Application::HandleStopListeningEvent() {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_event_bits_ |= MAIN_EVENT_STOP_LISTENING;
+        DeferProactiveAction("stop listening", [this]() { HandleStopListeningEvent(); });
         return;
     }
     auto state = GetDeviceState();
@@ -1497,15 +1500,21 @@ void Application::HandleStopListeningEvent() {
 
 void Application::HandleWakeWordDetectedEvent() {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_event_bits_ |= MAIN_EVENT_WAKE_WORD_DETECTED;
+        const auto wake_word = audio_service_.GetLastWakeWord();
+        DeferProactiveAction("wake detected", [this, wake_word]() {
+            HandleWakeWordDetectedValue(wake_word);
+        });
         return;
     }
+    HandleWakeWordDetectedValue(audio_service_.GetLastWakeWord());
+}
+
+void Application::HandleWakeWordDetectedValue(const std::string& wake_word) {
     if (!protocol_) {
         return;
     }
 
     auto state = GetDeviceState();
-    auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
@@ -1535,7 +1544,9 @@ void Application::HandleWakeWordDetectedEvent() {
 
 void Application::BeginWakeWordInvoke(const std::string& wake_word) {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_wake_word_ = wake_word;
+        DeferProactiveAction("begin wake invoke", [this, wake_word]() {
+            BeginWakeWordInvoke(wake_word);
+        });
         return;
     }
     // Must run in the main task with the device in idle state
@@ -1567,7 +1578,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
         return;
     }
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_wake_word_ = wake_word;
+        DeferProactiveAction("continue wake invoke", [this, wake_word]() {
+            ContinueWakeWordInvoke(wake_word);
+        });
         return;
     }
 
@@ -1717,10 +1730,21 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+bool Application::DeferProactiveAction(const char* name, std::function<void()>&& action) {
+    if (proactive_deferred_actions_.size() >= kMaxDeferredProactiveActions) {
+        ESP_LOGE(TAG, "Deferred proactive action queue is full; rejected %s", name);
+        Board::GetInstance().GetDisplay()->ShowNotification(
+            "操作等待队列已满，请稍后重试", 5000);
+        return false;
+    }
+    proactive_deferred_actions_.push_back(std::move(action));
+    return true;
+}
+
 void Application::AbortSpeaking(AbortReason reason) {
     if (IsProactiveConnectionBusy()) {
         ESP_LOGW(TAG, "Deferring abort while proactive connection worker owns protocol");
-        proactive_deferred_event_bits_ |= MAIN_EVENT_TOGGLE_CHAT;
+        DeferProactiveAction("abort speaking", [this, reason]() { AbortSpeaking(reason); });
         return;
     }
     ESP_LOGI(TAG, "Abort speaking");
@@ -1819,20 +1843,26 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     // This API may be called by a board callback task. All shared proactive and
     // protocol state is therefore inspected and changed only in the main task.
     Schedule([this, wake_word]() {
-        if (IsProactiveConnectionBusy()) {
-            proactive_deferred_wake_word_ = wake_word;
-            return;
-        }
-        if (!protocol_) return;
-        const auto state = GetDeviceState();
-        if (state == kDeviceStateIdle) {
-            BeginWakeWordInvoke(wake_word);
-        } else if (state == kDeviceStateSpeaking) {
-            AbortSpeaking(kAbortReasonNone);
-        } else if (state == kDeviceStateListening) {
-            protocol_->CloseAudioChannel();
-        }
+        HandleExternalWakeWordInvoke(wake_word);
     });
+}
+
+void Application::HandleExternalWakeWordInvoke(const std::string& wake_word) {
+    if (IsProactiveConnectionBusy()) {
+        DeferProactiveAction("external wake invoke", [this, wake_word]() {
+            HandleExternalWakeWordInvoke(wake_word);
+        });
+        return;
+    }
+    if (!protocol_) return;
+    const auto state = GetDeviceState();
+    if (state == kDeviceStateIdle) {
+        BeginWakeWordInvoke(wake_word);
+    } else if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+    } else if (state == kDeviceStateListening) {
+        protocol_->CloseAudioChannel();
+    }
 }
 
 bool Application::CanEnterSleepMode() {
@@ -2007,14 +2037,46 @@ void Application::SaveSchedules() const {
 }
 
 void Application::LoadProactive() {
-    Settings settings("proactive");
     std::string saved;
-    const int chunk_count = settings.GetInt("chunks", 0);
-    if (chunk_count < 0 || chunk_count > 4) throw std::runtime_error("NVS中的主动状态分片数无效");
-    for (int i = 0; i < chunk_count; ++i) {
-        const auto chunk = settings.GetString("data" + std::to_string(i));
-        if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
-        saved += chunk;
+    nvs_handle_t handle = 0;
+    const esp_err_t open_error = nvs_open("proactive", NVS_READONLY, &handle);
+    if (open_error == ESP_OK) {
+        size_t blob_size = 0;
+        const esp_err_t size_error = nvs_get_blob(handle, "state", nullptr, &blob_size);
+        if (size_error == ESP_OK) {
+            if (blob_size == 0 || blob_size > 3600) {
+                nvs_close(handle);
+                throw std::runtime_error("NVS中的主动状态blob长度无效");
+            }
+            std::vector<uint8_t> compressed(blob_size);
+            const esp_err_t read_error = nvs_get_blob(
+                handle, "state", compressed.data(), &blob_size);
+            nvs_close(handle);
+            if (read_error != ESP_OK) throw std::runtime_error("读取主动状态blob失败");
+            saved = proactive::StateCodec::Decompress(
+                compressed.data(), compressed.size(), 7200);
+        } else {
+            nvs_close(handle);
+            if (size_error != ESP_ERR_NVS_NOT_FOUND) {
+                throw std::runtime_error("查询主动状态blob失败");
+            }
+        }
+    } else if (open_error != ESP_ERR_NVS_NOT_FOUND) {
+        throw std::runtime_error("打开主动状态NVS失败");
+    }
+    if (saved.empty()) {
+        // One-time compatibility path for chunked builds. A successful blob
+        // save becomes authoritative before legacy keys are erased.
+        Settings settings("proactive");
+        const int chunk_count = settings.GetInt("chunks", 0);
+        if (chunk_count < 0 || chunk_count > 4) {
+            throw std::runtime_error("NVS中的主动状态分片数无效");
+        }
+        for (int i = 0; i < chunk_count; ++i) {
+            const auto chunk = settings.GetString("data" + std::to_string(i));
+            if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
+            saved += chunk;
+        }
     }
     if (saved.empty()) {
         proactive_manager_.Restore({}, {});
@@ -2025,8 +2087,10 @@ void Application::LoadProactive() {
     auto follow_ups = cJSON_GetObjectItem(root.get(), "follow_ups");
     auto health = cJSON_GetObjectItem(root.get(), "health");
     auto queue = cJSON_GetObjectItem(root.get(), "queue");
+    auto pending = cJSON_GetObjectItem(root.get(), "pending");
     if (!cJSON_IsObject(root.get()) || !cJSON_IsObject(config_json) ||
-        !cJSON_IsArray(follow_ups) || !cJSON_IsObject(health) || !cJSON_IsArray(queue)) {
+        !cJSON_IsArray(follow_ups) || !cJSON_IsObject(health) || !cJSON_IsArray(queue) ||
+        (pending != nullptr && !cJSON_IsNull(pending) && !cJSON_IsObject(pending))) {
         throw std::runtime_error("NVS中的主动状态JSON损坏");
     }
     auto mode = cJSON_GetObjectItem(config_json, "mode");
@@ -2119,6 +2183,18 @@ void Application::LoadProactive() {
         }
     }
     proactive_queue_.Restore(std::move(queued));
+    pending_proactive_event_.reset();
+    if (pending != nullptr && cJSON_IsObject(pending)) {
+        auto restored_pending = ParseProactiveEvent(pending);
+        auto source = restored_pending.metadata.find("source_id");
+        if (source != restored_pending.metadata.end()) {
+            FindFollowUpLabel(static_cast<uint32_t>(
+                std::strtoul(source->second.c_str(), nullptr, 10)));
+        }
+        restored_pending.metadata["cue_played"] = "true";
+        pending_proactive_event_ = std::move(restored_pending);
+        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+    }
 }
 
 void Application::SaveProactive() const {
@@ -2147,17 +2223,18 @@ void Application::SaveProactive() const {
     for (const auto& event : proactive_queue_.items()) {
         cJSON_AddItemToArray(queue, ProactiveEventJson(event));
     }
-    if (pending_proactive_event_) {
-        cJSON_AddItemToArray(queue, ProactiveEventJson(*pending_proactive_event_));
-    }
+    cJSON_AddItemToObject(root, "pending", pending_proactive_event_ ?
+        ProactiveEventJson(*pending_proactive_event_) : cJSON_CreateNull());
     const std::string saved = JsonString(root);
-    static constexpr size_t kChunkSize = 1800;
     static constexpr size_t kMaxSerializedBytes = 7200;
     if (saved.size() > kMaxSerializedBytes) {
         throw std::runtime_error("主动状态超过7200字节持久化预算");
     }
-    const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
-    if (chunk_count > 4) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    const auto compressed = proactive::StateCodec::Compress(saved);
+    static constexpr size_t kMaxCompressedBytes = 3600;
+    if (compressed.size() > kMaxCompressedBytes) {
+        throw std::runtime_error("主动状态压缩后超过3600字节NVS替换预算");
+    }
     nvs_handle_t handle = 0;
     auto check_nvs = [&handle](esp_err_t error, const char* operation) {
         if (error == ESP_OK || (strcmp(operation, "erase") == 0 &&
@@ -2172,38 +2249,31 @@ void Application::SaveProactive() const {
     check_nvs(nvs_get_stats(nullptr, &nvs_stats), "stats");
     size_t namespace_used_entries = 0;
     check_nvs(nvs_get_used_entry_count(handle, &namespace_used_entries), "used entries");
-    size_t required_entries = 1;  // chunks i32
-    size_t max_chunk_entries = 0;
-    for (int i = 0; i < chunk_count; ++i) {
-        const size_t chunk_length = std::min(kChunkSize, saved.size() - i * kChunkSize);
-        const size_t chunk_entries = 2 + (chunk_length + 32) / 32;
-        required_entries += chunk_entries;
-        max_chunk_entries = std::max(max_chunk_entries, chunk_entries);
-    }
+    // Blob data consumes one entry per 32 bytes plus blob index/page metadata.
+    // Eight metadata entries is deliberately conservative for a 3600-byte blob.
+    const size_t required_entries = 8 + (compressed.size() + 31) / 32;
     static constexpr size_t kNvsSafetyEntries = 16;
     const size_t reusable_entries = nvs_stats.available_entries + namespace_used_entries;
-    const size_t replacement_peak = required_entries + max_chunk_entries + kNvsSafetyEntries;
+    const size_t replacement_peak = required_entries + namespace_used_entries +
+        kNvsSafetyEntries;
     if (reusable_entries < replacement_peak) {
         nvs_close(handle);
         handle = 0;
         throw std::runtime_error("NVS剩余空间不足，无法原子保存主动状态");
     }
-    int32_t old_count = 0;
-    const esp_err_t get_count_error = nvs_get_i32(handle, "chunks", &old_count);
-    if (get_count_error != ESP_OK && get_count_error != ESP_ERR_NVS_NOT_FOUND) {
-        check_nvs(get_count_error, "read");
-    }
-    for (int i = 0; i < chunk_count; ++i) {
-        const std::string key = "data" + std::to_string(i);
-        const std::string chunk = saved.substr(i * kChunkSize, kChunkSize);
-        check_nvs(nvs_set_str(handle, key.c_str(), chunk.c_str()), "write");
-    }
-    for (int i = chunk_count; i < old_count && i < 16; ++i) {
+    // A single blob key is the crash-consistency boundary. ESP-IDF NVS keeps an
+    // individual key update power-loss safe; no multi-key transaction is assumed.
+    check_nvs(nvs_set_blob(handle, "state", compressed.data(), compressed.size()),
+              "write blob");
+    check_nvs(nvs_commit(handle), "commit blob");
+    // Legacy chunks are removed only after the authoritative blob commit. A
+    // reset during cleanup therefore still loads the complete blob.
+    for (int i = 0; i < 16; ++i) {
         const std::string key = "data" + std::to_string(i);
         check_nvs(nvs_erase_key(handle, key.c_str()), "erase");
     }
-    check_nvs(nvs_set_i32(handle, "chunks", chunk_count), "write");
-    check_nvs(nvs_commit(handle), "commit");
+    check_nvs(nvs_erase_key(handle, "chunks"), "erase");
+    check_nvs(nvs_commit(handle), "commit cleanup");
     nvs_close(handle);
 }
 
@@ -2396,10 +2466,6 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     proactive_close_pending_ = false;
     const bool reboot_pending = proactive_reboot_pending_;
     proactive_reboot_pending_ = false;
-    const auto deferred_open = proactive_deferred_open_mode_;
-    proactive_deferred_open_mode_.reset();
-    const auto deferred_wake_word = proactive_deferred_wake_word_;
-    proactive_deferred_wake_word_.reset();
     const EventBits_t deferred_bits = proactive_deferred_event_bits_;
     proactive_deferred_event_bits_ = 0;
     if (reset_pending) {
@@ -2418,12 +2484,10 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
         proactive_deferred_mcp_messages_.pop_front();
         if (protocol_) protocol_->SendMcpMessage(payload);
     }
-    if (deferred_wake_word && GetDeviceState() == kDeviceStateIdle) {
-        BeginWakeWordInvoke(*deferred_wake_word);
-    } else if (deferred_wake_word && GetDeviceState() == kDeviceStateConnecting) {
-        ContinueWakeWordInvoke(*deferred_wake_word);
-    } else if (deferred_open && GetDeviceState() == kDeviceStateConnecting) {
-        ContinueOpenAudioChannel(*deferred_open);
+    while (!proactive_deferred_actions_.empty()) {
+        auto action = std::move(proactive_deferred_actions_.front());
+        proactive_deferred_actions_.pop_front();
+        action();
     }
     xEventGroupSetBits(event_group_, deferred_bits | MAIN_EVENT_CLOCK_TICK |
                                      MAIN_EVENT_PLAYBACK_DRAINED |
@@ -2569,7 +2633,9 @@ void Application::CheckProactiveEvents() {
 
 bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
     if (IsProactiveConnectionBusy()) {
-        proactive_deferred_event_bits_ |= MAIN_EVENT_PLAYBACK_DRAINED;
+        DeferProactiveAction("reminder playback drained", [this]() {
+            xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+        });
         return false;
     }
     if (protocol_ == nullptr) {
