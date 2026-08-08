@@ -51,6 +51,7 @@ class ScheduleManagerTest(unittest.TestCase):
 
     def test_device_integration_contract(self):
         application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        application_h = (ROOT / "main" / "application.h").read_text(encoding="utf-8")
         mcp = (ROOT / "main" / "mcp_server.cc").read_text(encoding="utf-8")
         boards = [
             (
@@ -108,6 +109,7 @@ class ScheduleManagerTest(unittest.TestCase):
         worker = worker.split("void Application::CheckProactiveEvents", 1)[0]
         self.assertIn("protocol_->OpenAudioChannel()", worker)
         self.assertIn("proactive_connection_running_.store(false)", worker)
+        self.assertIn('"proactive_conn", 4096 * 2, this, 11', application)
         self.assertLess(worker.index("Schedule([this, shutdown_token"),
                         worker.index("xSemaphoreGive(proactive_connection_done_)"))
         finish = application.split("void Application::FinishProactiveConnection", 1)[1]
@@ -116,6 +118,8 @@ class ScheduleManagerTest(unittest.TestCase):
             finish.index("xSemaphoreTake(proactive_connection_done_"),
             finish.index("proactive_connection_running_.store(false)"),
         )
+        self.assertNotIn("Schedule([this", finish)
+        self.assertIn("proactive_finish_pending_ = true", finish)
         destructor = application.split("Application::~Application()", 1)[1]
         destructor = destructor.split("bool Application::SetDeviceState", 1)[0]
         self.assertIn("xSemaphoreTake(proactive_connection_done_, portMAX_DELAY)", destructor)
@@ -147,6 +151,11 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertNotIn("event.priority = proactive::Priority::kCritical", application)
         self.assertIn('cJSON_AddArrayToObject(root, "pending_health")', application)
         self.assertIn("pending_health_events_.push_back", application)
+        self.assertIn("kMaxPendingHealthEvents = 8", application_h)
+        preserve_health = application.split("bool Application::PreservePendingHealth", 1)[1]
+        preserve_health = preserve_health.split("void Application::QueueHealthEvent", 1)[0]
+        self.assertNotIn("pop_front", preserve_health)
+        self.assertIn("return false", preserve_health)
         load_proactive = application.split("void Application::LoadProactive()", 1)[1]
         load_proactive = load_proactive.split("void Application::SaveProactive()", 1)[0]
         self.assertIn('cJSON_GetObjectItem(root.get(), "pending_health")', load_proactive)
@@ -160,6 +169,11 @@ class ScheduleManagerTest(unittest.TestCase):
         recovery = health_queue.split("if (health.recovered)", 1)[1]
         self.assertLess(recovery.index("pending_health_events_.erase"),
                         recovery.index("proactive_queue_.Push(event)"))
+        wake_invoke = application.split("void Application::WakeWordInvoke", 1)[1]
+        wake_invoke = wake_invoke.split("bool Application::CanEnterSleepMode", 1)[0]
+        self.assertLess(wake_invoke.index("Schedule([this, wake_word]"),
+                        wake_invoke.index("proactive_connection_running_.load()"))
+        self.assertIn("proactive_deferred_wake_word_ = wake_word", wake_invoke)
         network_callback = application.split("case NetworkEvent::Scanning:", 1)[1]
         scanning = network_callback.split("case NetworkEvent::Connecting", 1)[0]
         self.assertNotIn("MAIN_EVENT_NETWORK_DISCONNECTED", scanning)

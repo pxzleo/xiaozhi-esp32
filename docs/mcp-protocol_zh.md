@@ -339,4 +339,4 @@ sequenceDiagram
 
 `severity` 只允许 `info/warning/critical`；`details` 由设备为每类事件生成受控字段，不含 URL 凭证、令牌或网络密码。恢复通知沿用同一 `dedupe_key` 且 `recovered=true`。设备持久保存活动去重状态和待发送 follow-up/health 队列；通道不可用不丢失事件，下一次可用时重试。
 
-离线重试采用 5 秒到 5 分钟的指数退避；音频通道由受单 worker 保护的 FreeRTOS 后台任务自动建立，主任务不调用 `OpenAudioChannel`，worker 只建链且不进入 listening。worker 完成并发出信号前保持协议独占，主线程将其他协议操作延后；随后由下一 tick 发送。健康事件保留 info/normal、warning/high、critical/critical 的优先级映射，只有 critical health 绕过普通策略；恢复通知继续走旁路。被淘汰或暂不能入队的健康事件持久保存到最多 4 项的 dedupe 待重试槽，恢复入队会同步清除同 key 的旧故障，槽满时淘汰最旧项并明确记录。本地健康提示音只在设备和播放队列空闲时播放。主动状态 NVS 序列化预算为 3600 字节，超限明确失败；内部保存失败保留一致内存状态并退避重试，MCP 修改保存失败则回滚并返回错误，避免耗尽共享的 16KB NVS 分区或留下仅运行时生效的配置。
+离线重试采用 5 秒到 5 分钟的指数退避；音频通道由高于主任务优先级的单 FreeRTOS worker 自动建立，主任务不调用 `OpenAudioChannel`。worker 排入回调后先发出完成信号并退出，主线程取到信号前保持协议独占；极短双核窗口由下一时钟 tick 重试完成，不自旋。外部唤醒词始终携带具体字符串调度到主线程。健康事件保留 info/normal、warning/high、critical/critical 映射，只有 critical health 绕过普通策略；恢复通知继续走旁路。同优先级下健康事件优先留在主队列，被淘汰或暂不能入队的健康事件持久保存到最多 8 项的 dedupe 待重试槽；恢复会清除同 key 旧故障，槽满时拒绝新项并持续本地告警，不淘汰旧健康事件。主动状态 NVS 序列化预算为 3600 字节，超限明确失败并退避重试。

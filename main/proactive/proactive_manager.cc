@@ -359,8 +359,9 @@ std::optional<Event> DurableQueue::Push(Event event) {
     if (items_.size() >= kMaxItems) {
         auto importance = [](const Event& item) {
             if (item.metadata.count("recovered") != 0 &&
-                item.metadata.at("recovered") == "true") return 5;
-            return static_cast<int>(item.priority);
+                item.metadata.at("recovered") == "true") return 10;
+            return static_cast<int>(item.priority) * 2 +
+                (item.metadata.count("health_kind") != 0 ? 1 : 0);
         };
         auto lowest = std::min_element(items_.begin(), items_.end(),
             [&importance](const Event& left, const Event& right) {

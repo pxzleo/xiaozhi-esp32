@@ -177,7 +177,7 @@ private:
     proactive::DurableQueue proactive_queue_;
     std::optional<proactive::Event> pending_proactive_event_;
     std::deque<proactive::Event> pending_health_events_;
-    static constexpr size_t kMaxPendingHealthEvents = 4;
+    static constexpr size_t kMaxPendingHealthEvents = 8;
     std::atomic<bool> schedule_alert_active_{false};
     int64_t schedule_alert_deadline_us_ = 0;
     int64_t schedule_reminder_tts_deadline_us_ = 0;
@@ -198,6 +198,8 @@ private:
     std::deque<int64_t> network_disconnect_us_;
     std::atomic<bool> network_connected_{false};
     bool time_unsynced_health_reported_ = false;
+    bool health_pending_overflow_alert_ = false;
+    int64_t health_overflow_alert_after_us_ = 0;
     proactive::RetryBackoff proactive_retry_backoff_;
     proactive::RetryBackoff proactive_save_backoff_;
     proactive::RetryBackoff follow_up_enqueue_backoff_;
@@ -216,6 +218,9 @@ private:
     std::optional<std::string> proactive_deferred_wake_word_;
     std::deque<std::string> proactive_deferred_mcp_messages_;
     EventBits_t proactive_deferred_event_bits_ = 0;
+    bool proactive_finish_pending_ = false;
+    bool proactive_finish_success_ = false;
+    uint32_t proactive_finish_generation_ = 0;
     uint32_t proactive_protocol_generation_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -241,6 +246,7 @@ private:
     bool TrySaveProactive(const char* context, bool force = false);
     void CheckProactiveEvents();
     void QueueHealthEvent(const proactive::HealthEvent& event);
+    bool PreservePendingHealth(proactive::Event event);
     bool SendProactiveEvent(const proactive::Event& event);
     std::string FindFollowUpLabel(uint32_t source_id) const;
     void RecordProactiveSendResult(bool success);

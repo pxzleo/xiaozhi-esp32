@@ -220,6 +220,17 @@ void TestPersistentCapacityLimits() {
     assert(ota_evicted && ota_evicted->priority == Priority::kLow);
     assert(std::any_of(priority_queue.items().begin(), priority_queue.items().end(),
                        [](const Event& item) { return item.event_id == "ota-info"; }));
+    DurableQueue same_priority_queue;
+    for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
+        auto ordinary = Suggestion("normal-" + std::to_string(i), "normal", now);
+        ordinary.priority = Priority::kNormal;
+        ordinary.dedupe_key = ordinary.event_id;
+        same_priority_queue.Push(std::move(ordinary));
+    }
+    auto ordinary_evicted = same_priority_queue.Push(ota_info);
+    assert(ordinary_evicted && ordinary_evicted->metadata.count("health_kind") == 0);
+    assert(std::any_of(same_priority_queue.items().begin(), same_priority_queue.items().end(),
+                       [](const Event& item) { return item.event_id == "ota-info"; }));
 
     DurableQueue protected_queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
