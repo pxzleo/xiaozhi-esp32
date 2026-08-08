@@ -77,7 +77,7 @@ void TestQuietMuteTopicAndCooldown() {
     assert(!manager.ShouldDeliver(Suggestion("3", "weather", At(2026, 8, 9, 9)),
                                   At(2026, 8, 9, 9), true));
     manager.AllowTopic("weather");
-    assert(!manager.ShouldDeliver(Suggestion("whitelist", "other", At(2026, 8, 9, 9)),
+    assert(!manager.ShouldDeliver(Suggestion("whitelist", "music", At(2026, 8, 9, 9)),
                                   At(2026, 8, 9, 9), true));
     Event whitelist_critical{"critical", "other", Priority::kCritical, "critical",
                              At(2026, 8, 9, 9), At(2026, 8, 9, 10),
@@ -88,13 +88,13 @@ void TestQuietMuteTopicAndCooldown() {
     manager.RecordDelivered(first, first.created_at, true);
     assert(!manager.ShouldDeliver(Suggestion("5", "weather", first.created_at + 60),
                                   first.created_at + 60, true));
-    manager.AllowTopic("other");
+    manager.AllowTopic("music");
 
     manager.MuteToday(At(2026, 8, 9, 10), true);
     assert(manager.config().mode == Mode::kTodaySilent);
-    assert(!manager.ShouldDeliver(Suggestion("6", "other", At(2026, 8, 9, 11)),
+    assert(!manager.ShouldDeliver(Suggestion("6", "music", At(2026, 8, 9, 11)),
                                   At(2026, 8, 9, 11), true));
-    assert(manager.ShouldDeliver(Suggestion("7", "other", At(2026, 8, 10, 8)),
+    assert(manager.ShouldDeliver(Suggestion("7", "music", At(2026, 8, 10, 8)),
                                  At(2026, 8, 10, 8), true));
     assert(manager.config().mode == Mode::kAggressive);
 }
@@ -338,15 +338,28 @@ void TestPersistentCapacityLimits() {
 
 void TestTopicRuleMigrationAtCapacity() {
     Manager manager;
-    manager.BlockTopic("move-me");
-    for (int i = 0; i < 7; ++i) manager.BlockTopic("blocked-" + std::to_string(i));
-    assert(manager.config().blocked_topics.size() == 8);
-    manager.AllowTopic("move-me");
+    const std::vector<std::string> topics{
+        "reminder", "calendar", "weather", "music", "health", "habit", "system"};
+    for (const auto& topic : topics) manager.BlockTopic(topic);
     assert(manager.config().blocked_topics.size() == 7);
-    assert(manager.config().allowed_topics.count("move-me") == 1);
-    manager.BlockTopic("move-me");
-    assert(manager.config().blocked_topics.size() == 8);
+    manager.AllowTopic("weather");
+    assert(manager.config().blocked_topics.size() == 6);
+    assert(manager.config().allowed_topics.count("weather") == 1);
+    manager.BlockTopic("weather");
+    assert(manager.config().blocked_topics.size() == 7);
     assert(manager.config().allowed_topics.empty());
+
+    bool invalid_rejected = false;
+    try { manager.AllowTopic("follow_up"); }
+    catch (const std::invalid_argument&) { invalid_rejected = true; }
+    assert(invalid_rejected);
+
+    Manager follow_up_policy;
+    const auto now = At(2026, 8, 8, 12);
+    follow_up_policy.AllowTopic("reminder");
+    assert(follow_up_policy.ShouldDeliver(QueuedFollowUp("mapped", now), now, true));
+    follow_up_policy.BlockTopic("reminder");
+    assert(!follow_up_policy.ShouldDeliver(QueuedFollowUp("blocked", now), now, true));
 }
 
 void TestStateCodec() {

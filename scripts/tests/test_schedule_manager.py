@@ -1,5 +1,4 @@
 import json
-import random
 import shutil
 import subprocess
 import tempfile
@@ -42,10 +41,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertFalse(can_replace(100, max_required, 3600))  # Other namespaces full.
 
     def test_maximum_proactive_state_fits_persistence_budget(self):
-        generator = random.Random(0x5A17)
-        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-        topics = ["".join(generator.choice(alphabet) for _ in range(64)) for _ in range(8)]
-        topic = lambda index: topics[index]
+        topics = ["reminder", "calendar", "weather", "music", "health", "habit", "system"]
         config = {
             "mode": "aggressive",
             "mode_before_silent": "aggressive",
@@ -53,11 +49,11 @@ class ScheduleManagerTest(unittest.TestCase):
             "daily_limit": 5,
             "quiet_start": 1439,
             "quiet_end": 1439,
-            "allowed_topics": [topic(i) for i in range(4)],
-            "blocked_topics": [topic(i) for i in range(4, 8)],
+            "allowed_topics": topics[:4],
+            "blocked_topics": topics[4:],
             "budget_date": 20260808,
             "delivered_today": 5,
-            "last_delivered": {topic(i): 1786159999 for i in range(5)},
+            "last_delivered": {topics[i]: 1786159999 for i in range(5)},
         }
         follow_ups = [
             {

@@ -14,9 +14,19 @@ int LocalDate(std::time_t now) {
 }
 
 void ValidateTopic(const std::string& topic) {
-    if (topic.empty() || topic.size() > 64) {
-        throw std::invalid_argument("topic必须是1到64字节");
+    static const std::set<std::string> kTopics{
+        "reminder", "calendar", "weather", "music", "health", "habit", "system"};
+    if (kTopics.count(topic) == 0) {
+        throw std::invalid_argument("topic必须是受支持的主动主题");
     }
+}
+
+const std::string& PolicyTopic(const Event& event) {
+    static const std::string kReminder = "reminder";
+    static const std::string kHealth = "health";
+    if (event.topic == "follow_up") return kReminder;
+    if (event.topic == "health_critical") return kHealth;
+    return event.topic;
 }
 
 void ValidateHealthKind(const std::string& kind) {
@@ -198,9 +208,11 @@ void Manager::Restore(Config config, RuntimeState state) {
         (config.quiet_end && (*config.quiet_end < 0 || *config.quiet_end >= 1440))) {
         throw std::invalid_argument("安静时段超出一天范围");
     }
-    if (config.allowed_topics.size() + config.blocked_topics.size() > 8) {
-        throw std::invalid_argument("保存的主动主题状态超过8项上限");
+    if (config.allowed_topics.size() + config.blocked_topics.size() > 7) {
+        throw std::invalid_argument("保存的主动主题状态超过7项上限");
     }
+    for (const auto& topic : config.allowed_topics) ValidateTopic(topic);
+    for (const auto& topic : config.blocked_topics) ValidateTopic(topic);
     config_ = std::move(config);
     state_ = std::move(state);
     const auto now = std::time(nullptr);
@@ -257,8 +269,8 @@ void Manager::AllowTopic(const std::string& topic) {
     ValidateTopic(topic);
     config_.blocked_topics.erase(topic);
     if (config_.allowed_topics.count(topic) == 0 &&
-        config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
-        throw std::runtime_error("主动主题规则已达8项上限");
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= 7) {
+        throw std::runtime_error("主动主题规则已达7项上限");
     }
     config_.allowed_topics.insert(topic);
 }
@@ -267,8 +279,8 @@ void Manager::BlockTopic(const std::string& topic) {
     ValidateTopic(topic);
     config_.allowed_topics.erase(topic);
     if (config_.blocked_topics.count(topic) == 0 &&
-        config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
-        throw std::runtime_error("主动主题规则已达8项上限");
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= 7) {
+        throw std::runtime_error("主动主题规则已达7项上限");
     }
     config_.blocked_topics.insert(topic);
 }
@@ -309,14 +321,15 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
     RefreshDate(now, time_valid);
     if (event.expires_at > 0 && event.expires_at < now) return false;
     const bool critical = IsCritical(event);
+    const auto& topic = PolicyTopic(event);
     if (!time_valid && !critical) return false;
-    if (config_.blocked_topics.count(event.topic) != 0) return false;
+    if (config_.blocked_topics.count(topic) != 0) return false;
     if (critical) return true;
     if (!config_.allowed_topics.empty() &&
-        config_.allowed_topics.count(event.topic) == 0) return false;
+        config_.allowed_topics.count(topic) == 0) return false;
     if (config_.mode == Mode::kTodaySilent || config_.mode == Mode::kConservative) return false;
     if (IsQuiet(now)) return false;
-    auto previous = state_.last_delivered.find(event.topic);
+    auto previous = state_.last_delivered.find(topic);
     if (previous != state_.last_delivered.end() && now - previous->second < kCooldownSeconds) {
         return false;
     }
@@ -325,14 +338,15 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
 
 void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_valid) {
     RefreshDate(now, time_valid);
-    if (state_.last_delivered.count(event.topic) == 0 &&
+    const auto& topic = PolicyTopic(event);
+    if (state_.last_delivered.count(topic) == 0 &&
         state_.last_delivered.size() >= 5) {
         auto oldest = std::min_element(
             state_.last_delivered.begin(), state_.last_delivered.end(),
             [](const auto& left, const auto& right) { return left.second < right.second; });
         state_.last_delivered.erase(oldest);
     }
-    state_.last_delivered[event.topic] = now;
+    state_.last_delivered[topic] = now;
     if (time_valid && !IsCritical(event)) ++state_.delivered_today;
 }
 

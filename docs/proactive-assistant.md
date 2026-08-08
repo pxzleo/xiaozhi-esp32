@@ -15,7 +15,7 @@
 ## 积极主动模式（v2）
 
 - 设备以独立 `proactive::Manager` 作为主动策略权威。配置和运行状态保存在 NVS `proactive` 命名空间；默认 `aggressive`、普通事件每日最多 5 次。`active` 默认 3 次，`conservative` 的配置上限为 1，但策略仍只允许闹铃、明确提醒和 critical 健康事件。`today_silent` 在本地日期变化后恢复此前模式。
-- 安静时段默认不存在，只有用户明确同时提供 `quiet_start/quiet_end` 后才生效；支持跨午夜。策略还执行 topic allow/block、同类 30 分钟冷却和每日预算：allow 集合非空时作为白名单，普通事件只有 topic 在集合内才允许；critical 事件不受白名单限制。闹铃、明确提醒及 critical 健康事件不受普通预算阻止。系统时间未同步时不重置日期、不恢复 `today_silent`，也不触发非关键主动事件。
+- 安静时段默认不存在，只有用户明确同时提供 `quiet_start/quiet_end` 后才生效；支持跨午夜。策略还执行 topic allow/block、同类 30 分钟冷却和每日预算；主题只允许 `reminder/calendar/weather/music/health/habit/system`，设备内部 `follow_up` 按 `reminder`、`health_critical` 按 `health` 应用规则。allow 集合非空时作为白名单，普通事件只有 topic 在集合内才允许；critical 事件不受白名单限制。闹铃、明确提醒及 critical 健康事件不受普通预算阻止。系统时间未同步时不重置日期、不恢复 `today_silent`，也不触发非关键主动事件。
 - 统一主动事件至少包含 `event_id/topic/priority/reason/created_at/expires_at/dedupe_key/requires_response`。需跨断线的 follow-up 与健康事件进入 NVS 持久队列，按优先级和创建时间取出；普通建议过期即丢弃，明确闹铃/提醒仍走原调度队列并优先。
 - 普通提醒 TTS 真正 stop 后，策略允许时持久化 10 分钟后的完成确认；用于“最近”判定的 `source_triggered_at` 始终取原任务权威 `trigger_at`，不使用 TTS stop 时刻。每项最多主动追问一次。闹铃、每日简报和 follow-up 本身不会递归创建追问。断电恢复后未过期项继续；到期超过 5 分钟仍未发出的项丢弃。`complete_recent/follow_up/dismiss_follow_up` 只处理最近、未过期且唯一的候选，原始触发时刻相同时明确报错。
 - 主动模式工具为 `self.proactive.configure/status/mute/allow_topic/block_topic`。配置、主题和完成追踪工具都应直接调用，不在工具前播报“我来处理一下”。
