@@ -3,6 +3,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
 
@@ -176,6 +177,7 @@ private:
     proactive::DurableQueue proactive_queue_;
     std::optional<proactive::Event> pending_proactive_event_;
     std::deque<proactive::Event> pending_health_events_;
+    static constexpr size_t kMaxPendingHealthEvents = 4;
     std::atomic<bool> schedule_alert_active_{false};
     int64_t schedule_alert_deadline_us_ = 0;
     int64_t schedule_reminder_tts_deadline_us_ = 0;
@@ -203,8 +205,17 @@ private:
     bool proactive_save_pending_ = false;
     std::atomic<bool> proactive_connection_running_{false};
     std::atomic<bool> proactive_shutdown_{false};
+    std::shared_ptr<std::atomic<bool>> proactive_shutdown_token_ =
+        std::make_shared<std::atomic<bool>>(false);
+    SemaphoreHandle_t proactive_connection_done_ = nullptr;
     TaskHandle_t proactive_connection_task_handle_ = nullptr;
     bool proactive_reset_pending_ = false;
+    bool proactive_close_pending_ = false;
+    bool proactive_reboot_pending_ = false;
+    std::optional<ListeningMode> proactive_deferred_open_mode_;
+    std::optional<std::string> proactive_deferred_wake_word_;
+    std::deque<std::string> proactive_deferred_mcp_messages_;
+    EventBits_t proactive_deferred_event_bits_ = 0;
     uint32_t proactive_protocol_generation_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -235,6 +246,7 @@ private:
     void RecordProactiveSendResult(bool success);
     bool StartProactiveConnectionWorker();
     void ProactiveConnectionTask(uint32_t protocol_generation);
+    void FinishProactiveConnection(bool success, uint32_t protocol_generation);
     void CheckSchedules();
     void StartNextScheduleAlert();
     void ShowScheduleAlertPage();

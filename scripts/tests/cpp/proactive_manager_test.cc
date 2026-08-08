@@ -134,7 +134,14 @@ void TestHealthDedupRecoveryAndQueueOrdering() {
     const auto now = At(2026, 8, 8, 9);
     auto raised = health.Raise("network_flapping", Severity::kWarning, now,
                                {{"disconnects", "3"}});
-    assert(raised && raised->event.topic == "health");
+    assert(raised && raised->event.topic == "health" &&
+           raised->event.priority == Priority::kHigh);
+    auto info = health.Raise("ota_update_available", Severity::kInfo, now, {});
+    assert(info && info->event.topic == "health" &&
+           info->event.priority == Priority::kNormal);
+    auto critical_health = health.Raise("audio_decode_failed", Severity::kCritical, now, {});
+    assert(critical_health && critical_health->event.topic == "health_critical" &&
+           critical_health->event.priority == Priority::kCritical);
     assert(!health.Raise("network_flapping", Severity::kWarning, now + 1, {}));
     auto recovered = health.Recover("network_flapping", now + 2);
     assert(recovered && recovered->event.dedupe_key == raised->event.dedupe_key);
@@ -206,7 +213,7 @@ void TestPersistentCapacityLimits() {
     auto evicted = priority_queue.Push(critical);
     assert(evicted && evicted->priority == Priority::kLow);
     assert(priority_queue.items().size() == DurableQueue::kMaxItems);
-    Event ota_info{"ota-info", "health_critical", Priority::kCritical,
+    Event ota_info{"ota-info", "health", Priority::kNormal,
                    "ota info health", now, now + 60, "health:ota", false,
                    {{"health_kind", "ota_update_available"}, {"severity", "info"}}};
     auto ota_evicted = priority_queue.Push(ota_info);

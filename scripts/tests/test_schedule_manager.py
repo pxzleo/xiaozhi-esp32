@@ -87,7 +87,7 @@ class ScheduleManagerTest(unittest.TestCase):
             proactive_check.index("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)"),
         )
         drained = application.split(
-            "if (pending_proactive_event_ && audio_service_.IsPlaybackIdle())", 1
+            "pending_proactive_event_ &&", 1
         )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]
         self.assertIn("SendProactiveEvent(event)", drained)
         send_proactive = application.split("bool Application::SendProactiveEvent", 1)[1]
@@ -108,6 +108,24 @@ class ScheduleManagerTest(unittest.TestCase):
         worker = worker.split("void Application::CheckProactiveEvents", 1)[0]
         self.assertIn("protocol_->OpenAudioChannel()", worker)
         self.assertIn("proactive_connection_running_.store(false)", worker)
+        self.assertLess(worker.index("Schedule([this, shutdown_token"),
+                        worker.index("xSemaphoreGive(proactive_connection_done_)"))
+        finish = application.split("void Application::FinishProactiveConnection", 1)[1]
+        finish = finish.split("void Application::CheckProactiveEvents", 1)[0]
+        self.assertLess(
+            finish.index("xSemaphoreTake(proactive_connection_done_"),
+            finish.index("proactive_connection_running_.store(false)"),
+        )
+        destructor = application.split("Application::~Application()", 1)[1]
+        destructor = destructor.split("bool Application::SetDeviceState", 1)[0]
+        self.assertIn("xSemaphoreTake(proactive_connection_done_, portMAX_DELAY)", destructor)
+        self.assertIn("deferred_bits | MAIN_EVENT_CLOCK_TICK", finish)
+        for method in ("ContinueOpenAudioChannel", "ContinueWakeWordInvoke",
+                       "NotifyReminderTriggered"):
+            body = application.split(f"Application::{method}", 1)[1]
+            self.assertIn("proactive_connection_running_.load()", body[:1200])
+        self.assertLess(proactive_check.index("proactive_connection_running_.load()"),
+                        proactive_check.index("protocol_->IsAudioChannelOpened()"))
         reset = application.split("void Application::ResetProtocol()", 1)[1]
         self.assertIn("proactive_reset_pending_ = true", reset)
         self.assertIn("LoadProactive()", application)
@@ -126,10 +144,22 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("未应用修改", application)
         self.assertEqual(application.count("SaveProactive();"), 1)
         self.assertIn("recovered_health ||", application)
-        self.assertIn("event.priority = proactive::Priority::kCritical", application)
+        self.assertNotIn("event.priority = proactive::Priority::kCritical", application)
+        self.assertIn('cJSON_AddArrayToObject(root, "pending_health")', application)
+        self.assertIn("pending_health_events_.push_back", application)
+        load_proactive = application.split("void Application::LoadProactive()", 1)[1]
+        load_proactive = load_proactive.split("void Application::SaveProactive()", 1)[0]
+        self.assertIn('cJSON_GetObjectItem(root.get(), "pending_health")', load_proactive)
+        self.assertIn("ParseProactiveEvent(item)", load_proactive)
+        save_proactive = application.split("void Application::SaveProactive()", 1)[1]
+        save_proactive = save_proactive.split("bool Application::TrySaveProactive", 1)[0]
+        self.assertIn("for (const auto& event : pending_health_events_)", save_proactive)
         health_queue = application.split("void Application::QueueHealthEvent", 1)[1]
         health_queue = health_queue.split("bool Application::SendProactiveEvent", 1)[0]
         self.assertIn("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)", health_queue)
+        recovery = health_queue.split("if (health.recovered)", 1)[1]
+        self.assertLess(recovery.index("pending_health_events_.erase"),
+                        recovery.index("proactive_queue_.Push(event)"))
         network_callback = application.split("case NetworkEvent::Scanning:", 1)[1]
         scanning = network_callback.split("case NetworkEvent::Connecting", 1)[0]
         self.assertNotIn("MAIN_EVENT_NETWORK_DISCONNECTED", scanning)
