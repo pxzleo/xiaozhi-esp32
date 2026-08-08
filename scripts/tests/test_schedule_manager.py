@@ -10,6 +10,31 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduleManagerTest(unittest.TestCase):
+    def test_proactive_nvs_replacement_peak_model(self):
+        chunk_size = 1800
+        safety_entries = 16
+
+        def entry_cost(serialized_bytes):
+            lengths = [
+                min(chunk_size, serialized_bytes - offset)
+                for offset in range(0, serialized_bytes, chunk_size)
+            ]
+            chunk_entries = [2 + (length + 32) // 32 for length in lengths]
+            return 1 + sum(chunk_entries), max(chunk_entries)
+
+        def can_replace(global_available, proactive_used, serialized_bytes):
+            required, largest_chunk = entry_cost(serialized_bytes)
+            return (global_available + proactive_used >=
+                    required + largest_chunk + safety_entries)
+
+        max_required, _ = entry_cost(7200)
+        half_required, _ = entry_cost(3600)
+        self.assertTrue(can_replace(504, 0, 7200))  # 16KB target first save.
+        self.assertTrue(can_replace(142, max_required, 7200))  # Same-size rewrite.
+        self.assertTrue(can_replace(142, max_required, 3600))  # Shrink rewrite.
+        self.assertTrue(can_replace(260, half_required, 7200))  # Grow back to max.
+        self.assertFalse(can_replace(32, max_required, 7200))  # Other namespaces full.
+
     def test_maximum_proactive_state_fits_persistence_budget(self):
         topic = lambda index: f"topic-{index}-" + "x" * 56
         config = {
@@ -220,6 +245,9 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("RecordProactiveSendResult", application)
         self.assertIn("kMaxSerializedBytes = 7200", application)
         self.assertIn("nvs_get_stats(nullptr, &nvs_stats)", application)
+        self.assertIn("nvs_get_used_entry_count(handle, &namespace_used_entries)", application)
+        self.assertIn("nvs_stats.available_entries + namespace_used_entries", application)
+        self.assertIn("required_entries + max_chunk_entries + kNvsSafetyEntries", application)
         self.assertIn("kNvsSafetyEntries = 16", application)
         self.assertIn("TrySaveProactive", application)
         self.assertIn("proactive_save_pending_ = true", application)

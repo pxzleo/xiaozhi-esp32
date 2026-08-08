@@ -2158,18 +2158,6 @@ void Application::SaveProactive() const {
     }
     const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
     if (chunk_count > 4) throw std::runtime_error("主动状态JSON超过NVS容量限制");
-    nvs_stats_t nvs_stats{};
-    const esp_err_t stats_error = nvs_get_stats(nullptr, &nvs_stats);
-    if (stats_error != ESP_OK) throw std::runtime_error("无法读取NVS剩余容量");
-    size_t required_entries = 1;  // chunks i32
-    for (int i = 0; i < chunk_count; ++i) {
-        const size_t chunk_length = std::min(kChunkSize, saved.size() - i * kChunkSize);
-        required_entries += 2 + (chunk_length + 32) / 32;
-    }
-    static constexpr size_t kNvsSafetyEntries = 16;
-    if (nvs_stats.available_entries < required_entries + kNvsSafetyEntries) {
-        throw std::runtime_error("NVS剩余空间不足，无法原子保存主动状态");
-    }
     nvs_handle_t handle = 0;
     auto check_nvs = [&handle](esp_err_t error, const char* operation) {
         if (error == ESP_OK || (strcmp(operation, "erase") == 0 &&
@@ -2180,6 +2168,26 @@ void Application::SaveProactive() const {
                                  esp_err_to_name(error));
     };
     check_nvs(nvs_open("proactive", NVS_READWRITE, &handle), "open");
+    nvs_stats_t nvs_stats{};
+    check_nvs(nvs_get_stats(nullptr, &nvs_stats), "stats");
+    size_t namespace_used_entries = 0;
+    check_nvs(nvs_get_used_entry_count(handle, &namespace_used_entries), "used entries");
+    size_t required_entries = 1;  // chunks i32
+    size_t max_chunk_entries = 0;
+    for (int i = 0; i < chunk_count; ++i) {
+        const size_t chunk_length = std::min(kChunkSize, saved.size() - i * kChunkSize);
+        const size_t chunk_entries = 2 + (chunk_length + 32) / 32;
+        required_entries += chunk_entries;
+        max_chunk_entries = std::max(max_chunk_entries, chunk_entries);
+    }
+    static constexpr size_t kNvsSafetyEntries = 16;
+    const size_t reusable_entries = nvs_stats.available_entries + namespace_used_entries;
+    const size_t replacement_peak = required_entries + max_chunk_entries + kNvsSafetyEntries;
+    if (reusable_entries < replacement_peak) {
+        nvs_close(handle);
+        handle = 0;
+        throw std::runtime_error("NVS剩余空间不足，无法原子保存主动状态");
+    }
     int32_t old_count = 0;
     const esp_err_t get_count_error = nvs_get_i32(handle, "chunks", &old_count);
     if (get_count_error != ESP_OK && get_count_error != ESP_ERR_NVS_NOT_FOUND) {
