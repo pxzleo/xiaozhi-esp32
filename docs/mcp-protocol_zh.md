@@ -341,4 +341,4 @@ sequenceDiagram
 
 离线重试采用 5 秒到 5 分钟的指数退避；音频通道由高于主任务优先级的单 FreeRTOS worker 自动建立，主任务不调用 `OpenAudioChannel`。独立原子 busy 在任务创建前发布，并在 worker Give 完成信号前始终为 true；Give 是 worker 最后一次 Application 访问，Finish 取到信号后才由主线程清 busy/handle，析构看到 busy 就无条件等待。连接期间的 start/stop/toggle/具体唤醒词进入有界 FIFO 并按到达顺序重放，满时明确告警。健康事件只接受 network/time/OTA/audio 四类 kind，活动与恢复按 dedupe key 在统一 8 项主队列中替换；当前发送中的事件另存独立 `pending` 字段。
 
-主动状态合法 JSON 上限 7200 字节，使用共享有界 LZSS 压缩为不超过 3600 字节的单个 NVS `state` blob，并校验原始长度与 FNV-1a；单键 commit 是断电一致性边界。容量预检覆盖旧、新 blob 共存峰值和 16 entry 安全余量：目标 16KB 模型首次可用 378 entry、重复替换时可用约 142 entry 均能通过，真实空间不足仍明确拒绝并保留内存退避重试。
+主动状态合法 JSON 上限 7200 字节，使用共享有界长窗口 LZSS 压缩为不超过 3600 字节的单个 NVS `state` blob，并校验原始长度与 FNV-1a；持久事件仅接受受控 follow-up/health schema。单键 commit 是断电一致性边界，损坏 blob 会提交删除隔离。旧版 9 项队列迁移时唯一的最高优先/最新追问拆为独立 pending，歧义明确报错。容量预检覆盖旧、新 blob 共存峰值和 16 entry 安全余量：目标 16KB 模型首次可用 378 entry、重复替换时可用约 142 entry 均能通过，真实空间不足仍明确拒绝并保留内存退避重试。

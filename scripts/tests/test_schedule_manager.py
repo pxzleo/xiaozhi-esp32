@@ -1,4 +1,5 @@
 import json
+import random
 import shutil
 import subprocess
 import tempfile
@@ -41,7 +42,10 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertFalse(can_replace(100, max_required, 3600))  # Other namespaces full.
 
     def test_maximum_proactive_state_fits_persistence_budget(self):
-        topic = lambda index: f"topic-{index}-" + "x" * 56
+        generator = random.Random(0x5A17)
+        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        topics = ["".join(generator.choice(alphabet) for _ in range(64)) for _ in range(8)]
+        topic = lambda index: topics[index]
         config = {
             "mode": "aggressive",
             "mode_before_silent": "aggressive",
@@ -57,14 +61,15 @@ class ScheduleManagerTest(unittest.TestCase):
         }
         follow_ups = [
             {
-                "source_id": i + 1,
-                "label": "最" * 80,
-                "source_triggered_at": 1786159000 + i,
-                "due_at": 1786159600 + i,
-                "expires_at": 1786159900 + i,
+                "source_id": source_index + 1,
+                "label": "".join(chr(0x4e00 + char_index * 83 + source_index)
+                                 for char_index in range(80)),
+                "source_triggered_at": 1786159000 + source_index,
+                "due_at": 1786159600 + source_index,
+                "expires_at": 1786159900 + source_index,
                 "asked": True,
             }
-            for i in range(4)
+            for source_index in range(4)
         ]
         kinds = ("network_flapping", "time_unsynchronized",
                  "ota_update_available", "audio_decode_failed")
@@ -102,11 +107,9 @@ class ScheduleManagerTest(unittest.TestCase):
                   })
             for kind in kinds
         ]
-        queue += [
-            event(f"proactive-{i + 1}-1786159600", topic(i), "high",
-                  f"proactive:{i + 1}", {})
-            for i in range(4)
-        ]
+        queue += [event(f"follow-up-{i + 1}-1786159600", "follow_up", "high",
+                        f"follow-up:{i + 1}", {"source_id": str(i + 1)})
+                  for i in range(4)]
         pending = event("follow-up-pending-1786159600", "follow_up", "high",
                         "follow-up:pending", {"source_id": "4", "cue_played": "true"})
         state = {"config": config, "follow_ups": follow_ups,
@@ -114,7 +117,7 @@ class ScheduleManagerTest(unittest.TestCase):
         encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
 
         def production_lzss(data):
-            output = bytearray(b"PZ1\0" + len(data).to_bytes(4, "little") + b"\0\0\0\0")
+            output = bytearray(b"PZ2\0" + len(data).to_bytes(4, "little") + b"\0\0\0\0")
             checksum = 2166136261
             for value in data:
                 checksum = ((checksum ^ value) * 16777619) & 0xffffffff
@@ -127,16 +130,16 @@ class ScheduleManagerTest(unittest.TestCase):
                     if cursor >= len(data):
                         break
                     best_length = best_offset = 0
-                    for candidate in range(max(0, cursor - 255), cursor):
+                    for candidate in range(max(0, cursor - 65535), cursor):
                         length = 0
                         while (length < 255 and cursor + length < len(data) and
                                data[candidate + length] == data[cursor + length]):
                             length += 1
-                        if length >= 3 and length > best_length:
+                        if length >= 4 and length > best_length:
                             best_length, best_offset = length, cursor - candidate
-                    if best_length >= 3:
+                    if best_length >= 4:
                         output[flags_index] |= 1 << bit
-                        output.extend((best_offset, best_length))
+                        output.extend((best_offset & 0xff, best_offset >> 8, best_length))
                         cursor += best_length
                     else:
                         output.append(data[cursor])
@@ -277,6 +280,23 @@ class ScheduleManagerTest(unittest.TestCase):
         reset = application.split("void Application::ResetProtocol()", 1)[1]
         self.assertIn("proactive_reset_pending_ = true", reset)
         self.assertIn("LoadProactive()", application)
+        for public_name, handler, event_bit in (
+                ("ToggleChatState", "HandleToggleChatEvent", "MAIN_EVENT_TOGGLE_CHAT"),
+                ("StartListening", "HandleStartListeningEvent", "MAIN_EVENT_START_LISTENING"),
+                ("StopListening", "HandleStopListeningEvent", "MAIN_EVENT_STOP_LISTENING")):
+            public_body = application.split(f"void Application::{public_name}()", 1)[1]
+            public_body = public_body.split("\n}", 1)[0]
+            self.assertIn("Schedule([this]", public_body)
+            self.assertIn(handler, public_body)
+            self.assertNotIn(f"xEventGroupSetBits(event_group_, {event_bit})", public_body)
+        wake_callback = application.split("callbacks.on_wake_word_detected", 1)[1]
+        wake_callback = wake_callback.split("callbacks.on_vad_change", 1)[0]
+        self.assertIn("Schedule([this, wake_word]", wake_callback)
+        self.assertNotIn("MAIN_EVENT_WAKE_WORD_DETECTED", wake_callback)
+        self.assertIn('nvs_erase_key(quarantine_handle, "state")', application)
+        self.assertIn("nvs_commit(quarantine_handle)", application)
+        self.assertIn("migrated_pending", application)
+        self.assertIn("旧版主动队列待播追问存在歧义", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)
         self.assertIn("uptime_ticks_ >= 600", application)

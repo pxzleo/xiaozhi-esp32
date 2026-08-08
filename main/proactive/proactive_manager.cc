@@ -25,12 +25,70 @@ void ValidateHealthKind(const std::string& kind) {
     }
 }
 
+void ValidatePersistentEvent(const Event& event) {
+    if (event.event_id.empty() || event.event_id.size() > 96 ||
+        event.dedupe_key.empty() || event.dedupe_key.size() > 96 ||
+        event.reason.empty() || event.reason.size() > 64) {
+        throw std::invalid_argument("持久主动事件文本字段超出限制");
+    }
+    if (event.topic == "follow_up") {
+        if (!event.requires_response ||
+            event.reason != "confirm reminder completion" ||
+            event.metadata.count("source_id") != 1 || event.metadata.size() > 2) {
+            throw std::invalid_argument("持久追问事件schema无效");
+        }
+        for (const auto& [key, value] : event.metadata) {
+            if ((key != "source_id" && key != "cue_played") || value.size() > 32) {
+                throw std::invalid_argument("持久追问metadata无效");
+            }
+        }
+        const auto& source_id = event.metadata.at("source_id");
+        if (source_id.empty() || !std::all_of(source_id.begin(), source_id.end(),
+                [](unsigned char value) { return value >= '0' && value <= '9'; }) ||
+            (event.metadata.count("cue_played") != 0 &&
+             event.metadata.at("cue_played") != "true")) {
+            throw std::invalid_argument("持久追问metadata值无效");
+        }
+        return;
+    }
+    if (event.topic != "health" && event.topic != "health_critical") {
+        throw std::invalid_argument("持久主动事件topic不受支持");
+    }
+    const auto kind = event.metadata.find("health_kind");
+    const auto severity = event.metadata.find("severity");
+    const auto recovered = event.metadata.find("recovered");
+    if (event.requires_response || kind == event.metadata.end() ||
+        severity == event.metadata.end() || recovered == event.metadata.end() ||
+        !HealthTracker::IsSupportedKind(kind->second) ||
+        (severity->second != "info" && severity->second != "warning" &&
+         severity->second != "critical") ||
+        (recovered->second != "true" && recovered->second != "false")) {
+        throw std::invalid_argument("持久健康事件schema无效");
+    }
+    const Priority expected_priority = severity->second == "critical" ? Priority::kCritical :
+        (severity->second == "warning" ? Priority::kHigh : Priority::kNormal);
+    const std::string expected_reason = recovered->second == "true" ?
+        "device health recovered" : "device health";
+    if (event.priority != expected_priority || event.reason != expected_reason ||
+        (expected_priority == Priority::kCritical) != (event.topic == "health_critical")) {
+        throw std::invalid_argument("持久健康事件优先级或原因无效");
+    }
+    for (const auto& [key, value] : event.metadata) {
+        const bool base = key == "health_kind" || key == "severity" || key == "recovered";
+        const bool detail = key == "detail.error_code" || key == "detail.version" ||
+            key == "detail.uptime_seconds" || key == "detail.disconnects_in_5m";
+        if ((!base && !detail) || value.size() > 96) {
+            throw std::invalid_argument("持久健康metadata无效");
+        }
+    }
+}
+
 }  // namespace
 
 std::vector<uint8_t> StateCodec::Compress(const std::string& input) {
     uint32_t checksum = 2166136261u;
     for (uint8_t value : input) checksum = (checksum ^ value) * 16777619u;
-    std::vector<uint8_t> output{'P', 'Z', '1', 0};
+    std::vector<uint8_t> output{'P', 'Z', '2', 0};
     auto append_u32 = [&output](uint32_t value) {
         for (int shift = 0; shift < 32; shift += 8) {
             output.push_back(static_cast<uint8_t>(value >> shift));
@@ -45,21 +103,22 @@ std::vector<uint8_t> StateCodec::Compress(const std::string& input) {
         for (int bit = 0; bit < 8 && cursor < input.size(); ++bit) {
             size_t best_length = 0;
             size_t best_offset = 0;
-            const size_t window_start = cursor > 255 ? cursor - 255 : 0;
+            const size_t window_start = cursor > 65535 ? cursor - 65535 : 0;
             for (size_t candidate = window_start; candidate < cursor; ++candidate) {
                 size_t length = 0;
                 while (length < 255 && cursor + length < input.size() &&
                        input[candidate + length] == input[cursor + length]) {
                     ++length;
                 }
-                if (length >= 3 && length > best_length) {
+                if (length >= 4 && length > best_length) {
                     best_length = length;
                     best_offset = cursor - candidate;
                 }
             }
-            if (best_length >= 3) {
+            if (best_length >= 4) {
                 output[flags_index] |= static_cast<uint8_t>(1u << bit);
                 output.push_back(static_cast<uint8_t>(best_offset));
+                output.push_back(static_cast<uint8_t>(best_offset >> 8));
                 output.push_back(static_cast<uint8_t>(best_length));
                 cursor += best_length;
             } else {
@@ -72,7 +131,7 @@ std::vector<uint8_t> StateCodec::Compress(const std::string& input) {
 
 std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_output) {
     if (data == nullptr || size < 12 || data[0] != 'P' || data[1] != 'Z' ||
-        data[2] != '1' || data[3] != 0) {
+        data[2] != '2' || data[3] != 0) {
         throw std::runtime_error("主动状态压缩头无效");
     }
     auto read_u32 = [data](size_t offset) {
@@ -93,10 +152,12 @@ std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_
         const uint8_t flags = data[cursor++];
         for (int bit = 0; bit < 8 && output.size() < expected_size; ++bit) {
             if ((flags & (1u << bit)) != 0) {
-                if (cursor + 2 > size) throw std::runtime_error("主动状态压缩引用截断");
-                const size_t offset = data[cursor++];
+                if (cursor + 3 > size) throw std::runtime_error("主动状态压缩引用截断");
+                const size_t offset = data[cursor] |
+                    (static_cast<size_t>(data[cursor + 1]) << 8);
+                cursor += 2;
                 const size_t length = data[cursor++];
-                if (offset == 0 || length < 3 || offset > output.size() ||
+                if (offset == 0 || length < 4 || offset > output.size() ||
                     output.size() + length > expected_size) {
                     throw std::runtime_error("主动状态压缩引用无效");
                 }
@@ -452,9 +513,7 @@ void DurableQueue::Restore(std::vector<Event> items) {
 }
 
 std::optional<Event> DurableQueue::Push(Event event) {
-    if (event.event_id.empty() || event.topic.empty() || event.dedupe_key.empty()) {
-        throw std::invalid_argument("主动事件字段不完整");
-    }
+    ValidatePersistentEvent(event);
     auto found = std::find_if(items_.begin(), items_.end(), [&event](const Event& item) {
         return item.event_id == event.event_id || item.dedupe_key == event.dedupe_key;
     });

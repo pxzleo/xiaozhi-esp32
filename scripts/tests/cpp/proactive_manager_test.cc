@@ -24,6 +24,12 @@ Event Suggestion(std::string id, std::string topic, std::time_t now) {
             now + 600, "suggestion", false, {}};
 }
 
+Event QueuedFollowUp(std::string id, std::time_t now,
+                     Priority priority = Priority::kHigh) {
+    return Event{id, "follow_up", priority, "confirm reminder completion", now,
+                 now + 60, "follow-up:" + id, true, {{"source_id", "1"}}};
+}
+
 void TestModesBudgetDateAndTimeValidity() {
     Manager manager;
     assert(manager.config().mode == Mode::kAggressive);
@@ -151,16 +157,15 @@ void TestHealthDedupRecoveryAndQueueOrdering() {
     assert(health.Raise("network_flapping", Severity::kWarning, now + 1803, {}));
 
     DurableQueue queue;
-    queue.Push(Suggestion("normal", "tip", now));
-    Event alarm{"alarm", "alarm", Priority::kCritical, "alarm", now + 1,
-                now + 60, "alarm-1", true, {}};
+    queue.Push(QueuedFollowUp("normal", now));
+    Event alarm = QueuedFollowUp("alarm", now + 1, Priority::kCritical);
     queue.Push(alarm);
     assert(queue.PopNext(now + 1)->event_id == "alarm");
-    Event follow_up = Suggestion("follow-up", "follow_up", now);
+    Event follow_up = QueuedFollowUp("follow-up", now);
     follow_up.dedupe_key = "follow-up:42";
     queue.Push(follow_up);
     assert(queue.RemoveByDedupeKey("follow-up:42") == 1);
-    queue.Push(Suggestion("expired", "tip", now - 1000));
+    queue.Push(QueuedFollowUp("expired", now - 1000));
     assert(queue.DropExpired(now + 1) == 1);
 }
 
@@ -169,7 +174,7 @@ void TestFourHealthKindsReplaceInPersistentQueue() {
     HealthTracker health;
     DurableQueue queue;
     for (int i = 0; i < 4; ++i) {
-        auto ordinary = Suggestion("ordinary-four-" + std::to_string(i), "tip", now + i);
+        auto ordinary = QueuedFollowUp("ordinary-four-" + std::to_string(i), now + i);
         ordinary.dedupe_key = ordinary.event_id;
         queue.Push(std::move(ordinary));
     }
@@ -183,6 +188,7 @@ void TestFourHealthKindsReplaceInPersistentQueue() {
         auto raised = health.Raise(kind, severity, now, {});
         assert(raised);
         raised->event.metadata["health_kind"] = kind;
+        raised->event.metadata["severity"] = HealthTracker::SeverityName(severity);
         raised->event.metadata["recovered"] = "false";
         queue.Push(raised->event);
     }
@@ -190,6 +196,7 @@ void TestFourHealthKindsReplaceInPersistentQueue() {
     auto recovered = health.Recover("network_flapping", now + 1);
     assert(recovered);
     recovered->event.metadata["health_kind"] = "network_flapping";
+    recovered->event.metadata["severity"] = "info";
     recovered->event.metadata["recovered"] = "true";
     assert(!queue.Push(recovered->event));
     assert(queue.items().size() == DurableQueue::kMaxItems);
@@ -240,14 +247,13 @@ void TestPersistentCapacityLimits() {
 
     DurableQueue queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
-        auto event = Suggestion("capacity-" + std::to_string(i),
-                                "topic-" + std::to_string(i), now);
+        auto event = QueuedFollowUp("capacity-" + std::to_string(i), now);
         event.dedupe_key = event.event_id;
         queue.Push(std::move(event));
     }
     bool queue_full = false;
     try {
-        auto event = Suggestion("overflow", "overflow", now);
+        auto event = QueuedFollowUp("overflow", now);
         event.dedupe_key = event.event_id;
         queue.Push(std::move(event));
     } catch (const std::runtime_error&) { queue_full = true; }
@@ -255,26 +261,27 @@ void TestPersistentCapacityLimits() {
 
     DurableQueue priority_queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
-        auto low = Suggestion("low-" + std::to_string(i), "low", now);
+        auto low = QueuedFollowUp("low-" + std::to_string(i), now, Priority::kLow);
         low.priority = Priority::kLow;
         low.dedupe_key = low.event_id;
         priority_queue.Push(std::move(low));
     }
-    Event critical{"critical-capacity", "health_critical", Priority::kCritical,
-                   "critical", now, now + 60, "critical-capacity", false, {}};
+    Event critical = QueuedFollowUp("critical-capacity", now, Priority::kCritical);
     auto evicted = priority_queue.Push(critical);
     assert(evicted && evicted->priority == Priority::kLow);
     assert(priority_queue.items().size() == DurableQueue::kMaxItems);
     Event ota_info{"ota-info", "health", Priority::kNormal,
-                   "ota info health", now, now + 60, "health:ota", false,
-                   {{"health_kind", "ota_update_available"}, {"severity", "info"}}};
+                   "device health", now, now + 60, "health:ota", false,
+                   {{"health_kind", "ota_update_available"}, {"severity", "info"},
+                    {"recovered", "false"}}};
     auto ota_evicted = priority_queue.Push(ota_info);
     assert(ota_evicted && ota_evicted->priority == Priority::kLow);
     assert(std::any_of(priority_queue.items().begin(), priority_queue.items().end(),
                        [](const Event& item) { return item.event_id == "ota-info"; }));
     DurableQueue same_priority_queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
-        auto ordinary = Suggestion("normal-" + std::to_string(i), "normal", now);
+        auto ordinary = QueuedFollowUp("normal-" + std::to_string(i), now,
+                                       Priority::kNormal);
         ordinary.priority = Priority::kNormal;
         ordinary.dedupe_key = ordinary.event_id;
         same_priority_queue.Push(std::move(ordinary));
@@ -286,15 +293,13 @@ void TestPersistentCapacityLimits() {
 
     DurableQueue protected_queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
-        Event protected_event{"protected-" + std::to_string(i), "health_critical",
-            Priority::kCritical, "protected", now, now + 60,
-            "protected-" + std::to_string(i), false, {}};
-        if (i == 0) protected_event.metadata["recovered"] = "true";
+        Event protected_event = QueuedFollowUp("protected-" + std::to_string(i), now,
+                                               Priority::kCritical);
         protected_queue.Push(std::move(protected_event));
     }
     bool ordinary_rejected = false;
     try {
-        auto ordinary = Suggestion("ordinary", "ordinary", now);
+        auto ordinary = QueuedFollowUp("ordinary", now);
         ordinary.dedupe_key = ordinary.event_id;
         protected_queue.Push(std::move(ordinary));
     } catch (const std::runtime_error&) { ordinary_rejected = true; }
@@ -314,7 +319,7 @@ void TestPersistentCapacityLimits() {
     assert(pending.size() == 1 && !transactional.items()[0].asked);
     bool enqueue_failed = false;
     try {
-        auto follow_up = Suggestion("follow-up-full", "follow_up", now);
+        auto follow_up = QueuedFollowUp("follow-up-full", now, Priority::kLow);
         follow_up.priority = Priority::kLow;
         follow_up.dedupe_key = "follow-up:200";
         priority_queue.Push(std::move(follow_up));

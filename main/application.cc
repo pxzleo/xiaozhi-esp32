@@ -279,6 +279,8 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
             throw std::runtime_error("NVS中的健康事件metadata无效");
         }
     }
+    proactive::DurableQueue schema_validator;
+    schema_validator.Push(event);
     return event;
 }
 
@@ -459,7 +461,7 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
-        xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+        Schedule([this, wake_word]() { HandleWakeWordDetectedValue(wake_word); });
     };
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
@@ -522,10 +524,31 @@ void Application::Initialize() {
     } catch (const std::exception& error) {
         ESP_LOGE(TAG, "Failed to load proactive state; quarantining damaged data: %s",
                  error.what());
-        Settings settings("proactive", true);
-        settings.SetString("last_error", error.what());
-        settings.SetInt("chunks", 0);
-        for (int i = 0; i < 16; ++i) settings.EraseKey("data" + std::to_string(i));
+        nvs_handle_t quarantine_handle = 0;
+        const esp_err_t quarantine_open = nvs_open(
+            "proactive", NVS_READWRITE, &quarantine_handle);
+        if (quarantine_open == ESP_OK) {
+            esp_err_t erase_error = nvs_erase_key(quarantine_handle, "state");
+            for (int i = 0; i < 16 &&
+                    (erase_error == ESP_OK || erase_error == ESP_ERR_NVS_NOT_FOUND); ++i) {
+                const std::string key = "data" + std::to_string(i);
+                erase_error = nvs_erase_key(quarantine_handle, key.c_str());
+            }
+            if (erase_error == ESP_OK || erase_error == ESP_ERR_NVS_NOT_FOUND) {
+                erase_error = nvs_erase_key(quarantine_handle, "chunks");
+            }
+            const esp_err_t commit_error = (erase_error == ESP_OK ||
+                erase_error == ESP_ERR_NVS_NOT_FOUND) ?
+                nvs_commit(quarantine_handle) : erase_error;
+            nvs_close(quarantine_handle);
+            if (commit_error != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to commit proactive blob quarantine: %s",
+                         esp_err_to_name(commit_error));
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to open proactive quarantine: %s",
+                     esp_err_to_name(quarantine_open));
+        }
         proactive_manager_.Restore({}, {});
         schedule_follow_ups_.Restore({});
         health_tracker_.Restore({});
@@ -1369,11 +1392,17 @@ void Application::DismissAlert() {
     }
 }
 
-void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
+void Application::ToggleChatState() {
+    Schedule([this]() { HandleToggleChatEvent(); });
+}
 
-void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
+void Application::StartListening() {
+    Schedule([this]() { HandleStartListeningEvent(); });
+}
 
-void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
+void Application::StopListening() {
+    Schedule([this]() { HandleStopListeningEvent(); });
+}
 
 void Application::HandleToggleChatEvent() {
     if (IsProactiveConnectionBusy()) {
@@ -2175,6 +2204,29 @@ void Application::LoadProactive() {
     health_tracker_.Restore(std::move(health_records));
     std::vector<proactive::Event> queued;
     cJSON_ArrayForEach(item, queue) queued.push_back(ParseProactiveEvent(item));
+    std::optional<proactive::Event> migrated_pending;
+    if (queued.size() > proactive::DurableQueue::kMaxItems) {
+        if (queued.size() != proactive::DurableQueue::kMaxItems + 1 ||
+            (pending != nullptr && !cJSON_IsNull(pending))) {
+            throw std::runtime_error("旧版主动队列超限且无法迁移");
+        }
+        auto selected = queued.end();
+        for (auto candidate = queued.begin(); candidate != queued.end(); ++candidate) {
+            if (candidate->topic != "follow_up" ||
+                candidate->metadata.count("source_id") == 0) continue;
+            if (selected == queued.end() || candidate->priority > selected->priority ||
+                (candidate->priority == selected->priority &&
+                 candidate->created_at > selected->created_at)) {
+                selected = candidate;
+            } else if (candidate->priority == selected->priority &&
+                       candidate->created_at == selected->created_at) {
+                throw std::runtime_error("旧版主动队列待播追问存在歧义");
+            }
+        }
+        if (selected == queued.end()) throw std::runtime_error("旧版主动队列没有可迁移待播项");
+        migrated_pending = std::move(*selected);
+        queued.erase(selected);
+    }
     for (const auto& event : queued) {
         auto source = event.metadata.find("source_id");
         if (source != event.metadata.end()) {
@@ -2193,6 +2245,10 @@ void Application::LoadProactive() {
         }
         restored_pending.metadata["cue_played"] = "true";
         pending_proactive_event_ = std::move(restored_pending);
+        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+    } else if (migrated_pending) {
+        migrated_pending->metadata["cue_played"] = "true";
+        pending_proactive_event_ = std::move(*migrated_pending);
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     }
 }
