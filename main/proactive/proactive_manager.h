@@ -85,12 +85,13 @@ struct FollowUp {
 
 class FollowUpStore {
 public:
-    static constexpr size_t kMaxItems = 16;
+    static constexpr size_t kMaxItems = 4;
     static constexpr int kDefaultDelaySeconds = 10 * 60;
     static constexpr int kLateGraceSeconds = 5 * 60;
     const std::vector<FollowUp>& items() const { return items_; }
     void Restore(std::vector<FollowUp> items);
-    void Schedule(uint32_t source_id, const std::string& label, std::time_t triggered_at);
+    void Schedule(uint32_t source_id, const std::string& label,
+                  std::time_t source_triggered_at, std::time_t scheduled_at);
     std::vector<FollowUp> Due(std::time_t now);
     FollowUp CompleteRecent(std::time_t now);
     FollowUp DelayRecent(int minutes, std::time_t now);
@@ -133,7 +134,7 @@ private:
 
 class DurableQueue {
 public:
-    static constexpr size_t kMaxItems = 32;
+    static constexpr size_t kMaxItems = 8;
     const std::vector<Event>& items() const { return items_; }
     void Restore(std::vector<Event> items);
     void Push(Event event);
@@ -143,6 +144,19 @@ public:
 
 private:
     std::vector<Event> items_;
+};
+
+class RetryBackoff {
+public:
+    bool Ready(int64_t now_us) const { return now_us >= retry_after_us_; }
+    void OnFailure(int64_t now_us);
+    void OnSuccess();
+    int delay_seconds() const { return delay_seconds_; }
+    int64_t retry_after_us() const { return retry_after_us_; }
+
+private:
+    int delay_seconds_ = 5;
+    int64_t retry_after_us_ = 0;
 };
 
 }  // namespace proactive

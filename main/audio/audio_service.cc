@@ -60,6 +60,8 @@ void AudioService::Initialize(AudioCodec* codec) {
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
+        decode_health_error_code_.store(ret);
+        decode_health_failed_.store(true);
     } else {
         decoder_sample_rate_ = codec->output_sample_rate();
         decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
@@ -431,6 +433,7 @@ void AudioService::OpusCodecTask() {
                     decoded = true;
                 } else {
                     ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
+                    decode_health_error_code_.store(ret);
                     if (!decode_health_failed_.exchange(true) && callbacks_.on_critical_error) {
                         callbacks_.on_critical_error("audio_decode_failed", ret, false);
                     }
@@ -530,6 +533,7 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
+        decode_health_error_code_.store(ret);
         if (!decode_health_failed_.exchange(true) && callbacks_.on_critical_error) {
             callbacks_.on_critical_error("audio_decode_failed", ret, false);
         }
@@ -736,6 +740,10 @@ void AudioService::EnableBargeInDetection(bool enable) {
 
 void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
+    if (decode_health_failed_.load() && callbacks_.on_critical_error) {
+        callbacks_.on_critical_error("audio_decode_failed",
+                                     decode_health_error_code_.load(), false);
+    }
 }
 
 void AudioService::PlaySound(const std::string_view& ogg) {

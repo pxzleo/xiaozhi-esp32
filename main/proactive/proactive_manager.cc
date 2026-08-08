@@ -34,6 +34,10 @@ void Manager::Restore(Config config, RuntimeState state) {
         (config.quiet_end && (*config.quiet_end < 0 || *config.quiet_end >= 1440))) {
         throw std::invalid_argument("安静时段超出一天范围");
     }
+    if (config.allowed_topics.size() + config.blocked_topics.size() > 8 ||
+        state.last_delivered.size() > 8) {
+        throw std::invalid_argument("保存的主动主题状态超过8项上限");
+    }
     config_ = std::move(config);
     state_ = std::move(state);
 }
@@ -74,12 +78,20 @@ void Manager::MuteToday(std::time_t now, bool time_valid) {
 
 void Manager::AllowTopic(const std::string& topic) {
     ValidateTopic(topic);
+    if (config_.allowed_topics.count(topic) == 0 &&
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
+        throw std::runtime_error("主动主题规则已达8项上限");
+    }
     config_.blocked_topics.erase(topic);
     config_.allowed_topics.insert(topic);
 }
 
 void Manager::BlockTopic(const std::string& topic) {
     ValidateTopic(topic);
+    if (config_.blocked_topics.count(topic) == 0 &&
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
+        throw std::runtime_error("主动主题规则已达8项上限");
+    }
     config_.allowed_topics.erase(topic);
     config_.blocked_topics.insert(topic);
 }
@@ -122,6 +134,8 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
     if (!time_valid && !critical) return false;
     if (config_.blocked_topics.count(event.topic) != 0) return false;
     if (critical) return true;
+    if (!config_.allowed_topics.empty() &&
+        config_.allowed_topics.count(event.topic) == 0) return false;
     if (config_.mode == Mode::kTodaySilent || config_.mode == Mode::kConservative) return false;
     if (IsQuiet(now)) return false;
     auto previous = state_.last_delivered.find(event.topic);
@@ -133,6 +147,13 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
 
 void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_valid) {
     RefreshDate(now, time_valid);
+    if (state_.last_delivered.count(event.topic) == 0 &&
+        state_.last_delivered.size() >= 8) {
+        auto oldest = std::min_element(
+            state_.last_delivered.begin(), state_.last_delivered.end(),
+            [](const auto& left, const auto& right) { return left.second < right.second; });
+        state_.last_delivered.erase(oldest);
+    }
     state_.last_delivered[event.topic] = now;
     if (time_valid && !IsCritical(event)) ++state_.delivered_today;
 }
@@ -180,7 +201,7 @@ std::string Manager::FormatClock(int minutes) {
 }
 
 void FollowUpStore::Restore(std::vector<FollowUp> items) {
-    if (items.size() > kMaxItems) throw std::invalid_argument("保存的追问超过16项");
+    if (items.size() > kMaxItems) throw std::invalid_argument("保存的追问超过4项");
     for (const auto& item : items) {
         if (item.source_id == 0 || item.label.empty() || item.source_triggered_at <= 0 ||
             item.due_at <= item.source_triggered_at || item.expires_at < item.due_at) {
@@ -191,18 +212,19 @@ void FollowUpStore::Restore(std::vector<FollowUp> items) {
 }
 
 void FollowUpStore::Schedule(uint32_t source_id, const std::string& label,
-                             std::time_t triggered_at) {
-    if (source_id == 0 || label.empty() || triggered_at <= 0) {
+                             std::time_t source_triggered_at,
+                             std::time_t scheduled_at) {
+    if (source_id == 0 || label.empty() || source_triggered_at <= 0 || scheduled_at <= 0) {
         throw std::invalid_argument("追问来源无效");
     }
     items_.erase(std::remove_if(items_.begin(), items_.end(),
                                 [source_id](const FollowUp& item) {
                                     return item.source_id == source_id;
                                 }), items_.end());
-    if (items_.size() >= kMaxItems) throw std::runtime_error("待确认提醒已达16项上限");
-    items_.push_back({source_id, label, triggered_at,
-                      triggered_at + kDefaultDelaySeconds,
-                      triggered_at + kDefaultDelaySeconds + kLateGraceSeconds, false});
+    if (items_.size() >= kMaxItems) throw std::runtime_error("待确认提醒已达4项上限");
+    items_.push_back({source_id, label, source_triggered_at,
+                      scheduled_at + kDefaultDelaySeconds,
+                      scheduled_at + kDefaultDelaySeconds + kLateGraceSeconds, false});
 }
 
 std::vector<FollowUp> FollowUpStore::Due(std::time_t now) {
@@ -265,6 +287,7 @@ size_t FollowUpStore::DropExpired(std::time_t now) {
 }
 
 void HealthTracker::Restore(std::map<std::string, Record> records) {
+    if (records.size() > 8) throw std::invalid_argument("保存的健康状态超过8项");
     records_ = std::move(records);
 }
 
@@ -310,7 +333,7 @@ const char* HealthTracker::SeverityName(Severity severity) {
 }
 
 void DurableQueue::Restore(std::vector<Event> items) {
-    if (items.size() > kMaxItems) throw std::invalid_argument("保存的主动队列超过32项");
+    if (items.size() > kMaxItems) throw std::invalid_argument("保存的主动队列超过8项");
     items_.clear();
     for (auto& item : items) Push(std::move(item));
 }
@@ -323,7 +346,7 @@ void DurableQueue::Push(Event event) {
         return item.event_id == event.event_id;
     });
     if (found == items_.end()) {
-        if (items_.size() >= kMaxItems) throw std::runtime_error("主动事件队列已达32项上限");
+        if (items_.size() >= kMaxItems) throw std::runtime_error("主动事件队列已达8项上限");
         items_.push_back(std::move(event));
     }
 }
@@ -356,6 +379,16 @@ size_t DurableQueue::DropExpired(std::time_t now) {
         return item.expires_at > 0 && item.expires_at < now;
     }), items_.end());
     return before - items_.size();
+}
+
+void RetryBackoff::OnFailure(int64_t now_us) {
+    retry_after_us_ = now_us + static_cast<int64_t>(delay_seconds_) * 1000000;
+    delay_seconds_ = std::min(delay_seconds_ * 2, 300);
+}
+
+void RetryBackoff::OnSuccess() {
+    retry_after_us_ = 0;
+    delay_seconds_ = 5;
 }
 
 }  // namespace proactive

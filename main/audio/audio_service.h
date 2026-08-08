@@ -191,6 +191,7 @@ private:
     bool audio_engine_initialized_ = false;
     bool voice_detected_ = false;
     std::atomic<bool> decode_health_failed_{false};
+    std::atomic<int> decode_health_error_code_{0};
 #if CONFIG_USE_DEVICE_AEC
     bool device_aec_enabled_ = true;
 #else

@@ -95,12 +95,33 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("time_unsynchronized", application)
         self.assertIn("uptime_ticks_ >= 600", application)
         self.assertIn("RemoveByDedupeKey", application)
+        self.assertIn("active_schedule_task_.trigger_at, now", application)
+        self.assertIn("proactive_retry_backoff_.Ready", application)
+        self.assertIn("RecordProactiveSendResult", application)
+        self.assertIn("kMaxSerializedBytes = 3600", application)
+        self.assertIn("nvs_get_stats(nullptr, &nvs_stats)", application)
+        self.assertIn("kNvsSafetyEntries = 16", application)
+        self.assertIn("recovered_health ||", application)
+        health_queue = application.split("void Application::QueueHealthEvent", 1)[1]
+        health_queue = health_queue.split("bool Application::SendProactiveEvent", 1)[0]
+        self.assertIn("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)", health_queue)
+        network_callback = application.split("case NetworkEvent::Scanning:", 1)[1]
+        scanning = network_callback.split("case NetworkEvent::Connecting", 1)[0]
+        self.assertNotIn("MAIN_EVENT_NETWORK_DISCONNECTED", scanning)
+        disconnected = application.split("case NetworkEvent::Disconnected:", 1)[1]
+        disconnected = disconnected.split("case NetworkEvent::WifiConfigModeEnter", 1)[0]
+        self.assertIn("network_connected_.exchange(false)", disconnected)
+        self.assertIn("network_disconnect_us_.push_back(esp_timer_get_time())", disconnected)
         self.assertIn("network_flapping", application)
         self.assertIn("ota_update_available", application)
         audio_h = (ROOT / "main" / "audio" / "audio_service.h").read_text(encoding="utf-8")
         audio_cc = (ROOT / "main" / "audio" / "audio_service.cc").read_text(encoding="utf-8")
         self.assertIn("on_critical_error", audio_h)
         self.assertIn("audio_decode_failed", audio_cc)
+        set_callbacks = audio_cc.split("void AudioService::SetCallbacks", 1)[1]
+        set_callbacks = set_callbacks.split("void AudioService::PlaySound", 1)[0]
+        self.assertIn("decode_health_failed_.load()", set_callbacks)
+        self.assertIn("callbacks_.on_critical_error", set_callbacks)
         self.assertGreaterEqual(
             mcp.count('Property("kind", kPropertyTypeString, std::string("all"))'), 2
         )

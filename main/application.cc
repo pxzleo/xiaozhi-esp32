@@ -13,6 +13,7 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <nvs.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
@@ -260,8 +261,7 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
         event.metadata[entry->string] = entry->valuestring;
     }
     if (event.metadata.count("source_id") != 0) {
-        if (event.metadata.count("label") == 0 || event.metadata.at("label").empty() ||
-            event.metadata.at("source_id").empty() ||
+        if (event.metadata.at("source_id").empty() ||
             !std::all_of(event.metadata.at("source_id").begin(),
                          event.metadata.at("source_id").end(),
                          [](unsigned char value) { return std::isdigit(value) != 0; })) {
@@ -529,7 +529,6 @@ void Application::Initialize() {
         switch (event) {
             case NetworkEvent::Scanning:
                 display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::Connecting: {
                 if (data.empty()) {
@@ -548,12 +547,19 @@ void Application::Initialize() {
                 std::string msg = Lang::Strings::CONNECTED_TO;
                 msg += data;
                 display->ShowNotification(msg.c_str(), 30000);
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
+                if (!network_connected_.exchange(true)) {
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
+                }
                 break;
             }
-            case NetworkEvent::Disconnected:
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+            case NetworkEvent::Disconnected: {
+                if (network_connected_.exchange(false)) {
+                    std::lock_guard<std::mutex> lock(network_health_mutex_);
+                    network_disconnect_us_.push_back(esp_timer_get_time());
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                }
                 break;
+            }
             case NetworkEvent::WifiConfigModeEnter:
                 // WiFi config mode enter is handled by WifiBoard internally
                 break;
@@ -661,10 +667,13 @@ void Application::Run() {
             if (pending_proactive_event_ && audio_service_.IsPlaybackIdle()) {
                 auto event = std::move(*pending_proactive_event_);
                 pending_proactive_event_.reset();
-                if (SendProactiveEvent(event)) {
+                const bool sent = SendProactiveEvent(event);
+                RecordProactiveSendResult(sent);
+                if (sent) {
                     proactive_manager_.RecordDelivered(
                         event, std::time(nullptr), has_server_time_.load());
                 } else {
+                    event.metadata["cue_played"] = "true";
                     proactive_queue_.Push(std::move(event));
                 }
                 SaveProactive();
@@ -748,11 +757,6 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
-    if (has_server_time_.load()) {
-        if (auto recovered = health_tracker_.Recover("network_flapping", std::time(nullptr))) {
-            QueueHealthEvent(*recovered);
-        }
-    }
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -781,14 +785,20 @@ void Application::HandleNetworkConnectedEvent() {
 void Application::HandleNetworkDisconnectedEvent() {
     if (has_server_time_.load()) {
         const auto now = std::time(nullptr);
-        network_disconnects_.push_back(now);
-        while (!network_disconnects_.empty() && now - network_disconnects_.front() > 300) {
-            network_disconnects_.pop_front();
+        const auto now_us = esp_timer_get_time();
+        size_t disconnect_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(network_health_mutex_);
+            while (!network_disconnect_us_.empty() &&
+                   now_us - network_disconnect_us_.front() > 300LL * 1000000) {
+                network_disconnect_us_.pop_front();
+            }
+            disconnect_count = network_disconnect_us_.size();
         }
-        if (network_disconnects_.size() >= 3) {
+        if (disconnect_count >= 3) {
             if (auto event = health_tracker_.Raise(
                     "network_flapping", proactive::Severity::kWarning, now,
-                    {{"disconnects_in_5m", std::to_string(network_disconnects_.size())}})) {
+                    {{"disconnects_in_5m", std::to_string(disconnect_count)}})) {
                 QueueHealthEvent(*event);
             }
         }
@@ -1101,9 +1111,18 @@ void Application::InitializeProtocol() {
                                     "follow-up:" + std::to_string(active_schedule_task_.id), true, {}};
                                 if (proactive_manager_.ShouldDeliver(
                                         follow_up, now, has_server_time_.load())) {
-                                    schedule_follow_ups_.Schedule(active_schedule_task_.id,
-                                                                 active_schedule_task_.label, now);
-                                    SaveProactive();
+                                    try {
+                                        schedule_follow_ups_.Schedule(
+                                            active_schedule_task_.id,
+                                            active_schedule_task_.label,
+                                            active_schedule_task_.trigger_at, now);
+                                        SaveProactive();
+                                    } catch (const std::exception& error) {
+                                        ESP_LOGE(TAG, "Cannot persist reminder follow-up: %s",
+                                                 error.what());
+                                        Board::GetInstance().GetDisplay()->ShowNotification(
+                                            "提醒完成追踪存储已满", 5000);
+                                    }
                                 }
                             }
                             FinishScheduleAlert();
@@ -1917,7 +1936,7 @@ void Application::LoadProactive() {
     Settings settings("proactive");
     std::string saved;
     const int chunk_count = settings.GetInt("chunks", 0);
-    if (chunk_count < 0 || chunk_count > 16) throw std::runtime_error("NVS中的主动状态分片数无效");
+    if (chunk_count < 0 || chunk_count > 3) throw std::runtime_error("NVS中的主动状态分片数无效");
     for (int i = 0; i < chunk_count; ++i) {
         const auto chunk = settings.GetString("data" + std::to_string(i));
         if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
@@ -2018,6 +2037,13 @@ void Application::LoadProactive() {
     health_tracker_.Restore(std::move(health_records));
     std::vector<proactive::Event> queued;
     cJSON_ArrayForEach(item, queue) queued.push_back(ParseProactiveEvent(item));
+    for (const auto& event : queued) {
+        auto source = event.metadata.find("source_id");
+        if (source != event.metadata.end()) {
+            FindFollowUpLabel(static_cast<uint32_t>(
+                std::strtoul(source->second.c_str(), nullptr, 10)));
+        }
+    }
     proactive_queue_.Restore(std::move(queued));
 }
 
@@ -2052,8 +2078,24 @@ void Application::SaveProactive() const {
     }
     const std::string saved = JsonString(root);
     static constexpr size_t kChunkSize = 1800;
+    static constexpr size_t kMaxSerializedBytes = 3600;
+    if (saved.size() > kMaxSerializedBytes) {
+        throw std::runtime_error("主动状态超过3600字节持久化预算");
+    }
     const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
-    if (chunk_count > 16) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    if (chunk_count > 3) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    nvs_stats_t nvs_stats{};
+    const esp_err_t stats_error = nvs_get_stats(nullptr, &nvs_stats);
+    if (stats_error != ESP_OK) throw std::runtime_error("无法读取NVS剩余容量");
+    size_t required_entries = 1;  // chunks i32
+    for (int i = 0; i < chunk_count; ++i) {
+        const size_t chunk_length = std::min(kChunkSize, saved.size() - i * kChunkSize);
+        required_entries += 2 + (chunk_length + 32) / 32;
+    }
+    static constexpr size_t kNvsSafetyEntries = 16;
+    if (nvs_stats.available_entries < required_entries + kNvsSafetyEntries) {
+        throw std::runtime_error("NVS剩余空间不足，无法原子保存主动状态");
+    }
     Settings settings("proactive", true);
     const int old_count = settings.GetInt("chunks", 0);
     settings.SetInt("chunks", chunk_count);
@@ -2074,10 +2116,28 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
         event.metadata["detail." + key] = value;
     }
     if (!has_server_time_.load()) event.expires_at = 0;
-    proactive_queue_.Push(std::move(event));
+    try {
+        if (health.recovered) {
+            proactive_queue_.RemoveByDedupeKey(event.dedupe_key);
+        }
+        proactive_queue_.Push(std::move(event));
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "Cannot persist health event: %s", error.what());
+        Board::GetInstance().GetDisplay()->ShowNotification("健康事件存储已满", 5000);
+        return;
+    }
     Board::GetInstance().GetDisplay()->ShowNotification(
         health.recovered ? "设备状态已恢复" : "检测到设备健康事件", 5000);
-    SaveProactive();
+    if (!schedule_alert_active_ && GetDeviceState() == kDeviceStateIdle &&
+        audio_service_.IsPlaybackIdle()) {
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+    }
+    try {
+        SaveProactive();
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "Cannot save health event: %s", error.what());
+        Board::GetInstance().GetDisplay()->ShowNotification("健康事件保存失败", 5000);
+    }
 }
 
 bool Application::SendProactiveEvent(const proactive::Event& event) {
@@ -2107,10 +2167,12 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     cJSON_AddStringToObject(params, "dedupe_key", event.dedupe_key.c_str());
     cJSON_AddBoolToObject(params, "requires_response", event.requires_response);
     if (follow_up) {
+        const uint32_t source_id = static_cast<uint32_t>(
+            std::strtoul(event.metadata.at("source_id").c_str(), nullptr, 10));
+        const std::string label = FindFollowUpLabel(source_id);
         cJSON_AddBoolToObject(params, "follow_up", true);
-        cJSON_AddNumberToObject(params, "source_id",
-                                std::strtoul(event.metadata.at("source_id").c_str(), nullptr, 10));
-        cJSON_AddStringToObject(params, "label", event.metadata.at("label").c_str());
+        cJSON_AddNumberToObject(params, "source_id", source_id);
+        cJSON_AddStringToObject(params, "label", label.c_str());
         cJSON_AddBoolToObject(params, "speak", true);
     }
     if (health) {
@@ -2129,6 +2191,21 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     return protocol_->SendMcpMessage(JsonString(root));
 }
 
+std::string Application::FindFollowUpLabel(uint32_t source_id) const {
+    for (const auto& item : schedule_follow_ups_.items()) {
+        if (item.source_id == source_id) return item.label;
+    }
+    throw std::runtime_error("追问事件缺少对应的原提醒");
+}
+
+void Application::RecordProactiveSendResult(bool success) {
+    if (success) {
+        proactive_retry_backoff_.OnSuccess();
+        return;
+    }
+    proactive_retry_backoff_.OnFailure(esp_timer_get_time());
+}
+
 void Application::CheckProactiveEvents() {
     const auto now = std::time(nullptr);
     bool changed = false;
@@ -2139,6 +2216,11 @@ void Application::CheckProactiveEvents() {
             "date-refresh", false, {}};
         proactive_manager_.ShouldDeliver(date_refresh, now, true);
         changed = mode_before_refresh != proactive_manager_.config().mode;
+        if (network_connected_.load()) {
+            if (auto recovered = health_tracker_.Recover("network_flapping", now)) {
+                QueueHealthEvent(*recovered);
+            }
+        }
     }
     if (!has_server_time_.load() && uptime_ticks_ >= 600 && !time_unsynced_health_reported_) {
         time_unsynced_health_reported_ = true;
@@ -2158,13 +2240,13 @@ void Application::CheckProactiveEvents() {
                 "confirm reminder completion", now, follow_up.expires_at,
                 "follow-up:" + std::to_string(follow_up.source_id), true, {}};
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
-            event.metadata["label"] = follow_up.label;
             proactive_queue_.Push(std::move(event));
             changed = true;
         }
     }
     if (proactive_queue_.DropExpired(now) > 0) changed = true;
     if (!pending_proactive_event_ && !schedule_alert_active_ &&
+        proactive_retry_backoff_.Ready(esp_timer_get_time()) &&
         GetDeviceState() != kDeviceStateSpeaking) {
         std::vector<proactive::Event> deferred;
         std::optional<proactive::Event> event;
@@ -2172,7 +2254,11 @@ void Application::CheckProactiveEvents() {
         for (size_t i = 0; i < candidates; ++i) {
             auto candidate = proactive_queue_.PopNext(now);
             if (!candidate) break;
-            if (proactive_manager_.ShouldDeliver(*candidate, now,
+            const bool recovered_health =
+                candidate->metadata.count("recovered") != 0 &&
+                candidate->metadata.at("recovered") == "true";
+            if (recovered_health ||
+                proactive_manager_.ShouldDeliver(*candidate, now,
                                                   has_server_time_.load())) {
                 event = std::move(candidate);
                 break;
@@ -2183,18 +2269,31 @@ void Application::CheckProactiveEvents() {
             proactive_queue_.Push(std::move(deferred_event));
         }
         if (event) {
-            if (event->metadata.count("source_id") != 0) {
+            if (event->metadata.count("source_id") != 0 &&
+                event->metadata.count("cue_played") == 0) {
+                const uint32_t source_id = static_cast<uint32_t>(std::strtoul(
+                    event->metadata.at("source_id").c_str(), nullptr, 10));
                 Board::GetInstance().GetDisplay()->ShowNotification(
-                    ("刚才提醒的" + event->metadata.at("label") + "完成了吗？").c_str(),
+                    ("刚才提醒的" + FindFollowUpLabel(source_id) + "完成了吗？").c_str(),
                     10000);
                 pending_proactive_event_ = std::move(*event);
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
                 changed = true;
-            } else if (SendProactiveEvent(*event)) {
-                proactive_manager_.RecordDelivered(*event, now, has_server_time_.load());
-                changed = true;
             } else {
-                proactive_queue_.Push(std::move(*event));
+                const bool sent = SendProactiveEvent(*event);
+                RecordProactiveSendResult(sent);
+                if (sent) {
+                    const bool recovered_health =
+                        event->metadata.count("recovered") != 0 &&
+                        event->metadata.at("recovered") == "true";
+                    if (!recovered_health) {
+                        proactive_manager_.RecordDelivered(
+                            *event, now, has_server_time_.load());
+                    }
+                    changed = true;
+                } else {
+                    proactive_queue_.Push(std::move(*event));
+                }
             }
         }
     }

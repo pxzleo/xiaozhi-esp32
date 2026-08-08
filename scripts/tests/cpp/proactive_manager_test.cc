@@ -58,11 +58,18 @@ void TestQuietMuteTopicAndCooldown() {
     assert(!manager.ShouldDeliver(Suggestion("3", "weather", At(2026, 8, 9, 9)),
                                   At(2026, 8, 9, 9), true));
     manager.AllowTopic("weather");
+    assert(!manager.ShouldDeliver(Suggestion("whitelist", "other", At(2026, 8, 9, 9)),
+                                  At(2026, 8, 9, 9), true));
+    Event whitelist_critical{"critical", "other", Priority::kCritical, "critical",
+                             At(2026, 8, 9, 9), At(2026, 8, 9, 10),
+                             "critical-other", false, {}};
+    assert(manager.ShouldDeliver(whitelist_critical, At(2026, 8, 9, 9), true));
     auto first = Suggestion("4", "weather", At(2026, 8, 9, 9));
     assert(manager.ShouldDeliver(first, first.created_at, true));
     manager.RecordDelivered(first, first.created_at, true);
     assert(!manager.ShouldDeliver(Suggestion("5", "weather", first.created_at + 60),
                                   first.created_at + 60, true));
+    manager.AllowTopic("other");
 
     manager.MuteToday(At(2026, 8, 9, 10), true);
     assert(manager.config().mode == Mode::kTodaySilent);
@@ -76,7 +83,9 @@ void TestQuietMuteTopicAndCooldown() {
 void TestFollowUpLifecycleAndRecovery() {
     FollowUpStore store;
     const auto now = At(2026, 8, 8, 9);
-    store.Schedule(42, "吃药", now);
+    store.Schedule(42, "吃药", now - 30, now);
+    assert(store.items()[0].source_triggered_at == now - 30);
+    assert(store.items()[0].due_at == now + 600);
     assert(store.Due(now + 599).empty());
     auto due = store.Due(now + 600);
     assert(due.size() == 1 && due[0].source_id == 42 && due[0].asked);
@@ -87,11 +96,11 @@ void TestFollowUpLifecycleAndRecovery() {
     assert(store.CompleteRecent(now + 1502).source_id == 42);
     assert(store.items().empty());
 
-    store.Schedule(7, "关窗", now);
+    store.Schedule(7, "关窗", now, now);
     FollowUpStore restored;
     restored.Restore(store.items());
     assert(restored.Due(now + 600).size() == 1);
-    store.Schedule(8, "喝水", now + 1);
+    store.Schedule(8, "喝水", now + 1, now + 1);
     assert(store.DismissRecent(now + 2).source_id == 8);
     assert(store.DismissRecent(now + 2).source_id == 7);
     bool no_recent = false;
@@ -99,15 +108,15 @@ void TestFollowUpLifecycleAndRecovery() {
     assert(no_recent);
 
     FollowUpStore ambiguous;
-    ambiguous.Schedule(10, "甲", now);
-    ambiguous.Schedule(11, "乙", now);
+    ambiguous.Schedule(10, "甲", now, now + 10);
+    ambiguous.Schedule(11, "乙", now, now + 20);
     bool ambiguity_reported = false;
     try { ambiguous.CompleteRecent(now + 1); }
     catch (const std::runtime_error&) { ambiguity_reported = true; }
     assert(ambiguity_reported && ambiguous.items().size() == 2);
 
     FollowUpStore expired;
-    expired.Schedule(9, "过期", now);
+    expired.Schedule(9, "过期", now, now);
     assert(expired.Due(now + 901).empty());
     assert(expired.items().empty());
 }
@@ -139,6 +148,45 @@ void TestHealthDedupRecoveryAndQueueOrdering() {
     assert(queue.DropExpired(now + 1) == 1);
 }
 
+void TestRetryBackoffIsBounded() {
+    RetryBackoff backoff;
+    assert(backoff.Ready(0));
+    backoff.OnFailure(1000000);
+    assert(!backoff.Ready(5999999));
+    assert(backoff.Ready(6000000));
+    for (int i = 0; i < 10; ++i) backoff.OnFailure(backoff.retry_after_us());
+    assert(backoff.delay_seconds() == 300);
+    backoff.OnSuccess();
+    assert(backoff.delay_seconds() == 5 && backoff.Ready(0));
+}
+
+void TestPersistentCapacityLimits() {
+    const auto now = At(2026, 8, 8, 9);
+    FollowUpStore follow_ups;
+    for (uint32_t id = 1; id <= FollowUpStore::kMaxItems; ++id) {
+        follow_ups.Schedule(id, "容量", now + id, now + id);
+    }
+    bool follow_up_full = false;
+    try { follow_ups.Schedule(99, "超限", now + 99, now + 99); }
+    catch (const std::runtime_error&) { follow_up_full = true; }
+    assert(follow_up_full);
+
+    DurableQueue queue;
+    for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
+        auto event = Suggestion("capacity-" + std::to_string(i),
+                                "topic-" + std::to_string(i), now);
+        event.dedupe_key = event.event_id;
+        queue.Push(std::move(event));
+    }
+    bool queue_full = false;
+    try {
+        auto event = Suggestion("overflow", "overflow", now);
+        event.dedupe_key = event.event_id;
+        queue.Push(std::move(event));
+    } catch (const std::runtime_error&) { queue_full = true; }
+    assert(queue_full);
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -146,5 +194,7 @@ int main() {
     TestQuietMuteTopicAndCooldown();
     TestFollowUpLifecycleAndRecovery();
     TestHealthDedupRecoveryAndQueueOrdering();
+    TestRetryBackoffIsBounded();
+    TestPersistentCapacityLimits();
     return 0;
 }
