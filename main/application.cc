@@ -225,6 +225,8 @@ cJSON* ProactiveEventJson(const proactive::Event& event) {
     cJSON_AddStringToObject(json, "reason", event.reason.c_str());
     cJSON_AddNumberToObject(json, "created_at", event.created_at);
     cJSON_AddNumberToObject(json, "expires_at", event.expires_at);
+    cJSON_AddNumberToObject(json, "protocol_created_at", event.protocol_created_at);
+    cJSON_AddNumberToObject(json, "protocol_expires_at", event.protocol_expires_at);
     cJSON_AddStringToObject(json, "dedupe_key", event.dedupe_key.c_str());
     cJSON_AddBoolToObject(json, "requires_response", event.requires_response);
     cJSON* metadata = cJSON_AddObjectToObject(json, "metadata");
@@ -241,6 +243,8 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
     auto reason = cJSON_GetObjectItem(json, "reason");
     auto created_at = cJSON_GetObjectItem(json, "created_at");
     auto expires_at = cJSON_GetObjectItem(json, "expires_at");
+    auto protocol_created_at = cJSON_GetObjectItem(json, "protocol_created_at");
+    auto protocol_expires_at = cJSON_GetObjectItem(json, "protocol_expires_at");
     auto dedupe_key = cJSON_GetObjectItem(json, "dedupe_key");
     auto requires_response = cJSON_GetObjectItem(json, "requires_response");
     auto metadata = cJSON_GetObjectItem(json, "metadata");
@@ -250,11 +254,22 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
         !cJSON_IsBool(requires_response) || !cJSON_IsObject(metadata)) {
         throw std::runtime_error("NVS中的主动事件字段无效");
     }
+    const bool has_protocol_created_at = cJSON_IsNumber(protocol_created_at);
+    const bool has_protocol_expires_at = cJSON_IsNumber(protocol_expires_at);
+    if (has_protocol_created_at != has_protocol_expires_at) {
+        throw std::runtime_error("NVS中的主动事件协议时间字段不完整");
+    }
     proactive::Event event{event_id->valuestring, topic->valuestring,
                            ParsePriority(priority->valuestring), reason->valuestring,
                            static_cast<std::time_t>(created_at->valuedouble),
                            static_cast<std::time_t>(expires_at->valuedouble),
                            dedupe_key->valuestring, cJSON_IsTrue(requires_response) != 0, {}};
+    if (has_protocol_created_at) {
+        event.protocol_created_at =
+            static_cast<std::time_t>(protocol_created_at->valuedouble);
+        event.protocol_expires_at =
+            static_cast<std::time_t>(protocol_expires_at->valuedouble);
+    }
     cJSON* entry = nullptr;
     cJSON_ArrayForEach(entry, metadata) {
         if (!cJSON_IsString(entry)) throw std::runtime_error("NVS中的主动事件metadata无效");
@@ -883,10 +898,19 @@ void Application::HandleActivationDoneEvent() {
     SetDeviceState(kDeviceStateIdle);
 
     has_server_time_ = ota_->HasServerTime();
+    server_timezone_offset_minutes_.store(
+        ota_->GetTimezoneOffsetMinutes(), std::memory_order_release);
+    bool backfilled_proactive_times = false;
+    if (has_server_time_.load(std::memory_order_acquire)) {
+        backfilled_proactive_times = BackfillProactiveProtocolTimes();
+    }
     if (has_server_time_.load()) {
         if (auto recovered = health_tracker_.Recover("time_unsynchronized", std::time(nullptr))) {
             QueueHealthEvent(*recovered);
         }
+    }
+    if (backfilled_proactive_times) {
+        TrySaveProactive("server time protocol backfill", true);
     }
 
     auto display = Board::GetInstance().GetDisplay();
@@ -2359,6 +2383,7 @@ bool Application::TrySaveProactive(const char* context, bool force) {
     try {
         SaveProactive();
         proactive_save_pending_ = false;
+        proactive_protocol_times_persist_pending_ = false;
         proactive_save_backoff_.OnSuccess();
         return true;
     } catch (const std::exception& error) {
@@ -2370,6 +2395,38 @@ bool Application::TrySaveProactive(const char* context, bool force) {
         }
         return false;
     }
+}
+
+bool Application::BackfillProactiveProtocolTimes() {
+    if (!has_server_time_.load(std::memory_order_acquire)) return false;
+    const auto now = std::time(nullptr);
+    const int timezone_offset =
+        server_timezone_offset_minutes_.load(std::memory_order_acquire);
+    auto backfill = [now, timezone_offset](proactive::Event& event) {
+        if (event.protocol_created_at > 0 && event.protocol_expires_at > 0) return false;
+        if (event.created_at <= 0 || event.expires_at <= event.created_at) {
+            event.created_at = now;
+            event.expires_at = now + 24 * 60 * 60;
+        }
+        proactive::StampProtocolUnixTimes(event, timezone_offset);
+        return true;
+    };
+
+    bool changed = false;
+    if (pending_proactive_event_) {
+        changed = backfill(*pending_proactive_event_) || changed;
+    }
+    auto queued = proactive_queue_.items();
+    bool queue_changed = false;
+    for (auto& event : queued) {
+        queue_changed = backfill(event) || queue_changed;
+    }
+    if (queue_changed) {
+        proactive_queue_.Restore(std::move(queued));
+        changed = true;
+    }
+    if (changed) proactive_protocol_times_persist_pending_ = true;
+    return changed;
 }
 
 void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
@@ -2385,7 +2442,13 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
     for (const auto& [key, value] : health.details) {
         event.metadata["detail." + key] = value;
     }
-    if (!has_server_time_.load()) event.expires_at = 0;
+    const bool has_protocol_times = has_server_time_.load(std::memory_order_acquire);
+    if (has_protocol_times) {
+        proactive::StampProtocolUnixTimes(
+            event, server_timezone_offset_minutes_.load(std::memory_order_acquire));
+    } else {
+        event.expires_at = 0;
+    }
     try {
         auto evicted = proactive_queue_.Push(event);
         if (evicted) {
@@ -2397,6 +2460,7 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
         Board::GetInstance().GetDisplay()->ShowNotification("健康事件存储已满", 5000);
         return;
     }
+    if (has_protocol_times) proactive_protocol_times_persist_pending_ = true;
     Board::GetInstance().GetDisplay()->ShowNotification(
         health.recovered ? "设备状态已恢复" : "检测到设备健康事件", 5000);
     if (!schedule_alert_active_ && GetDeviceState() == kDeviceStateIdle &&
@@ -2410,6 +2474,8 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     if (IsProactiveConnectionBusy() || !network_connected_.load() ||
         protocol_ == nullptr) return false;
     if (!protocol_->IsAudioChannelOpened()) return false;
+    if (proactive_protocol_times_persist_pending_) return false;
+    if (event.protocol_created_at <= 0 || event.protocol_expires_at <= 0) return false;
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
     const bool health = event.metadata.count("health_kind") != 0;
@@ -2423,8 +2489,10 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     cJSON_AddStringToObject(params, "topic", event.topic.c_str());
     cJSON_AddStringToObject(params, "priority", PriorityName(event.priority));
     cJSON_AddStringToObject(params, "reason", event.reason.c_str());
-    cJSON_AddNumberToObject(params, "created_at", event.created_at);
-    cJSON_AddNumberToObject(params, "expires_at", event.expires_at);
+    const auto created_at = event.protocol_created_at;
+    const auto expires_at = event.protocol_expires_at;
+    cJSON_AddNumberToObject(params, "created_at", created_at);
+    cJSON_AddNumberToObject(params, "expires_at", expires_at);
     cJSON_AddStringToObject(params, "dedupe_key", event.dedupe_key.c_str());
     cJSON_AddBoolToObject(params, "requires_response", event.requires_response);
     if (follow_up) {
@@ -2439,7 +2507,7 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     if (health) {
         cJSON_AddStringToObject(params, "kind", event.metadata.at("health_kind").c_str());
         cJSON_AddStringToObject(params, "severity", event.metadata.at("severity").c_str());
-        cJSON_AddNumberToObject(params, "occurred_at", event.created_at);
+        cJSON_AddNumberToObject(params, "occurred_at", created_at);
         cJSON_AddBoolToObject(params, "recovered",
                               event.metadata.at("recovered") == "true");
         cJSON* details = cJSON_AddObjectToObject(params, "details");
@@ -2577,6 +2645,7 @@ void Application::CheckProactiveEvents() {
     }
     const auto now = std::time(nullptr);
     bool changed = false;
+    changed = BackfillProactiveProtocolTimes() || changed;
     if (proactive_save_pending_ && proactive_save_backoff_.Ready(esp_timer_get_time())) {
         TrySaveProactive("scheduled retry");
     }
@@ -2610,11 +2679,16 @@ void Application::CheckProactiveEvents() {
                 "follow_up", proactive::Priority::kNormal,
                 "schedule follow up", now, follow_up.expires_at,
                 "follow-up:" + std::to_string(follow_up.source_id), true, {}};
+            proactive::StampProtocolUnixTimes(
+                event, server_timezone_offset_minutes_.load(std::memory_order_acquire));
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
             const auto old_follow_ups = schedule_follow_ups_.items();
             const auto old_queue = proactive_queue_.items();
+            const bool old_protocol_times_persist_pending =
+                proactive_protocol_times_persist_pending_;
             try {
                 auto evicted = proactive_queue_.Push(event);
+                proactive_protocol_times_persist_pending_ = true;
                 if (evicted) {
                     ESP_LOGW(TAG, "Evicted proactive event id=%s for due follow-up",
                              evicted->event_id.c_str());
@@ -2623,6 +2697,8 @@ void Application::CheckProactiveEvents() {
                 if (!TrySaveProactive("due follow-up transaction", true)) {
                     schedule_follow_ups_.Restore(old_follow_ups);
                     proactive_queue_.Restore(old_queue);
+                    proactive_protocol_times_persist_pending_ =
+                        old_protocol_times_persist_pending;
                     follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
                     ESP_LOGE(TAG, "Rolled back due follow-up id=%lu after save failure",
                              static_cast<unsigned long>(follow_up.source_id));
@@ -2632,6 +2708,8 @@ void Application::CheckProactiveEvents() {
             } catch (const std::exception& error) {
                 schedule_follow_ups_.Restore(old_follow_ups);
                 proactive_queue_.Restore(old_queue);
+                proactive_protocol_times_persist_pending_ =
+                    old_protocol_times_persist_pending;
                 ESP_LOGE(TAG, "Cannot enqueue due follow-up id=%lu: %s",
                          static_cast<unsigned long>(follow_up.source_id), error.what());
                 follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
@@ -2646,7 +2724,9 @@ void Application::CheckProactiveEvents() {
     }
     if (pending_proactive_event_ && !schedule_alert_active_ &&
         audio_service_.IsPlaybackIdle() &&
-        proactive_retry_backoff_.Ready(esp_timer_get_time())) {
+        proactive_retry_backoff_.Ready(esp_timer_get_time()) &&
+        pending_proactive_event_->protocol_created_at > 0 &&
+        pending_proactive_event_->protocol_expires_at > 0) {
         if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
             StartProactiveConnectionWorker();
         } else {

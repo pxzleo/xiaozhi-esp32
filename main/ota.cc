@@ -186,6 +186,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_server_time_ = false;
+    timezone_offset_minutes_ = 0;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {
         cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
@@ -198,7 +199,8 @@ esp_err_t Ota::CheckVersion() {
             
             // 如果有时区偏移，计算本地时间
             if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                timezone_offset_minutes_ = timezone_offset->valueint;
+                ts += (timezone_offset_minutes_ * 60 * 1000); // 转换分钟为毫秒
             }
             
             tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒

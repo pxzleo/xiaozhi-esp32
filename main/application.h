@@ -185,6 +185,7 @@ private:
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
     std::atomic<bool> has_server_time_{false};
+    std::atomic<int> server_timezone_offset_minutes_{0};
     std::atomic<bool> aborted_{false};
     std::atomic<bool> barge_in_detection_active_{false};
     bool assets_version_checked_ = false;
@@ -200,6 +201,7 @@ private:
     proactive::RetryBackoff proactive_save_backoff_;
     proactive::RetryBackoff follow_up_enqueue_backoff_;
     bool proactive_save_pending_ = false;
+    bool proactive_protocol_times_persist_pending_ = false;
     std::atomic<bool> proactive_connection_busy_{false};
     std::atomic<bool> proactive_shutdown_{false};
     std::shared_ptr<std::atomic<bool>> proactive_shutdown_token_ =
@@ -242,6 +244,7 @@ private:
     void LoadProactive();
     void SaveProactive() const;
     bool TrySaveProactive(const char* context, bool force = false);
+    bool BackfillProactiveProtocolTimes();
     void CheckProactiveEvents();
     void QueueHealthEvent(const proactive::HealthEvent& event);
     bool SendProactiveEvent(const proactive::Event& event);

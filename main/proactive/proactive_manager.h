@@ -11,6 +11,8 @@
 
 namespace proactive {
 
+std::time_t ToProtocolUnixTime(std::time_t local_time, int timezone_offset_minutes);
+
 enum class Mode { kConservative, kActive, kAggressive, kTodaySilent };
 enum class Priority { kLow, kNormal, kHigh, kCritical };
 enum class Severity { kInfo, kWarning, kCritical };
@@ -25,7 +27,11 @@ struct Event {
     std::string dedupe_key;
     bool requires_response = false;
     std::map<std::string, std::string> metadata;
+    std::time_t protocol_created_at = 0;
+    std::time_t protocol_expires_at = 0;
 };
+
+void StampProtocolUnixTimes(Event& event, int timezone_offset_minutes);
 
 struct Config {
     Mode mode = Mode::kAggressive;

@@ -337,6 +337,8 @@ sequenceDiagram
 }
 ```
 
+`created_at`、`expires_at` 和 `occurred_at` 均为 UTC 基准的 Unix 秒。设备若为兼容本地调度而在系统墙钟中叠加了 OTA `timezone_offset`，首次得到可靠时间时必须扣除该偏移，并把换算结果随持久事件保存；重启后不得使用新的偏移重复换算。未校时且没有已保存 UTC 时间的事件不得发送。
+
 `severity` 只允许 `info/warning/critical`；`details` 由设备为每类事件生成受控字段，不含 URL 凭证、令牌或网络密码。恢复通知沿用同一 `dedupe_key` 且 `recovered=true`。设备持久保存活动去重状态和待发送 follow-up/health 队列；通道不可用不丢失事件，下一次可用时重试。
 
 离线重试采用 5 秒到 5 分钟的指数退避；音频通道由高于主任务优先级的单 FreeRTOS worker 自动建立，主任务不调用 `OpenAudioChannel`。独立原子 busy 在任务创建前发布，并在 worker Give 完成信号前始终为 true；Give 是 worker 最后一次 Application 访问，Finish 取到信号后才由主线程清 busy/handle，析构看到 busy 就无条件等待。连接期间的 start/stop/toggle/具体唤醒词进入有界 FIFO 并按到达顺序重放，满时明确告警。健康事件只接受 network/time/OTA/audio 四类 kind，活动与恢复按 dedupe key 在统一 8 项主队列中替换；当前发送中的事件另存独立 `pending` 字段。

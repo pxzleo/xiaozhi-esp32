@@ -40,6 +40,17 @@ Event QueuedHealth(std::string id, Severity severity, std::time_t now) {
                   {"severity", severity_name}, {"recovered", "false"}}};
 }
 
+void TestProtocolUnixTimeRemovesDeviceTimezoneOffset() {
+    assert(ToProtocolUnixTime(1786218262, 480) == 1786189462);
+    assert(ToProtocolUnixTime(1786189462, 0) == 1786189462);
+    assert(ToProtocolUnixTime(1786189462, -60) == 1786193062);
+    assert(ToProtocolUnixTime(0, 480) == 0);
+    Event persisted = Suggestion("persisted", "weather", 1786218262);
+    StampProtocolUnixTimes(persisted, 480);
+    assert(persisted.protocol_created_at == 1786189462);
+    assert(persisted.protocol_expires_at == 1786190062);
+}
+
 void TestModesBudgetDateAndTimeValidity() {
     Manager manager;
     assert(manager.config().mode == Mode::kAggressive);
@@ -463,6 +474,7 @@ void TestStateCodec() {
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
+    TestProtocolUnixTimeRemovesDeviceTimezoneOffset();
     TestModesBudgetDateAndTimeValidity();
     TestQuietMuteTopicAndCooldown();
     TestLegacyAggressiveLimitIsNormalized();

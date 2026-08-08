@@ -95,6 +95,8 @@ class ScheduleManagerTest(unittest.TestCase):
                            else "device health"),
                 "created_at": 1786159000,
                 "expires_at": 1786245400,
+                "protocol_created_at": 1786130200,
+                "protocol_expires_at": 1786216600,
                 "dedupe_key": dedupe_key,
                 "requires_response": "source_id" in metadata,
                 "metadata": metadata,
@@ -247,6 +249,22 @@ class ScheduleManagerTest(unittest.TestCase):
         send_proactive = send_proactive.split("std::string Application::FindFollowUpLabel", 1)[0]
         self.assertIn("protocol_->IsAudioChannelOpened()", send_proactive)
         self.assertNotIn("OpenAudioChannel", send_proactive)
+        self.assertIn('"occurred_at", created_at', send_proactive)
+        self.assertIn("event.protocol_created_at <= 0", send_proactive)
+        self.assertIn("proactive_protocol_times_persist_pending_", send_proactive)
+        self.assertLess(
+            send_proactive.index("event.protocol_created_at <= 0"),
+            send_proactive.index("cJSON_CreateObject()"),
+        )
+        self.assertIn('"protocol_created_at"', application)
+        self.assertIn('"protocol_expires_at"', application)
+        self.assertIn("StampProtocolUnixTimes", proactive_check)
+        self.assertIn("pending_proactive_event_->protocol_created_at", proactive_check)
+        self.assertIn("BackfillProactiveProtocolTimes", application)
+        backfill = application.split("bool Application::BackfillProactiveProtocolTimes", 1)[1]
+        backfill = backfill.split("void Application::QueueHealthEvent", 1)[0]
+        self.assertIn("auto queued = proactive_queue_.items()", backfill)
+        self.assertIn("proactive_queue_.Restore(std::move(queued))", backfill)
         self.assertIn("PendingDue(now)", proactive_check)
         self.assertLess(
             proactive_check.index("proactive_queue_.Push(event)"),

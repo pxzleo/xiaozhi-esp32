@@ -5,6 +5,20 @@
 #include <stdexcept>
 
 namespace proactive {
+
+std::time_t ToProtocolUnixTime(std::time_t local_time, int timezone_offset_minutes) {
+    if (local_time == 0) return 0;
+    return local_time - static_cast<std::time_t>(timezone_offset_minutes) * 60;
+}
+
+void StampProtocolUnixTimes(Event& event, int timezone_offset_minutes) {
+    if (event.created_at <= 0 || event.expires_at <= event.created_at) {
+        throw std::invalid_argument("主动事件本地时间无效");
+    }
+    event.protocol_created_at = ToProtocolUnixTime(event.created_at, timezone_offset_minutes);
+    event.protocol_expires_at = ToProtocolUnixTime(event.expires_at, timezone_offset_minutes);
+}
+
 namespace {
 
 int LocalDate(std::time_t now) {
@@ -40,6 +54,12 @@ void ValidatePersistentEvent(const Event& event) {
         event.dedupe_key.empty() || event.dedupe_key.size() > 96 ||
         event.reason.empty() || event.reason.size() > 64) {
         throw std::invalid_argument("持久主动事件文本字段超出限制");
+    }
+    if ((event.protocol_created_at == 0) != (event.protocol_expires_at == 0) ||
+        event.protocol_created_at < 0 ||
+        (event.protocol_created_at > 0 &&
+         event.protocol_expires_at <= event.protocol_created_at)) {
+        throw std::invalid_argument("持久主动事件协议时间无效");
     }
     if (event.topic == "follow_up") {
         if (!event.requires_response ||
