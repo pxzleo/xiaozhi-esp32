@@ -359,6 +359,21 @@ void TestStateCodec() {
     } catch (const std::runtime_error&) { limit_failed = true; }
     assert(limit_failed);
 
+    const std::string legacy_text = "abcabcabc";
+    uint32_t legacy_checksum = 2166136261u;
+    for (uint8_t value : legacy_text) legacy_checksum = (legacy_checksum ^ value) * 16777619u;
+    std::vector<uint8_t> legacy{'P', 'Z', '1', 0, 9, 0, 0, 0};
+    for (int shift = 0; shift < 32; shift += 8) {
+        legacy.push_back(static_cast<uint8_t>(legacy_checksum >> shift));
+    }
+    legacy.insert(legacy.end(), {0x08, 'a', 'b', 'c', 3, 6});
+    assert(StateCodec::Decompress(legacy.data(), legacy.size(), 32) == legacy_text);
+    legacy.back() ^= 1;
+    bool legacy_damage_failed = false;
+    try { StateCodec::Decompress(legacy.data(), legacy.size(), 32); }
+    catch (const std::runtime_error&) { legacy_damage_failed = true; }
+    assert(legacy_damage_failed);
+
     std::mt19937 generator(0x5a17u);
     std::string random_state(2048, '\0');
     for (char& value : random_state) {

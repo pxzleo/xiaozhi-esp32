@@ -131,9 +131,10 @@ std::vector<uint8_t> StateCodec::Compress(const std::string& input) {
 
 std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_output) {
     if (data == nullptr || size < 12 || data[0] != 'P' || data[1] != 'Z' ||
-        data[2] != '2' || data[3] != 0) {
+        (data[2] != '1' && data[2] != '2') || data[3] != 0) {
         throw std::runtime_error("主动状态压缩头无效");
     }
+    const bool legacy_pz1 = data[2] == '1';
     auto read_u32 = [data](size_t offset) {
         return static_cast<uint32_t>(data[offset]) |
             (static_cast<uint32_t>(data[offset + 1]) << 8) |
@@ -152,12 +153,16 @@ std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_
         const uint8_t flags = data[cursor++];
         for (int bit = 0; bit < 8 && output.size() < expected_size; ++bit) {
             if ((flags & (1u << bit)) != 0) {
-                if (cursor + 3 > size) throw std::runtime_error("主动状态压缩引用截断");
-                const size_t offset = data[cursor] |
-                    (static_cast<size_t>(data[cursor + 1]) << 8);
-                cursor += 2;
+                const size_t reference_bytes = legacy_pz1 ? 2 : 3;
+                if (cursor + reference_bytes > size) {
+                    throw std::runtime_error("主动状态压缩引用截断");
+                }
+                const size_t offset = legacy_pz1 ? data[cursor] :
+                    (data[cursor] | (static_cast<size_t>(data[cursor + 1]) << 8));
+                cursor += legacy_pz1 ? 1 : 2;
                 const size_t length = data[cursor++];
-                if (offset == 0 || length < 4 || offset > output.size() ||
+                if (offset == 0 || length < (legacy_pz1 ? 3 : 4) ||
+                    offset > output.size() ||
                     output.size() + length > expected_size) {
                     throw std::runtime_error("主动状态压缩引用无效");
                 }

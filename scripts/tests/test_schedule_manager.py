@@ -296,6 +296,8 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn('nvs_erase_key(quarantine_handle, "state")', application)
         self.assertIn("nvs_commit(quarantine_handle)", application)
         self.assertIn("migrated_pending", application)
+        self.assertIn("loaded_legacy_pz1", application)
+        self.assertIn("if (loaded_legacy_pz1) proactive_save_pending_ = true", application)
         self.assertIn("旧版主动队列待播追问存在歧义", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)

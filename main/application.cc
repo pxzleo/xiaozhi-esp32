@@ -2067,6 +2067,7 @@ void Application::SaveSchedules() const {
 
 void Application::LoadProactive() {
     std::string saved;
+    bool loaded_legacy_pz1 = false;
     nvs_handle_t handle = 0;
     const esp_err_t open_error = nvs_open("proactive", NVS_READONLY, &handle);
     if (open_error == ESP_OK) {
@@ -2082,6 +2083,7 @@ void Application::LoadProactive() {
                 handle, "state", compressed.data(), &blob_size);
             nvs_close(handle);
             if (read_error != ESP_OK) throw std::runtime_error("读取主动状态blob失败");
+            loaded_legacy_pz1 = compressed.size() >= 3 && compressed[2] == '1';
             saved = proactive::StateCodec::Decompress(
                 compressed.data(), compressed.size(), 7200);
         } else {
@@ -2251,6 +2253,7 @@ void Application::LoadProactive() {
         pending_proactive_event_ = std::move(*migrated_pending);
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     }
+    if (loaded_legacy_pz1) proactive_save_pending_ = true;
 }
 
 void Application::SaveProactive() const {
