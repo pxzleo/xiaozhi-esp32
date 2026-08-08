@@ -716,18 +716,18 @@ void Application::Run() {
                 proactive_retry_backoff_.Ready(esp_timer_get_time())) {
                 if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
                     StartProactiveConnectionWorker();
-                    continue;
-                }
-                auto& event = *pending_proactive_event_;
-                const bool sent = SendProactiveEvent(event);
-                RecordProactiveSendResult(sent);
-                if (sent) {
-                    proactive_manager_.RecordDelivered(
-                        event, std::time(nullptr), has_server_time_.load());
-                    pending_proactive_event_.reset();
-                    TrySaveProactive("pending proactive sent");
                 } else {
-                    event.metadata["cue_played"] = "true";
+                    auto& event = *pending_proactive_event_;
+                    const bool sent = SendProactiveEvent(event);
+                    RecordProactiveSendResult(sent);
+                    if (sent) {
+                        proactive_manager_.RecordDelivered(
+                            event, std::time(nullptr), has_server_time_.load());
+                        pending_proactive_event_.reset();
+                        TrySaveProactive("pending proactive sent");
+                    } else {
+                        event.metadata["cue_played"] = "true";
+                    }
                 }
             }
         }
@@ -1941,8 +1941,7 @@ void Application::SendMcpMessage(const std::string& payload) {
                 accepted = true;
             }
         } else if (protocol_) {
-            protocol_->SendMcpMessage(payload);
-            accepted = true;
+            accepted = protocol_->SendMcpMessage(payload);
         }
         if (accepted && mcp_broadcast_callback_) {
             mcp_broadcast_callback_(payload);
