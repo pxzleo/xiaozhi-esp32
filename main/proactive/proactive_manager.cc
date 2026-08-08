@@ -33,7 +33,8 @@ void ValidatePersistentEvent(const Event& event) {
     }
     if (event.topic == "follow_up") {
         if (!event.requires_response ||
-            event.reason != "confirm reminder completion" ||
+            event.priority != Priority::kNormal ||
+            event.reason != "schedule follow up" ||
             event.metadata.count("source_id") != 1 || event.metadata.size() > 2) {
             throw std::invalid_argument("持久追问事件schema无效");
         }
@@ -354,7 +355,7 @@ const char* Manager::ModeName(Mode mode) {
 }
 
 int Manager::DefaultLimit(Mode mode) {
-    if (mode == Mode::kConservative) return 0;
+    if (mode == Mode::kConservative) return 1;
     if (mode == Mode::kActive) return 3;
     return 5;
 }

@@ -1164,7 +1164,7 @@ void Application::InitializeProtocol() {
                                 proactive::Event follow_up{
                                     "follow-up-policy-" + std::to_string(active_schedule_task_.id),
                                     "follow_up", proactive::Priority::kNormal,
-                                    "confirm reminder completion", now, now + 900,
+                                    "schedule follow up", now, now + 900,
                                     "follow-up:" + std::to_string(active_schedule_task_.id), true, {}};
                                 if (proactive_manager_.ShouldDeliver(
                                         follow_up, now, has_server_time_.load())) {
@@ -2600,8 +2600,8 @@ void Application::CheckProactiveEvents() {
             proactive::Event event{
                 "follow-up-" + std::to_string(follow_up.source_id) + "-" +
                     std::to_string(follow_up.due_at),
-                "follow_up", proactive::Priority::kHigh,
-                "confirm reminder completion", now, follow_up.expires_at,
+                "follow_up", proactive::Priority::kNormal,
+                "schedule follow up", now, follow_up.expires_at,
                 "follow-up:" + std::to_string(follow_up.source_id), true, {}};
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
             const auto old_follow_ups = schedule_follow_ups_.items();

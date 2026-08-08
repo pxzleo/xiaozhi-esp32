@@ -87,8 +87,9 @@ class ScheduleManagerTest(unittest.TestCase):
                 "event_id": event_id,
                 "topic": event_topic,
                 "priority": priority,
-                "reason": "device health recovered" if metadata.get("recovered") == "true"
-                          else "confirm reminder completion",
+                "reason": ("schedule follow up" if event_topic == "follow_up"
+                           else "device health recovered" if metadata.get("recovered") == "true"
+                           else "device health"),
                 "created_at": 1786159000,
                 "expires_at": 1786245400,
                 "dedupe_key": dedupe_key,
@@ -107,10 +108,10 @@ class ScheduleManagerTest(unittest.TestCase):
                   })
             for kind in kinds
         ]
-        queue += [event(f"follow-up-{i + 1}-1786159600", "follow_up", "high",
+        queue += [event(f"follow-up-{i + 1}-1786159600", "follow_up", "normal",
                         f"follow-up:{i + 1}", {"source_id": str(i + 1)})
                   for i in range(4)]
-        pending = event("follow-up-pending-1786159600", "follow_up", "high",
+        pending = event("follow-up-pending-1786159600", "follow_up", "normal",
                         "follow-up:pending", {"source_id": "4", "cue_played": "true"})
         state = {"config": config, "follow_ups": follow_ups,
                  "health": health, "queue": queue, "pending": pending}
