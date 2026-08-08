@@ -23,6 +23,7 @@
 #include "netease_music_lyrics.h"
 #include "schedule/schedule_manager.h"
 #include "proactive/proactive_manager.h"
+#include "proactive/external_monitor_device.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -152,6 +153,7 @@ public:
     void ResetProtocol();
 
 private:
+    enum class ProactiveConnectionPurpose { kNone, kLocal, kExternal };
     Application();
     ~Application();
 
@@ -219,6 +221,19 @@ private:
     bool proactive_finish_success_ = false;
     uint32_t proactive_finish_generation_ = 0;
     uint32_t proactive_protocol_generation_ = 0;
+    external_monitor::ProbeSchedule external_probe_schedule_;
+    std::optional<external_monitor::PendingEvent> pending_external_event_;
+    std::atomic<bool> external_probe_busy_{false};
+    std::atomic<bool> external_probe_schedule_failed_{false};
+    SemaphoreHandle_t external_probe_done_ = nullptr;
+    TaskHandle_t external_probe_task_handle_ = nullptr;
+    bool external_probe_initialized_ = false;
+    bool external_probe_finish_pending_ = false;
+    ProactiveConnectionPurpose proactive_connection_purpose_ =
+        ProactiveConnectionPurpose::kNone;
+    int64_t external_delivery_retry_after_us_ = 0;
+    int64_t external_non_owned_channel_idle_since_us_ = 0;
+    external_monitor::ProbeResult external_probe_finish_result_;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -250,12 +265,18 @@ private:
     bool SendProactiveEvent(const proactive::Event& event);
     std::string FindFollowUpLabel(uint32_t source_id) const;
     void RecordProactiveSendResult(bool success);
-    bool StartProactiveConnectionWorker();
+    bool StartProactiveConnectionWorker(
+        ProactiveConnectionPurpose purpose = ProactiveConnectionPurpose::kLocal);
     bool IsProactiveConnectionBusy() const {
         return proactive_connection_busy_.load(std::memory_order_acquire);
     }
     void ProactiveConnectionTask(uint32_t protocol_generation);
     void FinishProactiveConnection(bool success, uint32_t protocol_generation);
+    void CheckExternalMonitor();
+    bool StartExternalProbeWorker();
+    void ExternalProbeTask();
+    void FinishExternalProbe(external_monitor::ProbeResult result);
+    bool SendExternalEvent(const external_monitor::PendingEvent& event);
     void CheckSchedules();
     void StartNextScheduleAlert();
     void ShowScheduleAlertPage();

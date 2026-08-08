@@ -47,7 +47,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn('previous_daily_limit != nullptr ?', application)
 
     def test_maximum_proactive_state_fits_persistence_budget(self):
-        topics = ["reminder", "calendar", "weather", "music", "health", "habit", "system"]
+        topics = ["reminder", "calendar", "weather", "news", "music", "health", "habit", "system"]
         config = {
             "mode": "aggressive",
             "mode_before_silent": "aggressive",
@@ -60,7 +60,7 @@ class ScheduleManagerTest(unittest.TestCase):
             "blocked_topics": topics[4:],
             "budget_date": 20260808,
             "delivered_today": 6,
-            "last_delivered": {topics[i]: 1786159999 for i in range(7)},
+            "last_delivered": {topics[i]: 1786159999 for i in range(8)},
         }
         follow_ups = [
             {
@@ -198,6 +198,98 @@ class ScheduleManagerTest(unittest.TestCase):
             )
             subprocess.run([str(executable)], check=True)
 
+    def test_host_external_monitor_probe_core(self):
+        if not shutil.which("g++"):
+            self.skipTest("a host C++ compiler is unavailable")
+        source = ROOT / "main" / "proactive" / "external_monitor_probe.cc"
+        test = ROOT / "scripts" / "tests" / "cpp" / "external_monitor_probe_test.cc"
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "external_monitor_probe_test"
+            subprocess.run(
+                [
+                    "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    f"-I{source.parent}", str(source), str(test), "-o", str(executable),
+                ],
+                check=True,
+            )
+            subprocess.run([str(executable)], check=True)
+
+    def test_external_monitor_device_contract(self):
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        application_h = (ROOT / "main" / "application.h").read_text(encoding="utf-8")
+        client = (
+            ROOT / "main" / "proactive" / "external_monitor_device.cc"
+        ).read_text(encoding="utf-8")
+        manager = (
+            ROOT / "main" / "proactive" / "proactive_manager.cc"
+        ).read_text(encoding="utf-8")
+        manager_h = (
+            ROOT / "main" / "proactive" / "proactive_manager.h"
+        ).read_text(encoding="utf-8")
+
+        for header in ("Device-Id", "Client-Id", "Authorization"):
+            self.assertIn(f'SetHeader("{header}"', client)
+        self.assertIn('token = "Bearer " + token', client)
+        self.assertNotIn("ESP_LOG", client.split("std::string token", 1)[1].split("}", 1)[0])
+        self.assertIn('"/device/proactive/pending"', client)
+        self.assertIn('"retry_after_seconds"', client)
+        self.assertIn("HasExactFields", client)
+        self.assertIn("cJSON_ParseWithOpts", client)
+        self.assertIn("parse_end, true", client)
+        self.assertIn("kMaximumPendingResponseBytes", client)
+        self.assertIn("GetBodyLength()", client)
+        self.assertNotIn("ReadAll()", client)
+        self.assertIn("pending响应读取不完整", client)
+        self.assertNotIn('"payload"', client)
+        self.assertNotIn('"reason"', client)
+
+        self.assertIn('"notifications/assistant/external_triggered"', application)
+        send = application.split("bool Application::SendExternalEvent", 1)[1]
+        send = send.split("void Application::CheckExternalMonitor", 1)[0]
+        self.assertIn('"version", 1', send)
+        self.assertIn('"event_id"', send)
+        self.assertIn('"speak", true', send)
+        self.assertNotIn('"topic"', send)
+        self.assertNotIn('"priority"', send)
+        self.assertNotIn('"text"', send)
+        self.assertNotIn('"url"', send)
+
+        check = application.split("void Application::CheckExternalMonitor", 1)[1]
+        check = check.split("void Application::CheckProactiveEvents", 1)[0]
+        self.assertLess(check.index("pending_external_event_"),
+                        check.index("StartExternalProbeWorker()"))
+        self.assertIn("expires_at <= protocol_now", check)
+        self.assertIn("proactive::ToProtocolUnixTime", application)
+        self.assertIn(
+            "StartProactiveConnectionWorker(ProactiveConnectionPurpose::kExternal)", check
+        )
+        self.assertIn("!protocol_->IsAudioChannelOpened()", check)
+        self.assertIn("external_probe_busy_", application_h)
+        self.assertIn("CompletionSignal", application)
+        self.assertIn("external_probe_schedule_failed_", application)
+        self.assertIn("ProactiveConnectionPurpose", application_h)
+        self.assertIn("compare_exchange_strong", application)
+        self.assertIn('"external_probe", 4096 * 2, this, 2', application)
+        self.assertIn('"news"', manager)
+        self.assertIn("kMaxTrackedTopics = 8", manager_h)
+        self.assertIn(
+            "StartProactiveConnectionWorker(ProactiveConnectionPurpose::kExternal)", check
+        )
+        self.assertIn(
+            "proactive_connection_purpose_ != ProactiveConnectionPurpose::kExternal",
+            check,
+        )
+        self.assertIn("kNonOwnedChannelIdleGraceUs", check)
+        self.assertIn("protocol_->CloseAudioChannel()", check)
+        local_send = application.split("bool Application::SendProactiveEvent", 1)[1]
+        local_send = local_send.split("std::string Application::FindFollowUpLabel", 1)[0]
+        self.assertIn("ProactiveConnectionPurpose::kExternal", local_send)
+        connection_start = application.split(
+            "bool Application::StartProactiveConnectionWorker", 1
+        )[1].split("void Application::ProactiveConnectionTask", 1)[0]
+        self.assertIn("purpose == ProactiveConnectionPurpose::kExternal", connection_start)
+        self.assertIn("external_delivery_retry_after_us_", connection_start)
+
     def test_device_integration_contract(self):
         application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
         application_h = (ROOT / "main" / "application.h").read_text(encoding="utf-8")
@@ -294,7 +386,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertLess(worker.index("Schedule([this, shutdown_token"),
                         worker.index("xSemaphoreGive(proactive_connection_done_)"))
         finish = application.split("void Application::FinishProactiveConnection", 1)[1]
-        finish = finish.split("void Application::CheckProactiveEvents", 1)[0]
+        finish = finish.split("bool Application::StartExternalProbeWorker", 1)[0]
         self.assertLess(
             finish.index("xSemaphoreTake(proactive_connection_done_"),
             finish.index("proactive_connection_task_handle_ = nullptr"),

@@ -29,7 +29,7 @@ int LocalDate(std::time_t now) {
 
 void ValidateTopic(const std::string& topic) {
     static const std::set<std::string> kTopics{
-        "reminder", "calendar", "weather", "music", "health", "habit", "system"};
+        "reminder", "calendar", "weather", "news", "music", "health", "habit", "system"};
     if (kTopics.count(topic) == 0) {
         throw std::invalid_argument("topic必须是受支持的主动主题");
     }
@@ -248,8 +248,8 @@ void Manager::Restore(Config config, RuntimeState state) {
         (config.quiet_end && (*config.quiet_end < 0 || *config.quiet_end >= 1440))) {
         throw std::invalid_argument("安静时段超出一天范围");
     }
-    if (config.allowed_topics.size() + config.blocked_topics.size() > 7) {
-        throw std::invalid_argument("保存的主动主题状态超过7项上限");
+    if (config.allowed_topics.size() + config.blocked_topics.size() > kMaxTrackedTopics) {
+        throw std::invalid_argument("保存的主动主题状态超过8项上限");
     }
     for (const auto& topic : config.allowed_topics) ValidateTopic(topic);
     for (const auto& topic : config.blocked_topics) ValidateTopic(topic);
@@ -316,8 +316,8 @@ void Manager::AllowTopic(const std::string& topic) {
     ValidateTopic(topic);
     config_.blocked_topics.erase(topic);
     if (config_.allowed_topics.count(topic) == 0 &&
-        config_.allowed_topics.size() + config_.blocked_topics.size() >= 7) {
-        throw std::runtime_error("主动主题规则已达7项上限");
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= kMaxTrackedTopics) {
+        throw std::runtime_error("主动主题规则已达8项上限");
     }
     config_.allowed_topics.insert(topic);
 }
@@ -326,8 +326,8 @@ void Manager::BlockTopic(const std::string& topic) {
     ValidateTopic(topic);
     config_.allowed_topics.erase(topic);
     if (config_.blocked_topics.count(topic) == 0 &&
-        config_.allowed_topics.size() + config_.blocked_topics.size() >= 7) {
-        throw std::runtime_error("主动主题规则已达7项上限");
+        config_.allowed_topics.size() + config_.blocked_topics.size() >= kMaxTrackedTopics) {
+        throw std::runtime_error("主动主题规则已达8项上限");
     }
     config_.blocked_topics.insert(topic);
 }

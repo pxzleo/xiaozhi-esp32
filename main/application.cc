@@ -428,6 +428,14 @@ Application::Application() {
         event_group_ = nullptr;
         throw std::runtime_error("无法创建主动建链完成信号量");
     }
+    external_probe_done_ = xSemaphoreCreateBinary();
+    if (external_probe_done_ == nullptr) {
+        vSemaphoreDelete(proactive_connection_done_);
+        proactive_connection_done_ = nullptr;
+        vEventGroupDelete(event_group_);
+        event_group_ = nullptr;
+        throw std::runtime_error("无法创建外界探测完成信号量");
+    }
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
 #error "CONFIG_USE_DEVICE_AEC and CONFIG_USE_SERVER_AEC cannot be enabled at the same time"
@@ -455,6 +463,10 @@ Application::Application() {
 Application::~Application() {
     proactive_shutdown_.store(true);
     proactive_shutdown_token_->store(true);
+    if (external_probe_busy_.load(std::memory_order_acquire)) {
+        xSemaphoreTake(external_probe_done_, portMAX_DELAY);
+        external_probe_busy_.store(false, std::memory_order_release);
+    }
     if (proactive_connection_busy_.load(std::memory_order_acquire)) {
         xSemaphoreTake(proactive_connection_done_, portMAX_DELAY);
         proactive_connection_busy_.store(false, std::memory_order_release);
@@ -465,6 +477,7 @@ Application::~Application() {
     }
     vEventGroupDelete(event_group_);
     vSemaphoreDelete(proactive_connection_done_);
+    vSemaphoreDelete(external_probe_done_);
 }
 
 bool Application::SetDeviceState(DeviceState state) { return state_machine_.TransitionTo(state); }
@@ -816,6 +829,7 @@ void Application::Run() {
             uptime_ticks_++;
             CheckSchedules();
             CheckProactiveEvents();
+            CheckExternalMonitor();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -896,6 +910,11 @@ void Application::HandleActivationDoneEvent() {
 
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
+
+    if (!external_probe_initialized_) {
+        external_probe_schedule_.Initialize(SystemInfo::GetMacAddress(), esp_timer_get_time());
+        external_probe_initialized_ = true;
+    }
 
     has_server_time_ = ota_->HasServerTime();
     server_timezone_offset_minutes_.store(
@@ -2476,6 +2495,9 @@ bool Application::SendProactiveEvent(const proactive::Event& event) {
     if (!protocol_->IsAudioChannelOpened()) return false;
     if (proactive_protocol_times_persist_pending_) return false;
     if (event.protocol_created_at <= 0 || event.protocol_expires_at <= 0) return false;
+    if (proactive_connection_purpose_ == ProactiveConnectionPurpose::kExternal) {
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+    }
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
     const bool health = event.metadata.count("health_kind") != 0;
@@ -2535,7 +2557,7 @@ void Application::RecordProactiveSendResult(bool success) {
     proactive_retry_backoff_.OnFailure(esp_timer_get_time());
 }
 
-bool Application::StartProactiveConnectionWorker() {
+bool Application::StartProactiveConnectionWorker(ProactiveConnectionPurpose purpose) {
     if (IsProactiveConnectionBusy() || protocol_ == nullptr ||
         !network_connected_.load() ||
         GetDeviceState() != kDeviceStateIdle || schedule_alert_active_ ||
@@ -2550,6 +2572,7 @@ bool Application::StartProactiveConnectionWorker() {
         return false;
     }
     xSemaphoreTake(proactive_connection_done_, 0);
+    proactive_connection_purpose_ = purpose;
     BaseType_t result = xTaskCreate(
         [](void* arg) {
             auto* app = static_cast<Application*>(arg);
@@ -2560,7 +2583,13 @@ bool Application::StartProactiveConnectionWorker() {
     if (result != pdPASS) {
         proactive_connection_task_handle_ = nullptr;
         proactive_connection_busy_.store(false, std::memory_order_release);
-        RecordProactiveSendResult(false);
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+        if (purpose == ProactiveConnectionPurpose::kExternal) {
+            external_probe_schedule_.OnFailure(esp_timer_get_time());
+            external_delivery_retry_after_us_ = external_probe_schedule_.next_probe_us();
+        } else {
+            RecordProactiveSendResult(false);
+        }
         ESP_LOGE(TAG, "Failed to create proactive connection worker");
         return false;
     }
@@ -2598,9 +2627,8 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     proactive_finish_pending_ = false;
     proactive_connection_task_handle_ = nullptr;
     proactive_connection_busy_.store(false, std::memory_order_release);
-    if (protocol_generation == proactive_protocol_generation_) {
-        RecordProactiveSendResult(success);
-    }
+    const bool external_connection =
+        proactive_connection_purpose_ == ProactiveConnectionPurpose::kExternal;
     const bool reset_pending = proactive_reset_pending_;
     proactive_reset_pending_ = false;
     const bool close_pending = proactive_close_pending_ || !network_connected_.load();
@@ -2609,6 +2637,19 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     proactive_reboot_pending_ = false;
     const EventBits_t deferred_bits = proactive_deferred_event_bits_;
     proactive_deferred_event_bits_ = 0;
+    const bool external_preempted = external_connection &&
+        (!success || reset_pending || close_pending || reboot_pending ||
+         !proactive_deferred_mcp_messages_.empty() ||
+         !proactive_deferred_actions_.empty());
+    if (external_preempted) {
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+        external_probe_schedule_.OnFailure(esp_timer_get_time());
+        external_delivery_retry_after_us_ = external_probe_schedule_.next_probe_us();
+    } else if (!external_connection &&
+               protocol_generation == proactive_protocol_generation_) {
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+        RecordProactiveSendResult(success);
+    }
     if (reset_pending) {
         ResetProtocol();
         return;
@@ -2633,6 +2674,211 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     xEventGroupSetBits(event_group_, deferred_bits | MAIN_EVENT_CLOCK_TICK |
                                      MAIN_EVENT_PLAYBACK_DRAINED |
                                      MAIN_EVENT_SEND_AUDIO);
+}
+
+bool Application::StartExternalProbeWorker() {
+    if (external_probe_busy_.load(std::memory_order_acquire) ||
+        !network_connected_.load(std::memory_order_acquire) ||
+        GetDeviceState() != kDeviceStateIdle || schedule_alert_active_ ||
+        IsProactiveConnectionBusy() || pending_proactive_event_ ||
+        !audio_service_.IsPlaybackIdle() ||
+        (protocol_ != nullptr && protocol_->IsAudioChannelOpened())) {
+        return false;
+    }
+    bool expected = false;
+    if (!external_probe_busy_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    xSemaphoreTake(external_probe_done_, 0);
+    const BaseType_t result = xTaskCreate(
+        [](void* arg) {
+            auto* app = static_cast<Application*>(arg);
+            app->ExternalProbeTask();
+            vTaskDelete(nullptr);
+        },
+        "external_probe", 4096 * 2, this, 2, &external_probe_task_handle_);
+    if (result != pdPASS) {
+        external_probe_task_handle_ = nullptr;
+        external_probe_busy_.store(false, std::memory_order_release);
+        external_probe_schedule_.OnFailure(esp_timer_get_time());
+        ESP_LOGE(TAG, "Failed to create external monitor probe worker");
+        return false;
+    }
+    return true;
+}
+
+void Application::ExternalProbeTask() {
+    struct CompletionSignal final {
+        SemaphoreHandle_t semaphore;
+        ~CompletionSignal() { xSemaphoreGive(semaphore); }
+    } completion{external_probe_done_};
+
+    try {
+        external_monitor::ProbeResult result;
+        if (proactive_shutdown_.load(std::memory_order_acquire)) {
+            result.error = "设备正在关闭";
+        } else {
+            result = external_monitor::ProbePendingEvent();
+        }
+        if (!proactive_shutdown_.load(std::memory_order_acquire)) {
+            auto shutdown_token = proactive_shutdown_token_;
+            Schedule([this, shutdown_token, result = std::move(result)]() mutable {
+                if (!shutdown_token->load(std::memory_order_acquire)) {
+                    FinishExternalProbe(std::move(result));
+                }
+            });
+        }
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "External monitor worker exception: %s", error.what());
+        external_probe_schedule_failed_.store(true, std::memory_order_release);
+        xEventGroupSetBits(event_group_, MAIN_EVENT_CLOCK_TICK);
+    } catch (...) {
+        ESP_LOGE(TAG, "External monitor worker unknown exception");
+        external_probe_schedule_failed_.store(true, std::memory_order_release);
+        xEventGroupSetBits(event_group_, MAIN_EVENT_CLOCK_TICK);
+    }
+}
+
+void Application::FinishExternalProbe(external_monitor::ProbeResult result) {
+    if (xSemaphoreTake(external_probe_done_, 0) != pdTRUE) {
+        external_probe_finish_result_ = std::move(result);
+        external_probe_finish_pending_ = true;
+        xEventGroupSetBits(event_group_, MAIN_EVENT_CLOCK_TICK);
+        return;
+    }
+    external_probe_finish_pending_ = false;
+    external_probe_task_handle_ = nullptr;
+    external_probe_busy_.store(false, std::memory_order_release);
+    const int64_t now_us = esp_timer_get_time();
+    if (!result.success) {
+        external_probe_schedule_.OnFailure(now_us);
+        ESP_LOGE(TAG, "External monitor probe failed: %s", result.error.c_str());
+        return;
+    }
+    const int retry_after = result.retry_after_seconds > 0 ? result.retry_after_seconds :
+        external_monitor::ProbeSchedule::kRegularIntervalSeconds;
+    try {
+        external_probe_schedule_.OnSuccess(now_us, retry_after);
+    } catch (const std::exception& error) {
+        external_probe_schedule_.OnFailure(now_us);
+        ESP_LOGE(TAG, "Invalid external monitor retry interval: %s", error.what());
+        return;
+    }
+    if (!result.event) return;
+    const std::time_t protocol_now = proactive::ToProtocolUnixTime(
+        std::time(nullptr), server_timezone_offset_minutes_.load(std::memory_order_acquire));
+    if (!has_server_time_.load(std::memory_order_acquire) ||
+        result.event->expires_at <= protocol_now) {
+        ESP_LOGW(TAG, "Discarded expired external event id=%s",
+                 result.event->event_id.c_str());
+        return;
+    }
+    if (pending_external_event_) {
+        ESP_LOGW(TAG, "Ignored external event while another event is pending");
+        return;
+    }
+    pending_external_event_ = std::move(result.event);
+    external_delivery_retry_after_us_ = 0;
+    xEventGroupSetBits(event_group_, MAIN_EVENT_CLOCK_TICK);
+}
+
+bool Application::SendExternalEvent(const external_monitor::PendingEvent& event) {
+    if (IsProactiveConnectionBusy() || protocol_ == nullptr ||
+        !protocol_->IsAudioChannelOpened()) {
+        return false;
+    }
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", "notifications/assistant/external_triggered");
+    cJSON* params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddNumberToObject(params, "version", 1);
+    cJSON_AddStringToObject(params, "event_id", event.event_id.c_str());
+    cJSON_AddBoolToObject(params, "speak", true);
+    return protocol_->SendMcpMessage(JsonString(root));
+}
+
+void Application::CheckExternalMonitor() {
+    if (!external_probe_initialized_) return;
+    if (external_probe_schedule_failed_.exchange(false, std::memory_order_acq_rel)) {
+        FinishExternalProbe({.error = "pending探测任务异常"});
+        if (external_probe_busy_.load(std::memory_order_acquire)) return;
+    }
+    if (external_probe_finish_pending_) {
+        external_probe_finish_pending_ = false;
+        FinishExternalProbe(std::move(external_probe_finish_result_));
+        if (external_probe_busy_.load(std::memory_order_acquire)) return;
+    }
+    const std::time_t protocol_now = proactive::ToProtocolUnixTime(
+        std::time(nullptr), server_timezone_offset_minutes_.load(std::memory_order_acquire));
+    if (pending_external_event_ &&
+        (!has_server_time_.load(std::memory_order_acquire) ||
+         pending_external_event_->expires_at <= protocol_now)) {
+        ESP_LOGW(TAG, "Discarded expired pending external event id=%s",
+                 pending_external_event_->event_id.c_str());
+        pending_external_event_.reset();
+        if (proactive_connection_purpose_ == ProactiveConnectionPurpose::kExternal &&
+            protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+        external_delivery_retry_after_us_ = 0;
+    }
+
+    const bool idle = network_connected_.load(std::memory_order_acquire) &&
+        has_server_time_.load(std::memory_order_acquire) &&
+        GetDeviceState() == kDeviceStateIdle && !schedule_alert_active_ &&
+        !IsProactiveConnectionBusy() && !pending_proactive_event_ &&
+        audio_service_.IsPlaybackIdle();
+    if (pending_external_event_) {
+        if (!idle || protocol_ == nullptr) {
+            external_non_owned_channel_idle_since_us_ = 0;
+            return;
+        }
+        if (esp_timer_get_time() < external_delivery_retry_after_us_) return;
+        if (!protocol_->IsAudioChannelOpened()) {
+            external_non_owned_channel_idle_since_us_ = 0;
+            StartProactiveConnectionWorker(ProactiveConnectionPurpose::kExternal);
+            return;
+        }
+        if (proactive_connection_purpose_ != ProactiveConnectionPurpose::kExternal) {
+            constexpr int64_t kNonOwnedChannelIdleGraceUs = 30LL * 1000 * 1000;
+            const int64_t now_us = esp_timer_get_time();
+            if (external_non_owned_channel_idle_since_us_ == 0) {
+                external_non_owned_channel_idle_since_us_ = now_us;
+                return;
+            }
+            if (now_us - external_non_owned_channel_idle_since_us_ <
+                kNonOwnedChannelIdleGraceUs) {
+                return;
+            }
+            ESP_LOGI(TAG, "Closing idle non-external channel before external trigger");
+            protocol_->CloseAudioChannel();
+            proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+            external_non_owned_channel_idle_since_us_ = 0;
+            return;
+        }
+        external_non_owned_channel_idle_since_us_ = 0;
+        const bool sent = SendExternalEvent(*pending_external_event_);
+        proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;
+        if (sent) {
+            ESP_LOGI(TAG, "External event trigger sent id=%s topic=%s",
+                     pending_external_event_->event_id.c_str(),
+                     pending_external_event_->topic.c_str());
+            pending_external_event_.reset();
+        } else {
+            external_probe_schedule_.OnFailure(esp_timer_get_time());
+            external_delivery_retry_after_us_ = external_probe_schedule_.next_probe_us();
+            ESP_LOGE(TAG, "Failed to send external event trigger");
+            protocol_->CloseAudioChannel();
+        }
+        return;
+    }
+
+    if (idle && protocol_ != nullptr && !protocol_->IsAudioChannelOpened() &&
+        external_probe_schedule_.Ready(esp_timer_get_time())) {
+        StartExternalProbeWorker();
+    }
 }
 
 void Application::CheckProactiveEvents() {

@@ -15,7 +15,7 @@
 ## 积极主动模式（v2）
 
 - 设备以独立 `proactive::Manager` 作为主动策略权威。配置和运行状态保存在 NVS `proactive` 命名空间；默认 `aggressive`，其普通主动发言不受每日总额度限制，且不能配置成有限次数。`active` 默认每日 5 次，可在 1 至 5 次内调低；`conservative` 固定为 1，但策略仍只允许闹铃、明确提醒和 critical 健康事件。`today_silent` 的当前额度为 0，并在本地日期变化后恢复此前模式及此前额度。
-- 安静时段默认不存在，只有用户明确同时提供 `quiet_start/quiet_end` 后才生效；支持跨午夜。策略还执行 topic allow/block、同类 30 分钟冷却和每日预算；`aggressive` 仅绕过每日总额度，安静时段、主题规则、同主题冷却、过期、连接与投递安全规则仍照常执行。主题只允许 `reminder/calendar/weather/music/health/habit/system`，设备会同时保留并持久化全部 7 个策略主题的有效冷却记录，避免无限模式下因主题轮换提前淘汰冷却；内部 `follow_up` 按 `reminder`、`health_critical` 按 `health` 应用规则。allow 集合非空时作为白名单，普通事件只有 topic 在集合内才允许；critical 事件不受白名单限制。闹铃、明确提醒及 critical 健康事件不受普通预算阻止。系统时间未同步时不重置日期、不恢复 `today_silent`，也不触发非关键主动事件。
+- 安静时段默认不存在，只有用户明确同时提供 `quiet_start/quiet_end` 后才生效；支持跨午夜。策略还执行 topic allow/block、同类 30 分钟冷却和每日预算；`aggressive` 仅绕过每日总额度，安静时段、主题规则、同主题冷却、过期、连接与投递安全规则仍照常执行。主题只允许 `reminder/calendar/weather/news/music/health/habit/system`，设备会同时保留并持久化全部 8 个策略主题的有效冷却记录，避免无限模式下因主题轮换提前淘汰冷却；内部 `follow_up` 按 `reminder`、`health_critical` 按 `health` 应用规则。allow 集合非空时作为白名单，普通事件只有 topic 在集合内才允许；critical 事件不受白名单限制。闹铃、明确提醒及 critical 健康事件不受普通预算阻止。系统时间未同步时不重置日期、不恢复 `today_silent`，也不触发非关键主动事件。
 - 统一主动事件至少包含 `event_id/topic/priority/reason/created_at/expires_at/dedupe_key/requires_response`。设备内部仍使用 OTA 校准后的本地墙钟调度；事件首次获得有效服务端时间时扣除 `timezone_offset`，把真实 UTC `protocol_created_at/protocol_expires_at` 随事件一并持久化，后续发送 `created_at/expires_at/occurred_at` 时直接使用，不能因重启或时区变化再次换算。尚未校时且没有持久 UTC 时间的事件不得发送；校时完成后以首个可靠时刻补齐。需跨断线的 follow-up 与健康事件进入 NVS 持久队列，按优先级和创建时间取出；普通建议过期即丢弃，明确闹铃/提醒仍走原调度队列并优先。
 - 普通提醒 TTS 真正 stop 后，策略允许时持久化 10 分钟后的完成确认；用于“最近”判定的 `source_triggered_at` 始终取原任务权威 `trigger_at`，不使用 TTS stop 时刻。每项最多主动追问一次。闹铃、每日简报和 follow-up 本身不会递归创建追问。断电恢复后未过期项继续；到期超过 5 分钟仍未发出的项丢弃。`complete_recent/follow_up/dismiss_follow_up` 只处理最近、未过期且唯一的候选，原始触发时刻相同时明确报错。
 - 主动模式工具为 `self.proactive.configure/status/mute/allow_topic/block_topic`。配置、主题和完成追踪工具都应直接调用，不在工具前播报“我来处理一下”。
@@ -33,3 +33,19 @@
 主动状态的合法 JSON 上限为 7200 字节，保存为单个 `state` blob；生产与主机测试共用有界长窗口 LZSS 编解码器，压缩 blob 上限 3600 字节，并携带原始长度和 FNV-1a 校验，解压上限仍为 7200 字节。持久队列只接受设备实际产生的 `follow_up` 与四类 health schema，并限制标识、原因、受控 metadata 键和值长度；任意外观相似事件不会进入 NVS。单键 commit 是断电一致性边界，不假设多 key 原子事务；旧分片只在新 blob 成功提交后清理，损坏 blob 会删除并提交隔离，避免每次启动重复失败。统一队列始终最多 8 项，正在播放的事件使用独立可空 `pending` 字段；迁移旧版 9 项数组时会把唯一的最高优先/最新追问拆入 pending，同优先同时间候选明确报歧义。容量预检按 blob 的旧、新双版本峰值计算：3600 字节按 8 个元数据 entry 加每 32 字节一个 entry，并额外保留 16 entry 安全余量；16KB 目标模型在首次可用 378 entry、旧 blob 存在且全局可用约 142 entry 时均可重复写入，其他命名空间真实挤占过高仍明确拒绝。统计、压缩、写入或提交失败会日志告警、保留内存状态并退避重试。
 
 当前仓库没有跨目标板一致且可靠的“剩余可写存储空间”API，因此未接入 `storage_low`，不以堆内存或分区总大小伪造该指标。AudioService 会保存首次解码器初始化失败状态和错误码，健康回调注册后立即补报；运行期重建或实际解码失败同样上报，后续成功创建或成功解码会发送 recovered。
+
+## 服务端外界监测探测（v3）
+
+- 设备完成激活并获得可靠服务端时间后，按设备 MAC 的固定散列在 0 至 30 秒内错峰启动探测；之后空闲时每 5 分钟使用设备鉴权请求 `GET /device/proactive/pending`。请求沿用 manager-api 基址、`Device-Id`、`Client-Id` 与 WebSocket Bearer 令牌，不记录令牌。失败从 5 分钟开始指数退避，最多 30 分钟；成功空结果采用服务端 `retry_after_seconds`，当前为 300 秒。监测开关、城市、来源和存量默认值都由服务端控制，固件不保存第二套配置。
+- 安全信封只接受 `pending/event_id/topic/priority/created_at/expires_at/retry_after_seconds`；topic 仅允许 `weather/news`，事件 ID、优先级、时间范围和过期状态都要校验。信封不包含且设备不请求播报文本、事实、新闻链接或事件类型；非法或已过期事件只写受控日志并丢弃。
+- 空结果绝不建立音频 WebSocket。有待播事件且设备空闲、没有闹铃/提醒、本地主动事件、播放、录音或其他连接 worker 时，复用单一主动建链 worker。连接成功后设备只发送 `notifications/assistant/external_triggered`：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/assistant/external_triggered",
+  "params": {"version": 1, "event_id": "evt-...", "speak": true}
+}
+```
+
+- 设备发送通知不代表已领取或已投递；manager-api 的 180 秒 claim、服务端 TTS 完成信号和审计终态仍是唯一权威。连接或发送失败后保留待播 ID 并退避重试，过期即丢弃。用户操作、手动连接、播放和录音始终优先，打断沿用现有语音通道；新闻播报后的收听与天气播报后的结束均由服务端决定。

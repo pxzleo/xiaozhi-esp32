@@ -45,6 +45,10 @@ void TestProtocolUnixTimeRemovesDeviceTimezoneOffset() {
     assert(ToProtocolUnixTime(1786189462, 0) == 1786189462);
     assert(ToProtocolUnixTime(1786189462, -60) == 1786193062);
     assert(ToProtocolUnixTime(0, 480) == 0);
+    const std::time_t utc_now = 1786233600;
+    const std::time_t device_wall_clock = utc_now + 8 * 60 * 60;
+    const std::time_t manager_expiry = utc_now + 60 * 60;
+    assert(manager_expiry > ToProtocolUnixTime(device_wall_clock, 480));
     Event persisted = Suggestion("persisted", "weather", 1786218262);
     StampProtocolUnixTimes(persisted, 480);
     assert(persisted.protocol_created_at == 1786189462);
@@ -151,17 +155,18 @@ void TestAggressiveCooldownRetainsAllPolicyTopics() {
         QueuedFollowUp("follow-up-cooldown", now),
         Suggestion("calendar-cooldown", "calendar", now + 1),
         Suggestion("weather-cooldown", "weather", now + 2),
-        Suggestion("music-cooldown", "music", now + 3),
-        Suggestion("health-cooldown", "health", now + 4),
-        Suggestion("habit-cooldown", "habit", now + 5),
-        Suggestion("system-cooldown", "system", now + 6),
+        Suggestion("news-cooldown", "news", now + 3),
+        Suggestion("music-cooldown", "music", now + 4),
+        Suggestion("health-cooldown", "health", now + 5),
+        Suggestion("habit-cooldown", "habit", now + 6),
+        Suggestion("system-cooldown", "system", now + 7),
     };
     for (const auto& event : events) {
         assert(manager.ShouldDeliver(event, event.created_at, true));
         manager.RecordDelivered(event, event.created_at, true);
     }
-    assert(manager.state().last_delivered.size() == 7);
-    assert(!manager.ShouldDeliver(QueuedFollowUp("follow-up-again", now + 7), now + 7, true));
+    assert(manager.state().last_delivered.size() == 8);
+    assert(!manager.ShouldDeliver(QueuedFollowUp("follow-up-again", now + 8), now + 8, true));
 }
 
 void TestFollowUpLifecycleAndRecovery() {
@@ -404,14 +409,14 @@ void TestPersistentCapacityLimits() {
 void TestTopicRuleMigrationAtCapacity() {
     Manager manager;
     const std::vector<std::string> topics{
-        "reminder", "calendar", "weather", "music", "health", "habit", "system"};
+        "reminder", "calendar", "weather", "news", "music", "health", "habit", "system"};
     for (const auto& topic : topics) manager.BlockTopic(topic);
-    assert(manager.config().blocked_topics.size() == 7);
+    assert(manager.config().blocked_topics.size() == 8);
     manager.AllowTopic("weather");
-    assert(manager.config().blocked_topics.size() == 6);
+    assert(manager.config().blocked_topics.size() == 7);
     assert(manager.config().allowed_topics.count("weather") == 1);
     manager.BlockTopic("weather");
-    assert(manager.config().blocked_topics.size() == 7);
+    assert(manager.config().blocked_topics.size() == 8);
     assert(manager.config().allowed_topics.empty());
 
     bool invalid_rejected = false;

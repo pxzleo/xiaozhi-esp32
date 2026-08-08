@@ -307,7 +307,7 @@ sequenceDiagram
 - `self.proactive.configure(mode,daily_limit?,quiet_start?,quiet_end?)`：模式为 `conservative/active/aggressive`；安静时段必须成对使用 `HH:MM`。
 - `self.proactive.status`：返回规范化模式、上限、今日已用次数、安静时段及 allow/block topic。
 - `self.proactive.mute(scope=today)`：仅静默今天，本地次日恢复此前模式。
-- `self.proactive.allow_topic(topic)` / `self.proactive.block_topic(topic)`：更新主题规则；topic 只允许 `reminder/calendar/weather/music/health/habit/system`，allow 集合非空时是普通事件白名单，critical 不受白名单限制。
+- `self.proactive.allow_topic(topic)` / `self.proactive.block_topic(topic)`：更新主题规则；topic 只允许 `reminder/calendar/weather/news/music/health/habit/system`，allow 集合非空时是普通事件白名单，critical 不受白名单限制。
 - `self.schedule.complete_recent`、`self.schedule.follow_up(minutes)`、`self.schedule.dismiss_follow_up`：完成、延后或取消最近唯一的提醒确认。
 
 这些工具的 `response` 是简短权威结论，`data` 是规范化配置或来源 id；“积极一点/更积极/少提醒/今天安静/每天最多 N 次/某主题不要再问”等自然语言应映射到相应工具，工具前不得先播报“我来处理一下”。

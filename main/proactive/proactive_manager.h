@@ -54,7 +54,7 @@ struct RuntimeState {
 class Manager {
 public:
     static constexpr int kCooldownSeconds = 30 * 60;
-    static constexpr size_t kMaxTrackedTopics = 7;
+    static constexpr size_t kMaxTrackedTopics = 8;
 
     const Config& config() const { return config_; }
     const RuntimeState& state() const { return state_; }
