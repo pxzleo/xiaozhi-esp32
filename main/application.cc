@@ -417,6 +417,13 @@ Application::Application() {
 }
 
 Application::~Application() {
+    proactive_shutdown_.store(true);
+    for (int i = 0; i < 150 && proactive_connection_running_.load(); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (proactive_connection_running_.load()) {
+        ESP_LOGE(TAG, "Proactive connection worker did not stop before shutdown");
+    }
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
@@ -1397,6 +1404,9 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
     }
+    if (proactive_connection_running_.load()) {
+        return;
+    }
 
     // Switch to performance mode before connecting to reduce latency
     auto& board = Board::GetInstance();
@@ -2154,6 +2164,8 @@ bool Application::TrySaveProactive(const char* context, bool force) {
 
 void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
     auto event = health.event;
+    event.topic = "health_critical";
+    event.priority = proactive::Priority::kCritical;
     event.metadata["health_kind"] = health.kind;
     event.metadata["severity"] = proactive::HealthTracker::SeverityName(health.severity);
     event.metadata["recovered"] = health.recovered ? "true" : "false";
@@ -2169,17 +2181,28 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
         if (evicted) {
             ESP_LOGW(TAG, "Evicted lower priority proactive event id=%s for health event",
                      evicted->event_id.c_str());
+            if (evicted->metadata.count("health_kind") != 0) {
+                pending_health_events_.erase(
+                    std::remove_if(pending_health_events_.begin(), pending_health_events_.end(),
+                        [&evicted](const proactive::Event& pending) {
+                            return pending.dedupe_key == evicted->dedupe_key;
+                        }),
+                    pending_health_events_.end());
+                pending_health_events_.push_back(std::move(*evicted));
+                ESP_LOGW(TAG, "Preserved evicted health event in retry queue");
+            }
         }
     } catch (const std::exception& error) {
         ESP_LOGE(TAG, "Cannot persist health event: %s", error.what());
         Board::GetInstance().GetDisplay()->ShowNotification("健康事件存储已满", 5000);
-        if (pending_health_events_.size() < 4) {
-            pending_health_events_.push_back(std::move(event));
-            health_enqueue_backoff_.OnFailure(esp_timer_get_time());
-        } else {
-            ESP_LOGE(TAG, "Health retry queue is full; event id=%s remains unqueued",
-                     event.event_id.c_str());
-        }
+        pending_health_events_.erase(
+            std::remove_if(pending_health_events_.begin(), pending_health_events_.end(),
+                [&event](const proactive::Event& pending) {
+                    return pending.dedupe_key == event.dedupe_key;
+                }),
+            pending_health_events_.end());
+        pending_health_events_.push_back(std::move(event));
+        health_enqueue_backoff_.OnFailure(esp_timer_get_time());
         return;
     }
     Board::GetInstance().GetDisplay()->ShowNotification(
@@ -2251,6 +2274,58 @@ void Application::RecordProactiveSendResult(bool success) {
     proactive_retry_backoff_.OnFailure(esp_timer_get_time());
 }
 
+bool Application::StartProactiveConnectionWorker() {
+    if (protocol_ == nullptr || !network_connected_.load() ||
+        GetDeviceState() != kDeviceStateIdle || schedule_alert_active_ ||
+        protocol_->IsAudioChannelOpened()) {
+        return false;
+    }
+    bool expected = false;
+    if (!proactive_connection_running_.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+    BaseType_t result = xTaskCreate(
+        [](void* arg) {
+            auto* app = static_cast<Application*>(arg);
+            app->ProactiveConnectionTask(app->proactive_protocol_generation_);
+            vTaskDelete(nullptr);
+        },
+        "proactive_conn", 4096 * 2, this, 2, &proactive_connection_task_handle_);
+    if (result != pdPASS) {
+        proactive_connection_task_handle_ = nullptr;
+        proactive_connection_running_.store(false);
+        RecordProactiveSendResult(false);
+        ESP_LOGE(TAG, "Failed to create proactive connection worker");
+        return false;
+    }
+    return true;
+}
+
+void Application::ProactiveConnectionTask(uint32_t protocol_generation) {
+    bool success = false;
+    if (!proactive_shutdown_.load() && protocol_ != nullptr &&
+        protocol_generation == proactive_protocol_generation_) {
+        success = protocol_->OpenAudioChannel();
+    }
+    proactive_connection_running_.store(false);
+    if (!proactive_shutdown_.load()) {
+        Schedule([this, success, protocol_generation]() {
+            proactive_connection_task_handle_ = nullptr;
+            if (protocol_generation != proactive_protocol_generation_) return;
+            RecordProactiveSendResult(success);
+            if (proactive_reset_pending_) {
+                proactive_reset_pending_ = false;
+                ResetProtocol();
+                return;
+            }
+            if (GetDeviceState() == kDeviceStateConnecting) {
+                ContinueOpenAudioChannel(GetDefaultListeningMode());
+            }
+            xEventGroupSetBits(event_group_, MAIN_EVENT_CLOCK_TICK);
+        });
+    }
+}
+
 void Application::CheckProactiveEvents() {
     const auto now = std::time(nullptr);
     bool changed = false;
@@ -2260,12 +2335,24 @@ void Application::CheckProactiveEvents() {
     if (!pending_health_events_.empty() &&
         health_enqueue_backoff_.Ready(esp_timer_get_time())) {
         try {
-            auto evicted = proactive_queue_.Push(pending_health_events_.front());
+            auto retrying_health = pending_health_events_.front();
+            auto evicted = proactive_queue_.Push(retrying_health);
+            pending_health_events_.pop_front();
             if (evicted) {
                 ESP_LOGW(TAG, "Evicted proactive event id=%s for retried health event",
                          evicted->event_id.c_str());
+                if (evicted->metadata.count("health_kind") != 0) {
+                    pending_health_events_.erase(
+                        std::remove_if(pending_health_events_.begin(),
+                                       pending_health_events_.end(),
+                            [&evicted](const proactive::Event& pending) {
+                                return pending.dedupe_key == evicted->dedupe_key;
+                            }),
+                        pending_health_events_.end());
+                    pending_health_events_.push_back(std::move(*evicted));
+                    ESP_LOGW(TAG, "Preserved health event evicted by recovery retry");
+                }
             }
-            pending_health_events_.pop_front();
             health_enqueue_backoff_.OnSuccess();
             changed = true;
         } catch (const std::exception& error) {
@@ -2304,6 +2391,8 @@ void Application::CheckProactiveEvents() {
                 "confirm reminder completion", now, follow_up.expires_at,
                 "follow-up:" + std::to_string(follow_up.source_id), true, {}};
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
+            const auto old_follow_ups = schedule_follow_ups_.items();
+            const auto old_queue = proactive_queue_.items();
             try {
                 auto evicted = proactive_queue_.Push(event);
                 if (evicted) {
@@ -2311,9 +2400,18 @@ void Application::CheckProactiveEvents() {
                              evicted->event_id.c_str());
                 }
                 schedule_follow_ups_.MarkAsked(follow_up.source_id, follow_up.due_at);
+                if (!TrySaveProactive("due follow-up transaction", true)) {
+                    schedule_follow_ups_.Restore(old_follow_ups);
+                    proactive_queue_.Restore(old_queue);
+                    follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
+                    ESP_LOGE(TAG, "Rolled back due follow-up id=%lu after save failure",
+                             static_cast<unsigned long>(follow_up.source_id));
+                    break;
+                }
                 follow_up_enqueue_backoff_.OnSuccess();
-                changed = true;
             } catch (const std::exception& error) {
+                schedule_follow_ups_.Restore(old_follow_ups);
+                proactive_queue_.Restore(old_queue);
                 ESP_LOGE(TAG, "Cannot enqueue due follow-up id=%lu: %s",
                          static_cast<unsigned long>(follow_up.source_id), error.what());
                 follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
@@ -2346,7 +2444,12 @@ void Application::CheckProactiveEvents() {
             proactive_queue_.Push(std::move(deferred_event));
         }
         if (event) {
-            if (event->metadata.count("source_id") != 0 &&
+            if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
+                proactive_queue_.Push(*event);
+                StartProactiveConnectionWorker();
+                event.reset();
+            }
+            if (event && event->metadata.count("source_id") != 0 &&
                 event->metadata.count("cue_played") == 0) {
                 const uint32_t source_id = static_cast<uint32_t>(std::strtoul(
                     event->metadata.at("source_id").c_str(), nullptr, 10));
@@ -2356,7 +2459,7 @@ void Application::CheckProactiveEvents() {
                 pending_proactive_event_ = std::move(*event);
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
                 changed = true;
-            } else {
+            } else if (event) {
                 const bool sent = SendProactiveEvent(*event);
                 RecordProactiveSendResult(sent);
                 if (sent) {
@@ -2858,6 +2961,12 @@ std::string Application::DismissScheduleFollowUp() {
 
 void Application::ResetProtocol() {
     Schedule([this]() {
+        if (proactive_connection_running_.load()) {
+            proactive_reset_pending_ = true;
+            ESP_LOGW(TAG, "Deferring protocol reset until proactive connection finishes");
+            return;
+        }
+        ++proactive_protocol_generation_;
         // Close audio channel if opened
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();

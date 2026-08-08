@@ -78,21 +78,21 @@ void Manager::MuteToday(std::time_t now, bool time_valid) {
 
 void Manager::AllowTopic(const std::string& topic) {
     ValidateTopic(topic);
+    config_.blocked_topics.erase(topic);
     if (config_.allowed_topics.count(topic) == 0 &&
         config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
         throw std::runtime_error("主动主题规则已达8项上限");
     }
-    config_.blocked_topics.erase(topic);
     config_.allowed_topics.insert(topic);
 }
 
 void Manager::BlockTopic(const std::string& topic) {
     ValidateTopic(topic);
+    config_.allowed_topics.erase(topic);
     if (config_.blocked_topics.count(topic) == 0 &&
         config_.allowed_topics.size() + config_.blocked_topics.size() >= 8) {
         throw std::runtime_error("主动主题规则已达8项上限");
     }
-    config_.allowed_topics.erase(topic);
     config_.blocked_topics.insert(topic);
 }
 

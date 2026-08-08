@@ -99,6 +99,17 @@ class ScheduleManagerTest(unittest.TestCase):
             proactive_check.index("proactive_queue_.Push(event)"),
             proactive_check.index("schedule_follow_ups_.MarkAsked"),
         )
+        self.assertLess(
+            proactive_check.index('TrySaveProactive("due follow-up transaction", true)'),
+            proactive_check.index("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)"),
+        )
+        self.assertIn("StartProactiveConnectionWorker()", proactive_check)
+        worker = application.split("void Application::ProactiveConnectionTask", 1)[1]
+        worker = worker.split("void Application::CheckProactiveEvents", 1)[0]
+        self.assertIn("protocol_->OpenAudioChannel()", worker)
+        self.assertIn("proactive_connection_running_.store(false)", worker)
+        reset = application.split("void Application::ResetProtocol()", 1)[1]
+        self.assertIn("proactive_reset_pending_ = true", reset)
         self.assertIn("LoadProactive()", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)
@@ -115,6 +126,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("未应用修改", application)
         self.assertEqual(application.count("SaveProactive();"), 1)
         self.assertIn("recovered_health ||", application)
+        self.assertIn("event.priority = proactive::Priority::kCritical", application)
         health_queue = application.split("void Application::QueueHealthEvent", 1)[1]
         health_queue = health_queue.split("bool Application::SendProactiveEvent", 1)[0]
         self.assertIn("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)", health_queue)

@@ -1,5 +1,6 @@
 #include "proactive_manager.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <stdexcept>
@@ -101,6 +102,12 @@ void TestFollowUpLifecycleAndRecovery() {
     FollowUpStore restored;
     restored.Restore(store.items());
     assert(restored.PendingDue(now + 600).size() == 1);
+    FollowUpStore delayed_connection;
+    delayed_connection.Schedule(70, "两分钟后通道恢复", now, now);
+    auto delayed_due = delayed_connection.PendingDue(now + 720);
+    assert(delayed_due.size() == 1 && delayed_due[0].expires_at == now + 900);
+    delayed_connection.MarkAsked(delayed_due[0].source_id, delayed_due[0].due_at);
+    assert(delayed_connection.items()[0].asked);
     store.Schedule(8, "喝水", now + 1, now + 1);
     assert(store.DismissRecent(now + 2).source_id == 8);
     assert(store.DismissRecent(now + 2).source_id == 7);
@@ -199,6 +206,13 @@ void TestPersistentCapacityLimits() {
     auto evicted = priority_queue.Push(critical);
     assert(evicted && evicted->priority == Priority::kLow);
     assert(priority_queue.items().size() == DurableQueue::kMaxItems);
+    Event ota_info{"ota-info", "health_critical", Priority::kCritical,
+                   "ota info health", now, now + 60, "health:ota", false,
+                   {{"health_kind", "ota_update_available"}, {"severity", "info"}}};
+    auto ota_evicted = priority_queue.Push(ota_info);
+    assert(ota_evicted && ota_evicted->priority == Priority::kLow);
+    assert(std::any_of(priority_queue.items().begin(), priority_queue.items().end(),
+                       [](const Event& item) { return item.event_id == "ota-info"; }));
 
     DurableQueue protected_queue;
     for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
@@ -215,6 +229,14 @@ void TestPersistentCapacityLimits() {
         protected_queue.Push(std::move(ordinary));
     } catch (const std::runtime_error&) { ordinary_rejected = true; }
     assert(ordinary_rejected && protected_queue.items().size() == DurableQueue::kMaxItems);
+    std::optional<Event> pending_ota;
+    try {
+        protected_queue.Push(ota_info);
+    } catch (const std::runtime_error&) {
+        pending_ota = ota_info;
+    }
+    assert(pending_ota && pending_ota->metadata.at("health_kind") ==
+                              "ota_update_available");
 
     FollowUpStore transactional;
     transactional.Schedule(200, "事务追问", now, now);
@@ -230,6 +252,19 @@ void TestPersistentCapacityLimits() {
     assert(enqueue_failed && !transactional.items()[0].asked);
 }
 
+void TestTopicRuleMigrationAtCapacity() {
+    Manager manager;
+    manager.BlockTopic("move-me");
+    for (int i = 0; i < 7; ++i) manager.BlockTopic("blocked-" + std::to_string(i));
+    assert(manager.config().blocked_topics.size() == 8);
+    manager.AllowTopic("move-me");
+    assert(manager.config().blocked_topics.size() == 7);
+    assert(manager.config().allowed_topics.count("move-me") == 1);
+    manager.BlockTopic("move-me");
+    assert(manager.config().blocked_topics.size() == 8);
+    assert(manager.config().allowed_topics.empty());
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -239,5 +274,6 @@ int main() {
     TestHealthDedupRecoveryAndQueueOrdering();
     TestRetryBackoffIsBounded();
     TestPersistentCapacityLimits();
+    TestTopicRuleMigrationAtCapacity();
     return 0;
 }

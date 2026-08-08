@@ -201,6 +201,11 @@ private:
     proactive::RetryBackoff follow_up_enqueue_backoff_;
     proactive::RetryBackoff health_enqueue_backoff_;
     bool proactive_save_pending_ = false;
+    std::atomic<bool> proactive_connection_running_{false};
+    std::atomic<bool> proactive_shutdown_{false};
+    TaskHandle_t proactive_connection_task_handle_ = nullptr;
+    bool proactive_reset_pending_ = false;
+    uint32_t proactive_protocol_generation_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -228,6 +233,8 @@ private:
     bool SendProactiveEvent(const proactive::Event& event);
     std::string FindFollowUpLabel(uint32_t source_id) const;
     void RecordProactiveSendResult(bool success);
+    bool StartProactiveConnectionWorker();
+    void ProactiveConnectionTask(uint32_t protocol_generation);
     void CheckSchedules();
     void StartNextScheduleAlert();
     void ShowScheduleAlertPage();
