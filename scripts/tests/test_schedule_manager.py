@@ -60,7 +60,7 @@ class ScheduleManagerTest(unittest.TestCase):
             "blocked_topics": topics[4:],
             "budget_date": 20260808,
             "delivered_today": 6,
-            "last_delivered": {topics[i]: 1786159999 for i in range(5)},
+            "last_delivered": {topics[i]: 1786159999 for i in range(7)},
         }
         follow_ups = [
             {

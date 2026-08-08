@@ -317,7 +317,9 @@ cJSON* ProactiveConfigJson(const proactive::Config& config,
     }
     std::sort(valid_cooldowns.begin(), valid_cooldowns.end(),
               [](const auto& left, const auto& right) { return left.second > right.second; });
-    if (valid_cooldowns.size() > 5) valid_cooldowns.resize(5);
+    if (valid_cooldowns.size() > proactive::Manager::kMaxTrackedTopics) {
+        valid_cooldowns.resize(proactive::Manager::kMaxTrackedTopics);
+    }
     for (const auto& [topic, timestamp] : valid_cooldowns) {
         cJSON_AddNumberToObject(cooldowns, topic.c_str(), timestamp);
     }

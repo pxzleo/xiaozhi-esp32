@@ -133,6 +133,26 @@ void TestLegacyAggressiveLimitIsNormalized() {
     assert(invalid_silent_limit_rejected);
 }
 
+void TestAggressiveCooldownRetainsAllPolicyTopics() {
+    Manager manager;
+    const auto now = At(2026, 8, 8, 12);
+    std::vector<Event> events{
+        QueuedFollowUp("follow-up-cooldown", now),
+        Suggestion("calendar-cooldown", "calendar", now + 1),
+        Suggestion("weather-cooldown", "weather", now + 2),
+        Suggestion("music-cooldown", "music", now + 3),
+        Suggestion("health-cooldown", "health", now + 4),
+        Suggestion("habit-cooldown", "habit", now + 5),
+        Suggestion("system-cooldown", "system", now + 6),
+    };
+    for (const auto& event : events) {
+        assert(manager.ShouldDeliver(event, event.created_at, true));
+        manager.RecordDelivered(event, event.created_at, true);
+    }
+    assert(manager.state().last_delivered.size() == 7);
+    assert(!manager.ShouldDeliver(QueuedFollowUp("follow-up-again", now + 7), now + 7, true));
+}
+
 void TestFollowUpLifecycleAndRecovery() {
     FollowUpStore store;
     const auto now = At(2026, 8, 8, 9);
@@ -446,6 +466,7 @@ int main() {
     TestModesBudgetDateAndTimeValidity();
     TestQuietMuteTopicAndCooldown();
     TestLegacyAggressiveLimitIsNormalized();
+    TestAggressiveCooldownRetainsAllPolicyTopics();
     TestFollowUpLifecycleAndRecovery();
     TestHealthDedupRecoveryAndQueueOrdering();
     TestFourHealthKindsReplaceInPersistentQueue();

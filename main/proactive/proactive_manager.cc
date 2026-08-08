@@ -244,7 +244,7 @@ void Manager::TrimCooldowns(std::time_t now) {
         if (item->second < now - kCooldownSeconds) item = state_.last_delivered.erase(item);
         else ++item;
     }
-    while (state_.last_delivered.size() > 5) {
+    while (state_.last_delivered.size() > kMaxTrackedTopics) {
         auto oldest = std::min_element(state_.last_delivered.begin(), state_.last_delivered.end(),
             [](const auto& left, const auto& right) { return left.second < right.second; });
         state_.last_delivered.erase(oldest);
@@ -369,7 +369,7 @@ void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_val
     RefreshDate(now, time_valid);
     const auto& topic = PolicyTopic(event);
     if (state_.last_delivered.count(topic) == 0 &&
-        state_.last_delivered.size() >= 5) {
+        state_.last_delivered.size() >= kMaxTrackedTopics) {
         auto oldest = std::min_element(
             state_.last_delivered.begin(), state_.last_delivered.end(),
             [](const auto& left, const auto& right) { return left.second < right.second; });
