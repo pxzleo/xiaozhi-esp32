@@ -66,6 +66,7 @@ public:
     static std::string FormatClock(int minutes);
 
 private:
+    void TrimCooldowns(std::time_t now);
     void RefreshDate(std::time_t now, bool time_valid);
     bool IsQuiet(std::time_t now) const;
     static bool IsCritical(const Event& event);

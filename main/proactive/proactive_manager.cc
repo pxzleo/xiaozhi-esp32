@@ -197,12 +197,25 @@ void Manager::Restore(Config config, RuntimeState state) {
         (config.quiet_end && (*config.quiet_end < 0 || *config.quiet_end >= 1440))) {
         throw std::invalid_argument("安静时段超出一天范围");
     }
-    if (config.allowed_topics.size() + config.blocked_topics.size() > 8 ||
-        state.last_delivered.size() > 8) {
+    if (config.allowed_topics.size() + config.blocked_topics.size() > 8) {
         throw std::invalid_argument("保存的主动主题状态超过8项上限");
     }
     config_ = std::move(config);
     state_ = std::move(state);
+    const auto now = std::time(nullptr);
+    if (now > 1600000000) TrimCooldowns(now);
+}
+
+void Manager::TrimCooldowns(std::time_t now) {
+    for (auto item = state_.last_delivered.begin(); item != state_.last_delivered.end();) {
+        if (item->second < now - kCooldownSeconds) item = state_.last_delivered.erase(item);
+        else ++item;
+    }
+    while (state_.last_delivered.size() > 5) {
+        auto oldest = std::min_element(state_.last_delivered.begin(), state_.last_delivered.end(),
+            [](const auto& left, const auto& right) { return left.second < right.second; });
+        state_.last_delivered.erase(oldest);
+    }
 }
 
 void Manager::Configure(Mode mode, std::optional<int> daily_limit,
@@ -261,6 +274,7 @@ void Manager::BlockTopic(const std::string& topic) {
 
 void Manager::RefreshDate(std::time_t now, bool time_valid) {
     if (!time_valid) return;
+    TrimCooldowns(now);
     const int date = LocalDate(now);
     if (state_.budget_date != date) {
         state_.budget_date = date;
@@ -311,7 +325,7 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
 void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_valid) {
     RefreshDate(now, time_valid);
     if (state_.last_delivered.count(event.topic) == 0 &&
-        state_.last_delivered.size() >= 8) {
+        state_.last_delivered.size() >= 5) {
         auto oldest = std::min_element(
             state_.last_delivered.begin(), state_.last_delivered.end(),
             [](const auto& left, const auto& right) { return left.second < right.second; });

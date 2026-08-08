@@ -57,12 +57,12 @@ class ScheduleManagerTest(unittest.TestCase):
             "blocked_topics": [topic(i) for i in range(4, 8)],
             "budget_date": 20260808,
             "delivered_today": 5,
-            "last_delivered": {topic(i): 1786159999 for i in range(8)},
+            "last_delivered": {topic(i): 1786159999 for i in range(5)},
         }
         follow_ups = [
             {
                 "source_id": source_index + 1,
-                "label": "".join(chr(0x4e00 + char_index * 83 + source_index)
+                "label": "".join(chr(0x1f300 + char_index + source_index * 80)
                                  for char_index in range(80)),
                 "source_triggered_at": 1786159000 + source_index,
                 "due_at": 1786159600 + source_index,
@@ -298,7 +298,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("migrated_pending", application)
         self.assertIn("loaded_legacy_pz1", application)
         self.assertIn("if (loaded_legacy_pz1) proactive_save_pending_ = true", application)
-        self.assertIn("旧版主动队列待播追问存在歧义", application)
+        self.assertIn("legacy_tail = queued.back()", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)
         self.assertIn("uptime_ticks_ >= 600", application)

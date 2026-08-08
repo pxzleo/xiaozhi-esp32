@@ -307,7 +307,17 @@ cJSON* ProactiveConfigJson(const proactive::Config& config,
     cJSON_AddNumberToObject(json, "budget_date", state.budget_date);
     cJSON_AddNumberToObject(json, "delivered_today", state.delivered_today);
     cJSON* cooldowns = cJSON_AddObjectToObject(json, "last_delivered");
-    for (const auto& [topic, timestamp] : state.last_delivered) {
+    std::vector<std::pair<std::string, std::time_t>> valid_cooldowns;
+    const auto now = std::time(nullptr);
+    for (const auto& entry : state.last_delivered) {
+        if (entry.second >= now - proactive::Manager::kCooldownSeconds) {
+            valid_cooldowns.push_back(entry);
+        }
+    }
+    std::sort(valid_cooldowns.begin(), valid_cooldowns.end(),
+              [](const auto& left, const auto& right) { return left.second > right.second; });
+    if (valid_cooldowns.size() > 5) valid_cooldowns.resize(5);
+    for (const auto& [topic, timestamp] : valid_cooldowns) {
         cJSON_AddNumberToObject(cooldowns, topic.c_str(), timestamp);
     }
     return json;
@@ -2212,22 +2222,16 @@ void Application::LoadProactive() {
             (pending != nullptr && !cJSON_IsNull(pending))) {
             throw std::runtime_error("旧版主动队列超限且无法迁移");
         }
-        auto selected = queued.end();
-        for (auto candidate = queued.begin(); candidate != queued.end(); ++candidate) {
-            if (candidate->topic != "follow_up" ||
-                candidate->metadata.count("source_id") == 0) continue;
-            if (selected == queued.end() || candidate->priority > selected->priority ||
-                (candidate->priority == selected->priority &&
-                 candidate->created_at > selected->created_at)) {
-                selected = candidate;
-            } else if (candidate->priority == selected->priority &&
-                       candidate->created_at == selected->created_at) {
-                throw std::runtime_error("旧版主动队列待播追问存在歧义");
-            }
+        auto& legacy_tail = queued.back();
+        if (legacy_tail.topic != "follow_up" ||
+            legacy_tail.metadata.count("source_id") == 0) {
+            throw std::runtime_error("旧版九项主动队列末项不是待播追问");
         }
-        if (selected == queued.end()) throw std::runtime_error("旧版主动队列没有可迁移待播项");
-        migrated_pending = std::move(*selected);
-        queued.erase(selected);
+        const uint32_t source_id = static_cast<uint32_t>(std::strtoul(
+            legacy_tail.metadata.at("source_id").c_str(), nullptr, 10));
+        FindFollowUpLabel(source_id);
+        migrated_pending = std::move(legacy_tail);
+        queued.pop_back();
     }
     for (const auto& event : queued) {
         auto source = event.metadata.find("source_id");
