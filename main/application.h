@@ -190,6 +190,7 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    int64_t uptime_ticks_ = 0;
     std::deque<std::time_t> network_disconnects_;
     bool time_unsynced_health_reported_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;

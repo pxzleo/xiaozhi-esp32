@@ -180,6 +180,7 @@ std::string Manager::FormatClock(int minutes) {
 }
 
 void FollowUpStore::Restore(std::vector<FollowUp> items) {
+    if (items.size() > kMaxItems) throw std::invalid_argument("保存的追问超过16项");
     for (const auto& item : items) {
         if (item.source_id == 0 || item.label.empty() || item.source_triggered_at <= 0 ||
             item.due_at <= item.source_triggered_at || item.expires_at < item.due_at) {
@@ -198,6 +199,7 @@ void FollowUpStore::Schedule(uint32_t source_id, const std::string& label,
                                 [source_id](const FollowUp& item) {
                                     return item.source_id == source_id;
                                 }), items_.end());
+    if (items_.size() >= kMaxItems) throw std::runtime_error("待确认提醒已达16项上限");
     items_.push_back({source_id, label, triggered_at,
                       triggered_at + kDefaultDelaySeconds,
                       triggered_at + kDefaultDelaySeconds + kLateGraceSeconds, false});
@@ -307,7 +309,11 @@ const char* HealthTracker::SeverityName(Severity severity) {
     throw std::invalid_argument("未知健康严重级别");
 }
 
-void DurableQueue::Restore(std::vector<Event> items) { items_ = std::move(items); }
+void DurableQueue::Restore(std::vector<Event> items) {
+    if (items.size() > kMaxItems) throw std::invalid_argument("保存的主动队列超过32项");
+    items_.clear();
+    for (auto& item : items) Push(std::move(item));
+}
 
 void DurableQueue::Push(Event event) {
     if (event.event_id.empty() || event.topic.empty() || event.dedupe_key.empty()) {
@@ -316,7 +322,10 @@ void DurableQueue::Push(Event event) {
     auto found = std::find_if(items_.begin(), items_.end(), [&event](const Event& item) {
         return item.event_id == event.event_id;
     });
-    if (found == items_.end()) items_.push_back(std::move(event));
+    if (found == items_.end()) {
+        if (items_.size() >= kMaxItems) throw std::runtime_error("主动事件队列已达32项上限");
+        items_.push_back(std::move(event));
+    }
 }
 
 std::optional<Event> DurableQueue::PopNext(std::time_t now) {
@@ -330,6 +339,15 @@ std::optional<Event> DurableQueue::PopNext(std::time_t now) {
     Event result = *best;
     items_.erase(best);
     return result;
+}
+
+size_t DurableQueue::RemoveByDedupeKey(const std::string& dedupe_key) {
+    const size_t before = items_.size();
+    items_.erase(std::remove_if(items_.begin(), items_.end(),
+                                [&dedupe_key](const Event& event) {
+                                    return event.dedupe_key == dedupe_key;
+                                }), items_.end());
+    return before - items_.size();
 }
 
 size_t DurableQueue::DropExpired(std::time_t now) {

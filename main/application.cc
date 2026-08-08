@@ -259,6 +259,26 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
         if (!cJSON_IsString(entry)) throw std::runtime_error("NVS中的主动事件metadata无效");
         event.metadata[entry->string] = entry->valuestring;
     }
+    if (event.metadata.count("source_id") != 0) {
+        if (event.metadata.count("label") == 0 || event.metadata.at("label").empty() ||
+            event.metadata.at("source_id").empty() ||
+            !std::all_of(event.metadata.at("source_id").begin(),
+                         event.metadata.at("source_id").end(),
+                         [](unsigned char value) { return std::isdigit(value) != 0; })) {
+            throw std::runtime_error("NVS中的追问事件metadata无效");
+        }
+    }
+    if (event.metadata.count("health_kind") != 0) {
+        const auto severity = event.metadata.find("severity");
+        const auto recovered = event.metadata.find("recovered");
+        if (event.metadata.at("health_kind").empty() || severity == event.metadata.end() ||
+            recovered == event.metadata.end() ||
+            (severity->second != "info" && severity->second != "warning" &&
+             severity->second != "critical") ||
+            (recovered->second != "true" && recovered->second != "false")) {
+            throw std::runtime_error("NVS中的健康事件metadata无效");
+        }
+    }
     return event;
 }
 
@@ -492,7 +512,7 @@ void Application::Initialize() {
         Settings settings("proactive", true);
         settings.SetString("last_error", error.what());
         settings.SetInt("chunks", 0);
-        for (int i = 0; i < 8; ++i) settings.EraseKey("data" + std::to_string(i));
+        for (int i = 0; i < 16; ++i) settings.EraseKey("data" + std::to_string(i));
         proactive_manager_.Restore({}, {});
         schedule_follow_ups_.Restore({});
         health_tracker_.Restore({});
@@ -710,6 +730,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            uptime_ticks_++;
             CheckSchedules();
             CheckProactiveEvents();
             auto display = Board::GetInstance().GetDisplay();
@@ -1896,7 +1917,7 @@ void Application::LoadProactive() {
     Settings settings("proactive");
     std::string saved;
     const int chunk_count = settings.GetInt("chunks", 0);
-    if (chunk_count < 0 || chunk_count > 8) throw std::runtime_error("NVS中的主动状态分片数无效");
+    if (chunk_count < 0 || chunk_count > 16) throw std::runtime_error("NVS中的主动状态分片数无效");
     for (int i = 0; i < chunk_count; ++i) {
         const auto chunk = settings.GetString("data" + std::to_string(i));
         if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
@@ -2032,14 +2053,14 @@ void Application::SaveProactive() const {
     const std::string saved = JsonString(root);
     static constexpr size_t kChunkSize = 1800;
     const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
-    if (chunk_count > 8) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    if (chunk_count > 16) throw std::runtime_error("主动状态JSON超过NVS容量限制");
     Settings settings("proactive", true);
     const int old_count = settings.GetInt("chunks", 0);
     settings.SetInt("chunks", chunk_count);
     for (int i = 0; i < chunk_count; ++i) {
         settings.SetString("data" + std::to_string(i), saved.substr(i * kChunkSize, kChunkSize));
     }
-    for (int i = chunk_count; i < old_count && i < 8; ++i) {
+    for (int i = chunk_count; i < old_count && i < 16; ++i) {
         settings.EraseKey("data" + std::to_string(i));
     }
 }
@@ -2119,11 +2140,11 @@ void Application::CheckProactiveEvents() {
         proactive_manager_.ShouldDeliver(date_refresh, now, true);
         changed = mode_before_refresh != proactive_manager_.config().mode;
     }
-    if (!has_server_time_.load() && clock_ticks_ >= 600 && !time_unsynced_health_reported_) {
+    if (!has_server_time_.load() && uptime_ticks_ >= 600 && !time_unsynced_health_reported_) {
         time_unsynced_health_reported_ = true;
         if (auto event = health_tracker_.Raise(
                 "time_unsynchronized", proactive::Severity::kWarning, now,
-                {{"uptime_seconds", std::to_string(clock_ticks_)}})) {
+                {{"uptime_seconds", std::to_string(uptime_ticks_)}})) {
             QueueHealthEvent(*event);
         }
     }
@@ -2145,13 +2166,24 @@ void Application::CheckProactiveEvents() {
     if (proactive_queue_.DropExpired(now) > 0) changed = true;
     if (!pending_proactive_event_ && !schedule_alert_active_ &&
         GetDeviceState() != kDeviceStateSpeaking) {
-        auto event = proactive_queue_.PopNext(now);
+        std::vector<proactive::Event> deferred;
+        std::optional<proactive::Event> event;
+        const size_t candidates = proactive_queue_.items().size();
+        for (size_t i = 0; i < candidates; ++i) {
+            auto candidate = proactive_queue_.PopNext(now);
+            if (!candidate) break;
+            if (proactive_manager_.ShouldDeliver(*candidate, now,
+                                                  has_server_time_.load())) {
+                event = std::move(candidate);
+                break;
+            }
+            deferred.push_back(std::move(*candidate));
+        }
+        for (auto& deferred_event : deferred) {
+            proactive_queue_.Push(std::move(deferred_event));
+        }
         if (event) {
-            const bool health_event = event->metadata.count("health_kind") != 0;
-            if (!health_event &&
-                !proactive_manager_.ShouldDeliver(*event, now, has_server_time_.load())) {
-                proactive_queue_.Push(std::move(*event));
-            } else if (event->metadata.count("source_id") != 0) {
+            if (event->metadata.count("source_id") != 0) {
                 Board::GetInstance().GetDisplay()->ShowNotification(
                     ("刚才提醒的" + event->metadata.at("label") + "完成了吗？").c_str(),
                     10000);
@@ -2159,9 +2191,7 @@ void Application::CheckProactiveEvents() {
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
                 changed = true;
             } else if (SendProactiveEvent(*event)) {
-                if (!health_event) {
-                    proactive_manager_.RecordDelivered(*event, now, has_server_time_.load());
-                }
+                proactive_manager_.RecordDelivered(*event, now, has_server_time_.load());
                 changed = true;
             } else {
                 proactive_queue_.Push(std::move(*event));
@@ -2554,6 +2584,11 @@ std::string Application::BlockProactiveTopic(const std::string& topic) {
 
 std::string Application::CompleteRecentSchedule() {
     const auto completed = schedule_follow_ups_.CompleteRecent(std::time(nullptr));
+    const std::string dedupe_key = "follow-up:" + std::to_string(completed.source_id);
+    proactive_queue_.RemoveByDedupeKey(dedupe_key);
+    if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
+        pending_proactive_event_.reset();
+    }
     SaveProactive();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", completed.source_id);
@@ -2562,6 +2597,11 @@ std::string Application::CompleteRecentSchedule() {
 
 std::string Application::FollowUpRecentSchedule(int minutes) {
     const auto delayed = schedule_follow_ups_.DelayRecent(minutes, std::time(nullptr));
+    const std::string dedupe_key = "follow-up:" + std::to_string(delayed.source_id);
+    proactive_queue_.RemoveByDedupeKey(dedupe_key);
+    if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
+        pending_proactive_event_.reset();
+    }
     SaveProactive();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", delayed.source_id);
@@ -2571,6 +2611,11 @@ std::string Application::FollowUpRecentSchedule(int minutes) {
 
 std::string Application::DismissScheduleFollowUp() {
     const auto dismissed = schedule_follow_ups_.DismissRecent(std::time(nullptr));
+    const std::string dedupe_key = "follow-up:" + std::to_string(dismissed.source_id);
+    proactive_queue_.RemoveByDedupeKey(dedupe_key);
+    if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
+        pending_proactive_event_.reset();
+    }
     SaveProactive();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", dismissed.source_id);

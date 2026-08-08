@@ -93,6 +93,8 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("LoadProactive()", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)
+        self.assertIn("uptime_ticks_ >= 600", application)
+        self.assertIn("RemoveByDedupeKey", application)
         self.assertIn("network_flapping", application)
         self.assertIn("ota_update_available", application)
         audio_h = (ROOT / "main" / "audio" / "audio_service.h").read_text(encoding="utf-8")

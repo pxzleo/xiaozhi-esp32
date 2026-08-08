@@ -85,6 +85,7 @@ struct FollowUp {
 
 class FollowUpStore {
 public:
+    static constexpr size_t kMaxItems = 16;
     static constexpr int kDefaultDelaySeconds = 10 * 60;
     static constexpr int kLateGraceSeconds = 5 * 60;
     const std::vector<FollowUp>& items() const { return items_; }
@@ -132,10 +133,12 @@ private:
 
 class DurableQueue {
 public:
+    static constexpr size_t kMaxItems = 32;
     const std::vector<Event>& items() const { return items_; }
     void Restore(std::vector<Event> items);
     void Push(Event event);
     std::optional<Event> PopNext(std::time_t now);
+    size_t RemoveByDedupeKey(const std::string& dedupe_key);
     size_t DropExpired(std::time_t now);
 
 private:

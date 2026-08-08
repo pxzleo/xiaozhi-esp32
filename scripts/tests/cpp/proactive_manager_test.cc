@@ -131,6 +131,10 @@ void TestHealthDedupRecoveryAndQueueOrdering() {
                 now + 60, "alarm-1", true, {}};
     queue.Push(alarm);
     assert(queue.PopNext(now + 1)->event_id == "alarm");
+    Event follow_up = Suggestion("follow-up", "follow_up", now);
+    follow_up.dedupe_key = "follow-up:42";
+    queue.Push(follow_up);
+    assert(queue.RemoveByDedupeKey("follow-up:42") == 1);
     queue.Push(Suggestion("expired", "tip", now - 1000));
     assert(queue.DropExpired(now + 1) == 1);
 }
