@@ -254,7 +254,7 @@ proactive::Event ParseProactiveEvent(cJSON* json) {
                            ParsePriority(priority->valuestring), reason->valuestring,
                            static_cast<std::time_t>(created_at->valuedouble),
                            static_cast<std::time_t>(expires_at->valuedouble),
-                           dedupe_key->valuestring, cJSON_IsTrue(requires_response), {}};
+                           dedupe_key->valuestring, cJSON_IsTrue(requires_response) != 0, {}};
     cJSON* entry = nullptr;
     cJSON_ArrayForEach(entry, metadata) {
         if (!cJSON_IsString(entry)) throw std::runtime_error("NVS中的主动事件metadata无效");
@@ -2202,7 +2202,7 @@ void Application::LoadProactive() {
         restored_follow_ups.push_back({static_cast<uint32_t>(source_id->valuedouble),
             label->valuestring, static_cast<std::time_t>(triggered_at->valuedouble),
             static_cast<std::time_t>(due_at->valuedouble),
-            static_cast<std::time_t>(expires_at->valuedouble), cJSON_IsTrue(asked)});
+            static_cast<std::time_t>(expires_at->valuedouble), cJSON_IsTrue(asked) != 0});
     }
     schedule_follow_ups_.Restore(std::move(restored_follow_ups));
 
@@ -2213,7 +2213,7 @@ void Application::LoadProactive() {
         auto dedupe = cJSON_GetObjectItem(item, "dedupe_key");
         if (!cJSON_IsObject(item) || !cJSON_IsBool(active) || !cJSON_IsNumber(changed) ||
             !cJSON_IsString(dedupe)) throw std::runtime_error("NVS中的健康去重字段无效");
-        health_records[item->string] = {cJSON_IsTrue(active),
+        health_records[item->string] = {cJSON_IsTrue(active) != 0,
             static_cast<std::time_t>(changed->valuedouble), dedupe->valuestring};
     }
     health_tracker_.Restore(std::move(health_records));
