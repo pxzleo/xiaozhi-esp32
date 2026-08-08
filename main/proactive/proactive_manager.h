@@ -92,7 +92,8 @@ public:
     void Restore(std::vector<FollowUp> items);
     void Schedule(uint32_t source_id, const std::string& label,
                   std::time_t source_triggered_at, std::time_t scheduled_at);
-    std::vector<FollowUp> Due(std::time_t now);
+    std::vector<FollowUp> PendingDue(std::time_t now);
+    void MarkAsked(uint32_t source_id, std::time_t due_at);
     FollowUp CompleteRecent(std::time_t now);
     FollowUp DelayRecent(int minutes, std::time_t now);
     FollowUp DismissRecent(std::time_t now);
@@ -137,7 +138,7 @@ public:
     static constexpr size_t kMaxItems = 8;
     const std::vector<Event>& items() const { return items_; }
     void Restore(std::vector<Event> items);
-    void Push(Event event);
+    std::optional<Event> Push(Event event);
     std::optional<Event> PopNext(std::time_t now);
     size_t RemoveByDedupeKey(const std::string& dedupe_key);
     size_t DropExpired(std::time_t now);

@@ -227,16 +227,25 @@ void FollowUpStore::Schedule(uint32_t source_id, const std::string& label,
                       scheduled_at + kDefaultDelaySeconds + kLateGraceSeconds, false});
 }
 
-std::vector<FollowUp> FollowUpStore::Due(std::time_t now) {
+std::vector<FollowUp> FollowUpStore::PendingDue(std::time_t now) {
     DropExpired(now);
     std::vector<FollowUp> result;
-    for (auto& item : items_) {
+    for (const auto& item : items_) {
         if (!item.asked && item.due_at <= now) {
-            item.asked = true;
             result.push_back(item);
         }
     }
     return result;
+}
+
+void FollowUpStore::MarkAsked(uint32_t source_id, std::time_t due_at) {
+    auto found = std::find_if(items_.begin(), items_.end(),
+                              [source_id, due_at](const FollowUp& item) {
+                                  return item.source_id == source_id && item.due_at == due_at;
+                              });
+    if (found == items_.end()) throw std::runtime_error("待确认提醒已不存在");
+    if (found->asked) throw std::runtime_error("该提醒已经追问过");
+    found->asked = true;
 }
 
 size_t FollowUpStore::FindRecent(std::time_t now) const {
@@ -338,17 +347,36 @@ void DurableQueue::Restore(std::vector<Event> items) {
     for (auto& item : items) Push(std::move(item));
 }
 
-void DurableQueue::Push(Event event) {
+std::optional<Event> DurableQueue::Push(Event event) {
     if (event.event_id.empty() || event.topic.empty() || event.dedupe_key.empty()) {
         throw std::invalid_argument("主动事件字段不完整");
     }
     auto found = std::find_if(items_.begin(), items_.end(), [&event](const Event& item) {
         return item.event_id == event.event_id;
     });
-    if (found == items_.end()) {
-        if (items_.size() >= kMaxItems) throw std::runtime_error("主动事件队列已达8项上限");
-        items_.push_back(std::move(event));
+    if (found != items_.end()) return std::nullopt;
+    std::optional<Event> evicted;
+    if (items_.size() >= kMaxItems) {
+        auto importance = [](const Event& item) {
+            if (item.metadata.count("recovered") != 0 &&
+                item.metadata.at("recovered") == "true") return 5;
+            return static_cast<int>(item.priority);
+        };
+        auto lowest = std::min_element(items_.begin(), items_.end(),
+            [&importance](const Event& left, const Event& right) {
+                if (importance(left) != importance(right)) {
+                    return importance(left) < importance(right);
+                }
+                return left.created_at < right.created_at;
+            });
+        if (importance(event) <= importance(*lowest)) {
+            throw std::runtime_error("主动事件队列已满且没有可淘汰的低优先级事件");
+        }
+        evicted = std::move(*lowest);
+        items_.erase(lowest);
     }
+    items_.push_back(std::move(event));
+    return evicted;
 }
 
 std::optional<Event> DurableQueue::PopNext(std::time_t now) {

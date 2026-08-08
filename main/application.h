@@ -175,6 +175,7 @@ private:
     proactive::HealthTracker health_tracker_;
     proactive::DurableQueue proactive_queue_;
     std::optional<proactive::Event> pending_proactive_event_;
+    std::deque<proactive::Event> pending_health_events_;
     std::atomic<bool> schedule_alert_active_{false};
     int64_t schedule_alert_deadline_us_ = 0;
     int64_t schedule_reminder_tts_deadline_us_ = 0;
@@ -196,6 +197,10 @@ private:
     std::atomic<bool> network_connected_{false};
     bool time_unsynced_health_reported_ = false;
     proactive::RetryBackoff proactive_retry_backoff_;
+    proactive::RetryBackoff proactive_save_backoff_;
+    proactive::RetryBackoff follow_up_enqueue_backoff_;
+    proactive::RetryBackoff health_enqueue_backoff_;
+    bool proactive_save_pending_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -217,6 +222,7 @@ private:
     void SaveSchedules() const;
     void LoadProactive();
     void SaveProactive() const;
+    bool TrySaveProactive(const char* context, bool force = false);
     void CheckProactiveEvents();
     void QueueHealthEvent(const proactive::HealthEvent& event);
     bool SendProactiveEvent(const proactive::Event& event);

@@ -674,9 +674,14 @@ void Application::Run() {
                         event, std::time(nullptr), has_server_time_.load());
                 } else {
                     event.metadata["cue_played"] = "true";
-                    proactive_queue_.Push(std::move(event));
+                    try {
+                        proactive_queue_.Push(event);
+                    } catch (const std::exception& error) {
+                        ESP_LOGE(TAG, "Cannot requeue proactive follow-up: %s", error.what());
+                        pending_proactive_event_ = std::move(event);
+                    }
                 }
-                SaveProactive();
+                TrySaveProactive("playback drained");
             }
         }
 
@@ -1116,7 +1121,7 @@ void Application::InitializeProtocol() {
                                             active_schedule_task_.id,
                                             active_schedule_task_.label,
                                             active_schedule_task_.trigger_at, now);
-                                        SaveProactive();
+                                        TrySaveProactive("reminder follow-up");
                                     } catch (const std::exception& error) {
                                         ESP_LOGE(TAG, "Cannot persist reminder follow-up: %s",
                                                  error.what());
@@ -2096,14 +2101,54 @@ void Application::SaveProactive() const {
     if (nvs_stats.available_entries < required_entries + kNvsSafetyEntries) {
         throw std::runtime_error("NVS剩余空间不足，无法原子保存主动状态");
     }
-    Settings settings("proactive", true);
-    const int old_count = settings.GetInt("chunks", 0);
-    settings.SetInt("chunks", chunk_count);
+    nvs_handle_t handle = 0;
+    auto check_nvs = [&handle](esp_err_t error, const char* operation) {
+        if (error == ESP_OK || (strcmp(operation, "erase") == 0 &&
+                                error == ESP_ERR_NVS_NOT_FOUND)) return;
+        if (handle != 0) nvs_close(handle);
+        handle = 0;
+        throw std::runtime_error(std::string("主动状态NVS") + operation + "失败: " +
+                                 esp_err_to_name(error));
+    };
+    check_nvs(nvs_open("proactive", NVS_READWRITE, &handle), "open");
+    int32_t old_count = 0;
+    const esp_err_t get_count_error = nvs_get_i32(handle, "chunks", &old_count);
+    if (get_count_error != ESP_OK && get_count_error != ESP_ERR_NVS_NOT_FOUND) {
+        check_nvs(get_count_error, "read");
+    }
     for (int i = 0; i < chunk_count; ++i) {
-        settings.SetString("data" + std::to_string(i), saved.substr(i * kChunkSize, kChunkSize));
+        const std::string key = "data" + std::to_string(i);
+        const std::string chunk = saved.substr(i * kChunkSize, kChunkSize);
+        check_nvs(nvs_set_str(handle, key.c_str(), chunk.c_str()), "write");
     }
     for (int i = chunk_count; i < old_count && i < 16; ++i) {
-        settings.EraseKey("data" + std::to_string(i));
+        const std::string key = "data" + std::to_string(i);
+        check_nvs(nvs_erase_key(handle, key.c_str()), "erase");
+    }
+    check_nvs(nvs_set_i32(handle, "chunks", chunk_count), "write");
+    check_nvs(nvs_commit(handle), "commit");
+    nvs_close(handle);
+}
+
+bool Application::TrySaveProactive(const char* context, bool force) {
+    const int64_t now_us = esp_timer_get_time();
+    if (!force && !proactive_save_backoff_.Ready(now_us)) {
+        proactive_save_pending_ = true;
+        return false;
+    }
+    try {
+        SaveProactive();
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        return true;
+    } catch (const std::exception& error) {
+        proactive_save_pending_ = true;
+        proactive_save_backoff_.OnFailure(now_us);
+        ESP_LOGE(TAG, "Cannot save proactive state (%s): %s", context, error.what());
+        if (!schedule_alert_active_ && GetDeviceState() == kDeviceStateIdle) {
+            Board::GetInstance().GetDisplay()->ShowNotification("主动状态保存失败，将自动重试", 5000);
+        }
+        return false;
     }
 }
 
@@ -2120,10 +2165,21 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
         if (health.recovered) {
             proactive_queue_.RemoveByDedupeKey(event.dedupe_key);
         }
-        proactive_queue_.Push(std::move(event));
+        auto evicted = proactive_queue_.Push(event);
+        if (evicted) {
+            ESP_LOGW(TAG, "Evicted lower priority proactive event id=%s for health event",
+                     evicted->event_id.c_str());
+        }
     } catch (const std::exception& error) {
         ESP_LOGE(TAG, "Cannot persist health event: %s", error.what());
         Board::GetInstance().GetDisplay()->ShowNotification("健康事件存储已满", 5000);
+        if (pending_health_events_.size() < 4) {
+            pending_health_events_.push_back(std::move(event));
+            health_enqueue_backoff_.OnFailure(esp_timer_get_time());
+        } else {
+            ESP_LOGE(TAG, "Health retry queue is full; event id=%s remains unqueued",
+                     event.event_id.c_str());
+        }
         return;
     }
     Board::GetInstance().GetDisplay()->ShowNotification(
@@ -2132,23 +2188,12 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
         audio_service_.IsPlaybackIdle()) {
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
     }
-    try {
-        SaveProactive();
-    } catch (const std::exception& error) {
-        ESP_LOGE(TAG, "Cannot save health event: %s", error.what());
-        Board::GetInstance().GetDisplay()->ShowNotification("健康事件保存失败", 5000);
-    }
+    TrySaveProactive("health event", true);
 }
 
 bool Application::SendProactiveEvent(const proactive::Event& event) {
     if (protocol_ == nullptr) return false;
-    if (!protocol_->IsAudioChannelOpened()) {
-        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
-        if (!protocol_->OpenAudioChannel()) {
-            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-            return false;
-        }
-    }
+    if (!protocol_->IsAudioChannelOpened()) return false;
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
     const bool health = event.metadata.count("health_kind") != 0;
@@ -2209,13 +2254,32 @@ void Application::RecordProactiveSendResult(bool success) {
 void Application::CheckProactiveEvents() {
     const auto now = std::time(nullptr);
     bool changed = false;
+    if (proactive_save_pending_ && proactive_save_backoff_.Ready(esp_timer_get_time())) {
+        TrySaveProactive("scheduled retry");
+    }
+    if (!pending_health_events_.empty() &&
+        health_enqueue_backoff_.Ready(esp_timer_get_time())) {
+        try {
+            auto evicted = proactive_queue_.Push(pending_health_events_.front());
+            if (evicted) {
+                ESP_LOGW(TAG, "Evicted proactive event id=%s for retried health event",
+                         evicted->event_id.c_str());
+            }
+            pending_health_events_.pop_front();
+            health_enqueue_backoff_.OnSuccess();
+            changed = true;
+        } catch (const std::exception& error) {
+            ESP_LOGE(TAG, "Health event retry still blocked: %s", error.what());
+            health_enqueue_backoff_.OnFailure(esp_timer_get_time());
+        }
+    }
     if (has_server_time_.load()) {
         const auto mode_before_refresh = proactive_manager_.config().mode;
         proactive::Event date_refresh{"date-refresh", "maintenance",
             proactive::Priority::kLow, "refresh local date", now, now,
             "date-refresh", false, {}};
         proactive_manager_.ShouldDeliver(date_refresh, now, true);
-        changed = mode_before_refresh != proactive_manager_.config().mode;
+        changed = mode_before_refresh != proactive_manager_.config().mode || changed;
         if (network_connected_.load()) {
             if (auto recovered = health_tracker_.Recover("network_flapping", now)) {
                 QueueHealthEvent(*recovered);
@@ -2231,8 +2295,8 @@ void Application::CheckProactiveEvents() {
         }
     }
     changed = schedule_follow_ups_.DropExpired(now) > 0 || changed;
-    if (has_server_time_.load()) {
-        for (const auto& follow_up : schedule_follow_ups_.Due(now)) {
+    if (has_server_time_.load() && follow_up_enqueue_backoff_.Ready(esp_timer_get_time())) {
+        for (const auto& follow_up : schedule_follow_ups_.PendingDue(now)) {
             proactive::Event event{
                 "follow-up-" + std::to_string(follow_up.source_id) + "-" +
                     std::to_string(follow_up.due_at),
@@ -2240,8 +2304,21 @@ void Application::CheckProactiveEvents() {
                 "confirm reminder completion", now, follow_up.expires_at,
                 "follow-up:" + std::to_string(follow_up.source_id), true, {}};
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
-            proactive_queue_.Push(std::move(event));
-            changed = true;
+            try {
+                auto evicted = proactive_queue_.Push(event);
+                if (evicted) {
+                    ESP_LOGW(TAG, "Evicted proactive event id=%s for due follow-up",
+                             evicted->event_id.c_str());
+                }
+                schedule_follow_ups_.MarkAsked(follow_up.source_id, follow_up.due_at);
+                follow_up_enqueue_backoff_.OnSuccess();
+                changed = true;
+            } catch (const std::exception& error) {
+                ESP_LOGE(TAG, "Cannot enqueue due follow-up id=%lu: %s",
+                         static_cast<unsigned long>(follow_up.source_id), error.what());
+                follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
+                break;
+            }
         }
     }
     if (proactive_queue_.DropExpired(now) > 0) changed = true;
@@ -2297,7 +2374,7 @@ void Application::CheckProactiveEvents() {
             }
         }
     }
-    if (changed) SaveProactive();
+    if (changed) TrySaveProactive("proactive tick");
 }
 
 bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
@@ -2624,10 +2701,17 @@ std::string Application::ConfigureProactive(const std::string& mode, int daily_l
         start = proactive::Manager::ParseClock(quiet_start);
         end = proactive::Manager::ParseClock(quiet_end);
     }
+    const auto old_config = proactive_manager_.config();
+    const auto old_state = proactive_manager_.state();
     proactive_manager_.Configure(proactive::Manager::ParseMode(mode),
                                  daily_limit < 0 ? std::nullopt : std::optional<int>(daily_limit),
                                  start, end);
-    SaveProactive();
+    if (!TrySaveProactive("configure tool", true)) {
+        proactive_manager_.Restore(old_config, old_state);
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("主动配置保存失败，未应用修改");
+    }
     return ProactiveStatus();
 }
 
@@ -2661,47 +2745,88 @@ std::string Application::ProactiveStatus() {
 
 std::string Application::MuteProactiveToday(const std::string& scope) {
     if (scope != "today") throw std::invalid_argument("scope目前只支持today");
+    const auto old_config = proactive_manager_.config();
+    const auto old_state = proactive_manager_.state();
     proactive_manager_.MuteToday(std::time(nullptr), has_server_time_.load());
-    SaveProactive();
+    if (!TrySaveProactive("mute tool", true)) {
+        proactive_manager_.Restore(old_config, old_state);
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("今日静默保存失败，未应用修改");
+    }
     cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
     return ResponseEnvelope("今天已安静，明天自动恢复。", data);
 }
 
 std::string Application::AllowProactiveTopic(const std::string& topic) {
+    const auto old_config = proactive_manager_.config();
+    const auto old_state = proactive_manager_.state();
     proactive_manager_.AllowTopic(topic);
-    SaveProactive();
+    if (!TrySaveProactive("allow topic tool", true)) {
+        proactive_manager_.Restore(old_config, old_state);
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("主题允许规则保存失败，未应用修改");
+    }
     cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
     return ResponseEnvelope("已允许该主题。", data);
 }
 
 std::string Application::BlockProactiveTopic(const std::string& topic) {
+    const auto old_config = proactive_manager_.config();
+    const auto old_state = proactive_manager_.state();
     proactive_manager_.BlockTopic(topic);
-    SaveProactive();
+    if (!TrySaveProactive("block topic tool", true)) {
+        proactive_manager_.Restore(old_config, old_state);
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("主题屏蔽规则保存失败，未应用修改");
+    }
     cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
     return ResponseEnvelope("已屏蔽该主题。", data);
 }
 
 std::string Application::CompleteRecentSchedule() {
+    const auto old_follow_ups = schedule_follow_ups_.items();
+    const auto old_queue = proactive_queue_.items();
+    const auto old_pending = pending_proactive_event_;
     const auto completed = schedule_follow_ups_.CompleteRecent(std::time(nullptr));
     const std::string dedupe_key = "follow-up:" + std::to_string(completed.source_id);
     proactive_queue_.RemoveByDedupeKey(dedupe_key);
     if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
         pending_proactive_event_.reset();
     }
-    SaveProactive();
+    if (!TrySaveProactive("complete recent tool", true)) {
+        schedule_follow_ups_.Restore(old_follow_ups);
+        proactive_queue_.Restore(old_queue);
+        pending_proactive_event_ = old_pending;
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("完成状态保存失败，未应用修改");
+    }
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", completed.source_id);
     return ResponseEnvelope("好的，已记为完成。", data);
 }
 
 std::string Application::FollowUpRecentSchedule(int minutes) {
+    const auto old_follow_ups = schedule_follow_ups_.items();
+    const auto old_queue = proactive_queue_.items();
+    const auto old_pending = pending_proactive_event_;
     const auto delayed = schedule_follow_ups_.DelayRecent(minutes, std::time(nullptr));
     const std::string dedupe_key = "follow-up:" + std::to_string(delayed.source_id);
     proactive_queue_.RemoveByDedupeKey(dedupe_key);
     if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
         pending_proactive_event_.reset();
     }
-    SaveProactive();
+    if (!TrySaveProactive("delay follow-up tool", true)) {
+        schedule_follow_ups_.Restore(old_follow_ups);
+        proactive_queue_.Restore(old_queue);
+        pending_proactive_event_ = old_pending;
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("延后确认保存失败，未应用修改");
+    }
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", delayed.source_id);
     cJSON_AddNumberToObject(data, "due_at", delayed.due_at);
@@ -2709,13 +2834,23 @@ std::string Application::FollowUpRecentSchedule(int minutes) {
 }
 
 std::string Application::DismissScheduleFollowUp() {
+    const auto old_follow_ups = schedule_follow_ups_.items();
+    const auto old_queue = proactive_queue_.items();
+    const auto old_pending = pending_proactive_event_;
     const auto dismissed = schedule_follow_ups_.DismissRecent(std::time(nullptr));
     const std::string dedupe_key = "follow-up:" + std::to_string(dismissed.source_id);
     proactive_queue_.RemoveByDedupeKey(dedupe_key);
     if (pending_proactive_event_ && pending_proactive_event_->dedupe_key == dedupe_key) {
         pending_proactive_event_.reset();
     }
-    SaveProactive();
+    if (!TrySaveProactive("dismiss follow-up tool", true)) {
+        schedule_follow_ups_.Restore(old_follow_ups);
+        proactive_queue_.Restore(old_queue);
+        pending_proactive_event_ = old_pending;
+        proactive_save_pending_ = false;
+        proactive_save_backoff_.OnSuccess();
+        throw std::runtime_error("取消确认保存失败，未应用修改");
+    }
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", dismissed.source_id);
     return ResponseEnvelope("好的，不再追问。", data);

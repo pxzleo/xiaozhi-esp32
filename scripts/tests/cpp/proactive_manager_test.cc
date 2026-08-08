@@ -86,20 +86,21 @@ void TestFollowUpLifecycleAndRecovery() {
     store.Schedule(42, "吃药", now - 30, now);
     assert(store.items()[0].source_triggered_at == now - 30);
     assert(store.items()[0].due_at == now + 600);
-    assert(store.Due(now + 599).empty());
-    auto due = store.Due(now + 600);
-    assert(due.size() == 1 && due[0].source_id == 42 && due[0].asked);
-    assert(store.Due(now + 601).empty());  // 最多追问一次。
+    assert(store.PendingDue(now + 599).empty());
+    auto due = store.PendingDue(now + 600);
+    assert(due.size() == 1 && due[0].source_id == 42 && !due[0].asked);
+    store.MarkAsked(due[0].source_id, due[0].due_at);
+    assert(store.PendingDue(now + 601).empty());  // 最多追问一次。
     store.DelayRecent(15, now + 601);
-    assert(store.Due(now + 1500).empty());
-    assert(store.Due(now + 1501).size() == 1);
+    assert(store.PendingDue(now + 1500).empty());
+    assert(store.PendingDue(now + 1501).size() == 1);
     assert(store.CompleteRecent(now + 1502).source_id == 42);
     assert(store.items().empty());
 
     store.Schedule(7, "关窗", now, now);
     FollowUpStore restored;
     restored.Restore(store.items());
-    assert(restored.Due(now + 600).size() == 1);
+    assert(restored.PendingDue(now + 600).size() == 1);
     store.Schedule(8, "喝水", now + 1, now + 1);
     assert(store.DismissRecent(now + 2).source_id == 8);
     assert(store.DismissRecent(now + 2).source_id == 7);
@@ -117,7 +118,7 @@ void TestFollowUpLifecycleAndRecovery() {
 
     FollowUpStore expired;
     expired.Schedule(9, "过期", now, now);
-    assert(expired.Due(now + 901).empty());
+    assert(expired.PendingDue(now + 901).empty());
     assert(expired.items().empty());
 }
 
@@ -185,6 +186,48 @@ void TestPersistentCapacityLimits() {
         queue.Push(std::move(event));
     } catch (const std::runtime_error&) { queue_full = true; }
     assert(queue_full);
+
+    DurableQueue priority_queue;
+    for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
+        auto low = Suggestion("low-" + std::to_string(i), "low", now);
+        low.priority = Priority::kLow;
+        low.dedupe_key = low.event_id;
+        priority_queue.Push(std::move(low));
+    }
+    Event critical{"critical-capacity", "health_critical", Priority::kCritical,
+                   "critical", now, now + 60, "critical-capacity", false, {}};
+    auto evicted = priority_queue.Push(critical);
+    assert(evicted && evicted->priority == Priority::kLow);
+    assert(priority_queue.items().size() == DurableQueue::kMaxItems);
+
+    DurableQueue protected_queue;
+    for (size_t i = 0; i < DurableQueue::kMaxItems; ++i) {
+        Event protected_event{"protected-" + std::to_string(i), "health_critical",
+            Priority::kCritical, "protected", now, now + 60,
+            "protected-" + std::to_string(i), false, {}};
+        if (i == 0) protected_event.metadata["recovered"] = "true";
+        protected_queue.Push(std::move(protected_event));
+    }
+    bool ordinary_rejected = false;
+    try {
+        auto ordinary = Suggestion("ordinary", "ordinary", now);
+        ordinary.dedupe_key = ordinary.event_id;
+        protected_queue.Push(std::move(ordinary));
+    } catch (const std::runtime_error&) { ordinary_rejected = true; }
+    assert(ordinary_rejected && protected_queue.items().size() == DurableQueue::kMaxItems);
+
+    FollowUpStore transactional;
+    transactional.Schedule(200, "事务追问", now, now);
+    const auto pending = transactional.PendingDue(now + 600);
+    assert(pending.size() == 1 && !transactional.items()[0].asked);
+    bool enqueue_failed = false;
+    try {
+        auto follow_up = Suggestion("follow-up-full", "follow_up", now);
+        follow_up.priority = Priority::kLow;
+        follow_up.dedupe_key = "follow-up:200";
+        priority_queue.Push(std::move(follow_up));
+    } catch (const std::runtime_error&) { enqueue_failed = true; }
+    assert(enqueue_failed && !transactional.items()[0].asked);
 }
 
 int main() {

@@ -90,6 +90,15 @@ class ScheduleManagerTest(unittest.TestCase):
             "if (pending_proactive_event_ && audio_service_.IsPlaybackIdle())", 1
         )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]
         self.assertIn("SendProactiveEvent(event)", drained)
+        send_proactive = application.split("bool Application::SendProactiveEvent", 1)[1]
+        send_proactive = send_proactive.split("std::string Application::FindFollowUpLabel", 1)[0]
+        self.assertIn("protocol_->IsAudioChannelOpened()", send_proactive)
+        self.assertNotIn("OpenAudioChannel", send_proactive)
+        self.assertIn("PendingDue(now)", proactive_check)
+        self.assertLess(
+            proactive_check.index("proactive_queue_.Push(event)"),
+            proactive_check.index("schedule_follow_ups_.MarkAsked"),
+        )
         self.assertIn("LoadProactive()", application)
         self.assertIn("SaveProactive()", application)
         self.assertIn("time_unsynchronized", application)
@@ -101,6 +110,10 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("kMaxSerializedBytes = 3600", application)
         self.assertIn("nvs_get_stats(nullptr, &nvs_stats)", application)
         self.assertIn("kNvsSafetyEntries = 16", application)
+        self.assertIn("TrySaveProactive", application)
+        self.assertIn("proactive_save_pending_ = true", application)
+        self.assertIn("未应用修改", application)
+        self.assertEqual(application.count("SaveProactive();"), 1)
         self.assertIn("recovered_health ||", application)
         health_queue = application.split("void Application::QueueHealthEvent", 1)[1]
         health_queue = health_queue.split("bool Application::SendProactiveEvent", 1)[0]
