@@ -17,7 +17,33 @@ Service::Service(Client& client, Scheduler& scheduler, Observer& observer)
 Service::~Service() { scheduler_.Cancel(); }
 
 std::string Service::StartLogin() {
-    if (state_ == FlowState::kWaitingForAuthorization) {
+    const bool waiting_for_authorization = state_ == FlowState::kWaitingForAuthorization;
+    auto login_status = client_.GetLoginStatus();
+    if (!login_status.ok) {
+        if (waiting_for_authorization) {
+            const std::string message =
+                "暂时无法查询网易云音乐登录状态，当前二维码仍然有效，正在继续查询。";
+            observer_.UpdateQrStatus(message);
+            observer_.ShowMessage(message);
+            return message;
+        }
+        state_ = FlowState::kRetryableError;
+        const std::string message = "暂时无法查询网易云音乐登录状态，请检查网络后重试。";
+        observer_.ShowMessage(message);
+        return message;
+    }
+    if (login_status.value == LoginStatus::kLoggedIn) {
+        ++generation_;
+        scheduler_.Cancel();
+        observer_.ClearQrImage();
+        session_ = {};
+        expires_at_ms_ = 0;
+        state_ = FlowState::kLoggedIn;
+        const std::string message = "网易云音乐当前已登录，无需重复扫码。";
+        observer_.ShowMessage(message);
+        return message;
+    }
+    if (waiting_for_authorization) {
         const std::string message = "网易云音乐登录二维码已显示，请扫码确认。";
         observer_.ShowMessage(message);
         return message;
@@ -26,20 +52,6 @@ std::string Service::StartLogin() {
     ++generation_;
     scheduler_.Cancel();
     observer_.ClearQrImage();
-
-    auto login_status = client_.GetLoginStatus();
-    if (!login_status.ok) {
-        state_ = FlowState::kRetryableError;
-        const std::string message = "暂时无法查询网易云音乐登录状态，请检查网络后重试。";
-        observer_.ShowMessage(message);
-        return message;
-    }
-    if (login_status.value == LoginStatus::kLoggedIn) {
-        state_ = FlowState::kLoggedIn;
-        const std::string message = "网易云音乐当前已登录，无需重复扫码。";
-        observer_.ShowMessage(message);
-        return message;
-    }
 
     auto created = client_.CreateLoginSession();
     if (!created.ok || created.value.session_id.empty() || created.value.qr_image_url.empty() ||

@@ -14,7 +14,20 @@ class NeteaseMusicServiceTest(unittest.TestCase):
         source = (ROOT / "main" / "mcp_server.cc").read_text(encoding="utf-8")
         self.assertIn('"self.netease_music.login"', source)
         self.assertIn('"self.netease_music.logout"', source)
-        self.assertIn("我要登录网易云音乐", source)
+        login_description = source.split('"self.netease_music.login"', 1)[1].split(
+            "PropertyList()", 1
+        )[0]
+        for requirement in (
+            "我要登录网易云音乐",
+            "查询当前登录状态",
+            "会员权益",
+            "必须调用本工具核实",
+            "不得猜测",
+            "歌曲下载失败",
+            "版权限制",
+            "设备通用状态",
+        ):
+            self.assertIn(requirement, login_description)
         self.assertIn("退出网易云音乐", source)
 
     def test_manager_api_client_is_wired_with_device_auth(self):

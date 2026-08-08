@@ -108,7 +108,24 @@ void TestQrPersistsThroughPendingAndNetworkFailureUntilSuccess() {
     assert(observer.visible && scheduler.callback);
     const int status_calls = client.status_calls;
     assert(service.StartLogin().find("已显示") != std::string::npos);
-    assert(client.status_calls == status_calls && client.create_calls == 1);
+    assert(client.status_calls == status_calls + 1 && client.create_calls == 1);
+
+    client.login = Result<LoginStatus>::Failure("offline");
+    assert(service.StartLogin().find("仍然有效") != std::string::npos);
+    assert(client.status_calls == status_calls + 2 && client.create_calls == 1);
+    assert(observer.visible && scheduler.callback);
+
+    client.login = Result<LoginStatus>::Success(LoginStatus::kLoggedIn);
+    assert(service.StartLogin().find("已登录") != std::string::npos);
+    assert(client.status_calls == status_calls + 3 && client.create_calls == 1);
+    assert(!observer.visible && !scheduler.callback);
+    assert(service.state() == FlowState::kLoggedIn);
+
+    client.login = Result<LoginStatus>::Success(LoginStatus::kLoggedOut);
+    Service polling_service(client, scheduler, observer);
+    observer.visible = false;
+    assert(polling_service.StartLogin().find("扫描") != std::string::npos);
+    assert(observer.visible && scheduler.callback);
 
     scheduler.Run();
     assert(observer.visible && scheduler.callback);
@@ -117,7 +134,7 @@ void TestQrPersistsThroughPendingAndNetworkFailureUntilSuccess() {
     assert(observer.qr_status.find("仍然有效") != std::string::npos);
     scheduler.Run();
     assert(!observer.visible && !scheduler.callback);
-    assert(service.state() == FlowState::kLoggedIn);
+    assert(polling_service.state() == FlowState::kLoggedIn);
     assert(observer.voice.find("登录成功") != std::string::npos);
 }
 

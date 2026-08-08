@@ -166,9 +166,9 @@ void McpServer::AddCommonTools() {
     auto& netease_music_service = netease_music::GetDeviceService();
     AddTool(
         "self.netease_music.login",
-        "Log in to NetEase Cloud Music on this device. Use this tool when the user says "
-        "'我要登录网易云音乐' or otherwise explicitly asks to log in. The tool always checks "
-        "the current server-side login status first; speak its returned Chinese message verbatim.",
+        "登录网易云音乐或查询当前登录状态。用户说‘我要登录网易云音乐’、询问是否已登录、表示自己有会员权益，"
+        "或需要判断歌曲不可播放是否与账号登录有关时，必须调用本工具核实。工具会先查询服务端权威状态；"
+        "不得猜测账号未登录，也不得把歌曲下载失败、版权限制或设备通用状态当作登录证据。请原样播报工具返回的中文结果。",
         PropertyList(),
         [&netease_music_service](const PropertyList&) -> ReturnValue {
             return netease_music_service.StartLogin();

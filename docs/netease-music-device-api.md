@@ -6,6 +6,15 @@ same short-lived device identity used by the OTA/WebSocket flow: `Device-Id`, `C
 OTA-issued `Authorization: Bearer ...` token. No NetEase account password, Cookie, refresh token,
 access token, or other long-lived credential may be returned to or persisted by the device.
 
+`self.netease_music.login` is also the authoritative login-status query. The conversation must call
+it before answering whether the account is logged in, when the user says the account has membership
+rights, or when deciding whether an unplayable song is caused by login state. Download failures,
+missing audio URLs, copyright restrictions, and membership restrictions must not be used on their
+own to claim that the account is logged out; generic device status is not a substitute for this query.
+The status endpoint is queried even while a QR session is already waiting for authorization. If the
+server reports that authorization has completed before the next polling tick, the device closes the
+QR page and returns the logged-in result; a status-query failure keeps the existing QR session alive.
+
 ## Required operations
 
 All operations are device-scoped and use the manager-api routes below.
