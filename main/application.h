@@ -200,7 +200,7 @@ private:
     proactive::RetryBackoff proactive_save_backoff_;
     proactive::RetryBackoff follow_up_enqueue_backoff_;
     bool proactive_save_pending_ = false;
-    std::atomic<bool> proactive_connection_running_{false};
+    std::atomic<bool> proactive_connection_busy_{false};
     std::atomic<bool> proactive_shutdown_{false};
     std::shared_ptr<std::atomic<bool>> proactive_shutdown_token_ =
         std::make_shared<std::atomic<bool>>(false);
@@ -246,7 +246,7 @@ private:
     void RecordProactiveSendResult(bool success);
     bool StartProactiveConnectionWorker();
     bool IsProactiveConnectionBusy() const {
-        return proactive_connection_task_handle_ != nullptr;
+        return proactive_connection_busy_.load(std::memory_order_acquire);
     }
     void ProactiveConnectionTask(uint32_t protocol_generation);
     void FinishProactiveConnection(bool success, uint32_t protocol_generation);

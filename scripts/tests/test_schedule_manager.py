@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import tempfile
@@ -9,6 +10,79 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduleManagerTest(unittest.TestCase):
+    def test_maximum_proactive_state_fits_persistence_budget(self):
+        topic = lambda index: f"topic-{index}-" + "x" * 56
+        config = {
+            "mode": "aggressive",
+            "mode_before_silent": "aggressive",
+            "silent_date": 20260808,
+            "daily_limit": 5,
+            "quiet_start": 1439,
+            "quiet_end": 1439,
+            "allowed_topics": [topic(i) for i in range(4)],
+            "blocked_topics": [topic(i) for i in range(4, 8)],
+            "budget_date": 20260808,
+            "delivered_today": 5,
+            "last_delivered": {topic(i): 1786159999 for i in range(8)},
+        }
+        follow_ups = [
+            {
+                "source_id": i + 1,
+                "label": "最" * 80,
+                "source_triggered_at": 1786159000 + i,
+                "due_at": 1786159600 + i,
+                "expires_at": 1786159900 + i,
+                "asked": True,
+            }
+            for i in range(4)
+        ]
+        kinds = ("network_flapping", "time_unsynchronized",
+                 "ota_update_available", "audio_decode_failed")
+        health = {
+            kind: {
+                "active": True,
+                "last_changed_at": 1786159000 + index,
+                "dedupe_key": f"health:{kind}",
+            }
+            for index, kind in enumerate(kinds)
+        }
+
+        def event(event_id, event_topic, priority, dedupe_key, metadata):
+            return {
+                "event_id": event_id,
+                "topic": event_topic,
+                "priority": priority,
+                "reason": "device health recovered" if metadata.get("recovered") == "true"
+                          else "confirm reminder completion",
+                "created_at": 1786159000,
+                "expires_at": 1786245400,
+                "dedupe_key": dedupe_key,
+                "requires_response": "source_id" in metadata,
+                "metadata": metadata,
+            }
+
+        queue = [
+            event(f"{kind}:recovered:1786159000", "health", "normal",
+                  f"health:{kind}", {
+                      "health_kind": kind,
+                      "severity": "info",
+                      "recovered": "true",
+                      "detail.error_code": "-2147483648",
+                      "detail.version": "v" + "9" * 63,
+                  })
+            for kind in kinds
+        ]
+        queue += [
+            event(f"follow-up-{i + 1}-1786159600", "follow_up", "high",
+                  f"follow-up:{i + 1}", {"source_id": str(i + 1), "cue_played": "true"})
+            for i in range(4)
+        ]
+        state = {"config": config, "follow_ups": follow_ups,
+                 "health": health, "queue": queue}
+        encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertGreater(len(encoded), 3600)
+        self.assertLess(len(encoded), 7200)
+
     def test_host_schedule_core(self):
         if not shutil.which("g++"):
             self.skipTest("a host C++ compiler is unavailable")
@@ -108,11 +182,10 @@ class ScheduleManagerTest(unittest.TestCase):
         worker = application.split("void Application::ProactiveConnectionTask", 1)[1]
         worker = worker.split("void Application::CheckProactiveEvents", 1)[0]
         self.assertIn("protocol_->OpenAudioChannel()", worker)
-        self.assertIn("proactive_connection_running_.store(false)", worker)
+        worker_task = worker.split("void Application::FinishProactiveConnection", 1)[0]
+        self.assertNotIn("proactive_connection_busy_.store(false", worker_task)
         self.assertIn('"proactive_conn", 4096 * 2, this, 11', application)
         self.assertLess(worker.index("Schedule([this, shutdown_token"),
-                        worker.index("xSemaphoreGive(proactive_connection_done_)"))
-        self.assertLess(worker.index("proactive_connection_running_.store(false)"),
                         worker.index("xSemaphoreGive(proactive_connection_done_)"))
         finish = application.split("void Application::FinishProactiveConnection", 1)[1]
         finish = finish.split("void Application::CheckProactiveEvents", 1)[0]
@@ -120,11 +193,13 @@ class ScheduleManagerTest(unittest.TestCase):
             finish.index("xSemaphoreTake(proactive_connection_done_"),
             finish.index("proactive_connection_task_handle_ = nullptr"),
         )
+        self.assertLess(finish.index("proactive_connection_task_handle_ = nullptr"),
+                        finish.index("proactive_connection_busy_.store(false"))
         self.assertNotIn("Schedule([this", finish)
         self.assertIn("proactive_finish_pending_ = true", finish)
         destructor = application.split("Application::~Application()", 1)[1]
         destructor = destructor.split("bool Application::SetDeviceState", 1)[0]
-        self.assertIn("if (proactive_connection_task_handle_ != nullptr)", destructor)
+        self.assertIn("proactive_connection_busy_.load(std::memory_order_acquire)", destructor)
         self.assertIn("xSemaphoreTake(proactive_connection_done_, portMAX_DELAY)", destructor)
         self.assertIn("deferred_bits | MAIN_EVENT_CLOCK_TICK", finish)
         for method in ("ContinueOpenAudioChannel", "ContinueWakeWordInvoke",
@@ -143,7 +218,7 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("active_schedule_task_.trigger_at, now", application)
         self.assertIn("proactive_retry_backoff_.Ready", application)
         self.assertIn("RecordProactiveSendResult", application)
-        self.assertIn("kMaxSerializedBytes = 3600", application)
+        self.assertIn("kMaxSerializedBytes = 7200", application)
         self.assertIn("nvs_get_stats(nullptr, &nvs_stats)", application)
         self.assertIn("kNvsSafetyEntries = 16", application)
         self.assertIn("TrySaveProactive", application)

@@ -425,9 +425,9 @@ Application::Application() {
 Application::~Application() {
     proactive_shutdown_.store(true);
     proactive_shutdown_token_->store(true);
-    if (proactive_connection_task_handle_ != nullptr) {
+    if (proactive_connection_busy_.load(std::memory_order_acquire)) {
         xSemaphoreTake(proactive_connection_done_, portMAX_DELAY);
-        proactive_connection_running_.store(false);
+        proactive_connection_busy_.store(false, std::memory_order_release);
     }
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
@@ -2010,7 +2010,7 @@ void Application::LoadProactive() {
     Settings settings("proactive");
     std::string saved;
     const int chunk_count = settings.GetInt("chunks", 0);
-    if (chunk_count < 0 || chunk_count > 3) throw std::runtime_error("NVS中的主动状态分片数无效");
+    if (chunk_count < 0 || chunk_count > 4) throw std::runtime_error("NVS中的主动状态分片数无效");
     for (int i = 0; i < chunk_count; ++i) {
         const auto chunk = settings.GetString("data" + std::to_string(i));
         if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
@@ -2152,12 +2152,12 @@ void Application::SaveProactive() const {
     }
     const std::string saved = JsonString(root);
     static constexpr size_t kChunkSize = 1800;
-    static constexpr size_t kMaxSerializedBytes = 3600;
+    static constexpr size_t kMaxSerializedBytes = 7200;
     if (saved.size() > kMaxSerializedBytes) {
-        throw std::runtime_error("主动状态超过3600字节持久化预算");
+        throw std::runtime_error("主动状态超过7200字节持久化预算");
     }
     const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
-    if (chunk_count > 3) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    if (chunk_count > 4) throw std::runtime_error("主动状态JSON超过NVS容量限制");
     nvs_stats_t nvs_stats{};
     const esp_err_t stats_error = nvs_get_stats(nullptr, &nvs_stats);
     if (stats_error != ESP_OK) throw std::runtime_error("无法读取NVS剩余容量");
@@ -2324,7 +2324,10 @@ bool Application::StartProactiveConnectionWorker() {
         return false;
     }
     bool expected = false;
-    if (!proactive_connection_running_.compare_exchange_strong(expected, true)) {
+    // StartProactiveConnectionWorker and destruction both run on the main task,
+    // so destruction cannot enter between this busy publication and xTaskCreate.
+    if (!proactive_connection_busy_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
         return false;
     }
     xSemaphoreTake(proactive_connection_done_, 0);
@@ -2337,7 +2340,7 @@ bool Application::StartProactiveConnectionWorker() {
         "proactive_conn", 4096 * 2, this, 11, &proactive_connection_task_handle_);
     if (result != pdPASS) {
         proactive_connection_task_handle_ = nullptr;
-        proactive_connection_running_.store(false);
+        proactive_connection_busy_.store(false, std::memory_order_release);
         RecordProactiveSendResult(false);
         ESP_LOGE(TAG, "Failed to create proactive connection worker");
         return false;
@@ -2359,8 +2362,8 @@ void Application::ProactiveConnectionTask(uint32_t protocol_generation) {
             }
         });
     }
-    proactive_connection_running_.store(false);
-    // This must remain the worker's final access to Application state. The task
+    // busy remains true until the main-task Finish callback consumes this
+    // signal. This Give is the worker's final Application access; the task
     // entry only calls vTaskDelete after this method returns.
     xSemaphoreGive(proactive_connection_done_);
 }
@@ -2375,6 +2378,7 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     }
     proactive_finish_pending_ = false;
     proactive_connection_task_handle_ = nullptr;
+    proactive_connection_busy_.store(false, std::memory_order_release);
     if (protocol_generation == proactive_protocol_generation_) {
         RecordProactiveSendResult(success);
     }

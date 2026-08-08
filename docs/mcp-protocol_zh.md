@@ -339,4 +339,4 @@ sequenceDiagram
 
 `severity` 只允许 `info/warning/critical`；`details` 由设备为每类事件生成受控字段，不含 URL 凭证、令牌或网络密码。恢复通知沿用同一 `dedupe_key` 且 `recovered=true`。设备持久保存活动去重状态和待发送 follow-up/health 队列；通道不可用不丢失事件，下一次可用时重试。
 
-离线重试采用 5 秒到 5 分钟的指数退避；音频通道由高于主任务优先级的单 FreeRTOS worker 自动建立，主任务不调用 `OpenAudioChannel`。worker 完成全部 Application 访问后清运行标记，以完成信号 Give 作为最后一次访问；主线程用非空 task handle 保持协议独占并作为析构无条件等待依据，Finish 取到信号后才清 handle。外部唤醒词始终携带具体字符串调度到主线程。健康事件只接受 network/time/OTA/audio 四类 kind，保留 info/normal、warning/high、critical/critical 映射；活动与恢复按 dedupe key 在统一 8 项主队列中替换，同级优先保留健康，满载时淘汰非 critical 的非健康事件。主动状态 NVS 序列化预算为 3600 字节，不再保存重复健康溢出队列，超限明确失败并退避重试。
+离线重试采用 5 秒到 5 分钟的指数退避；音频通道由高于主任务优先级的单 FreeRTOS worker 自动建立，主任务不调用 `OpenAudioChannel`。独立原子 busy 在任务创建前发布，并在 worker Give 完成信号前始终为 true；Give 是 worker 最后一次 Application 访问，Finish 取到信号后才由主线程清 busy/handle，析构看到 busy 就无条件等待。外部唤醒词始终携带具体字符串调度到主线程。健康事件只接受 network/time/OTA/audio 四类 kind，活动与恢复按 dedupe key 在统一 8 项主队列中替换。主动状态 NVS 序列化预算为 4×1800=7200 字节，覆盖完整合法状态并保留 entry 预检；真实 NVS 故障明确告警并退避重试。
