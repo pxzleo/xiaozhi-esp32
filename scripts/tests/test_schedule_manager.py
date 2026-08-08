@@ -33,6 +33,22 @@ class ScheduleManagerTest(unittest.TestCase):
             )
             subprocess.run([str(executable)], check=True)
 
+    def test_host_proactive_core(self):
+        if not shutil.which("g++"):
+            self.skipTest("a host C++ compiler is unavailable")
+        source = ROOT / "main" / "proactive" / "proactive_manager.cc"
+        test = ROOT / "scripts" / "tests" / "cpp" / "proactive_manager_test.cc"
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "proactive_manager_test"
+            subprocess.run(
+                [
+                    "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    f"-I{source.parent}", str(source), str(test), "-o", str(executable),
+                ],
+                check=True,
+            )
+            subprocess.run([str(executable)], check=True)
+
     def test_device_integration_contract(self):
         application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
         mcp = (ROOT / "main" / "mcp_server.cc").read_text(encoding="utf-8")
@@ -55,6 +71,34 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("speak", application)
         for tool in ("create", "list", "delete", "clear", "stop", "snooze"):
             self.assertIn(f'"self.schedule.{tool}"', mcp)
+        for tool in ("complete_recent", "follow_up", "dismiss_follow_up"):
+            self.assertIn(f'"self.schedule.{tool}"', mcp)
+        for tool in ("configure", "status", "mute", "allow_topic", "block_topic"):
+            self.assertIn(f'"self.proactive.{tool}"', mcp)
+        self.assertIn("不要先说‘我来处理一下’", mcp)
+        self.assertIn('"notifications/schedule/follow_up"', application)
+        self.assertIn('"notifications/device/health"', application)
+        self.assertIn('"follow_up", true', application)
+        self.assertIn('"source_id"', application)
+        proactive_check = application.split("void Application::CheckProactiveEvents()", 1)[1]
+        proactive_check = proactive_check.split("bool Application::NotifyReminderTriggered", 1)[0]
+        self.assertLess(
+            proactive_check.index("pending_proactive_event_ = std::move(*event)"),
+            proactive_check.index("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)"),
+        )
+        drained = application.split(
+            "if (pending_proactive_event_ && audio_service_.IsPlaybackIdle())", 1
+        )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]
+        self.assertIn("SendProactiveEvent(event)", drained)
+        self.assertIn("LoadProactive()", application)
+        self.assertIn("SaveProactive()", application)
+        self.assertIn("time_unsynchronized", application)
+        self.assertIn("network_flapping", application)
+        self.assertIn("ota_update_available", application)
+        audio_h = (ROOT / "main" / "audio" / "audio_service.h").read_text(encoding="utf-8")
+        audio_cc = (ROOT / "main" / "audio" / "audio_service.cc").read_text(encoding="utf-8")
+        self.assertIn("on_critical_error", audio_h)
+        self.assertIn("audio_decode_failed", audio_cc)
         self.assertGreaterEqual(
             mcp.count('Property("kind", kPropertyTypeString, std::string("all"))'), 2
         )

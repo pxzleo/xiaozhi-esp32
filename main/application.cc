@@ -19,6 +19,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -197,6 +198,99 @@ cJSON* ScheduleTaskJson(const schedule::Task& task) {
     return json;
 }
 
+const char* PriorityName(proactive::Priority priority) {
+    switch (priority) {
+        case proactive::Priority::kLow: return "low";
+        case proactive::Priority::kNormal: return "normal";
+        case proactive::Priority::kHigh: return "high";
+        case proactive::Priority::kCritical: return "critical";
+    }
+    throw std::invalid_argument("未知主动事件优先级");
+}
+
+proactive::Priority ParsePriority(const char* value) {
+    if (strcmp(value, "low") == 0) return proactive::Priority::kLow;
+    if (strcmp(value, "normal") == 0) return proactive::Priority::kNormal;
+    if (strcmp(value, "high") == 0) return proactive::Priority::kHigh;
+    if (strcmp(value, "critical") == 0) return proactive::Priority::kCritical;
+    throw std::invalid_argument("NVS中的主动事件优先级无效");
+}
+
+cJSON* ProactiveEventJson(const proactive::Event& event) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "event_id", event.event_id.c_str());
+    cJSON_AddStringToObject(json, "topic", event.topic.c_str());
+    cJSON_AddStringToObject(json, "priority", PriorityName(event.priority));
+    cJSON_AddStringToObject(json, "reason", event.reason.c_str());
+    cJSON_AddNumberToObject(json, "created_at", event.created_at);
+    cJSON_AddNumberToObject(json, "expires_at", event.expires_at);
+    cJSON_AddStringToObject(json, "dedupe_key", event.dedupe_key.c_str());
+    cJSON_AddBoolToObject(json, "requires_response", event.requires_response);
+    cJSON* metadata = cJSON_AddObjectToObject(json, "metadata");
+    for (const auto& [key, value] : event.metadata) {
+        cJSON_AddStringToObject(metadata, key.c_str(), value.c_str());
+    }
+    return json;
+}
+
+proactive::Event ParseProactiveEvent(cJSON* json) {
+    auto event_id = cJSON_GetObjectItem(json, "event_id");
+    auto topic = cJSON_GetObjectItem(json, "topic");
+    auto priority = cJSON_GetObjectItem(json, "priority");
+    auto reason = cJSON_GetObjectItem(json, "reason");
+    auto created_at = cJSON_GetObjectItem(json, "created_at");
+    auto expires_at = cJSON_GetObjectItem(json, "expires_at");
+    auto dedupe_key = cJSON_GetObjectItem(json, "dedupe_key");
+    auto requires_response = cJSON_GetObjectItem(json, "requires_response");
+    auto metadata = cJSON_GetObjectItem(json, "metadata");
+    if (!cJSON_IsString(event_id) || !cJSON_IsString(topic) || !cJSON_IsString(priority) ||
+        !cJSON_IsString(reason) || !cJSON_IsNumber(created_at) ||
+        !cJSON_IsNumber(expires_at) || !cJSON_IsString(dedupe_key) ||
+        !cJSON_IsBool(requires_response) || !cJSON_IsObject(metadata)) {
+        throw std::runtime_error("NVS中的主动事件字段无效");
+    }
+    proactive::Event event{event_id->valuestring, topic->valuestring,
+                           ParsePriority(priority->valuestring), reason->valuestring,
+                           static_cast<std::time_t>(created_at->valuedouble),
+                           static_cast<std::time_t>(expires_at->valuedouble),
+                           dedupe_key->valuestring, cJSON_IsTrue(requires_response), {}};
+    cJSON* entry = nullptr;
+    cJSON_ArrayForEach(entry, metadata) {
+        if (!cJSON_IsString(entry)) throw std::runtime_error("NVS中的主动事件metadata无效");
+        event.metadata[entry->string] = entry->valuestring;
+    }
+    return event;
+}
+
+cJSON* ProactiveConfigJson(const proactive::Config& config,
+                           const proactive::RuntimeState& state) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "mode", proactive::Manager::ModeName(config.mode));
+    cJSON_AddStringToObject(json, "mode_before_silent",
+                            proactive::Manager::ModeName(config.mode_before_silent));
+    cJSON_AddNumberToObject(json, "silent_date", config.silent_date);
+    cJSON_AddNumberToObject(json, "daily_limit", config.daily_limit);
+    if (config.quiet_start) {
+        cJSON_AddNumberToObject(json, "quiet_start", *config.quiet_start);
+        cJSON_AddNumberToObject(json, "quiet_end", *config.quiet_end);
+    }
+    cJSON* allowed = cJSON_AddArrayToObject(json, "allowed_topics");
+    for (const auto& topic : config.allowed_topics) {
+        cJSON_AddItemToArray(allowed, cJSON_CreateString(topic.c_str()));
+    }
+    cJSON* blocked = cJSON_AddArrayToObject(json, "blocked_topics");
+    for (const auto& topic : config.blocked_topics) {
+        cJSON_AddItemToArray(blocked, cJSON_CreateString(topic.c_str()));
+    }
+    cJSON_AddNumberToObject(json, "budget_date", state.budget_date);
+    cJSON_AddNumberToObject(json, "delivered_today", state.delivered_today);
+    cJSON* cooldowns = cJSON_AddObjectToObject(json, "last_delivered");
+    for (const auto& [topic, timestamp] : state.last_delivered) {
+        cJSON_AddNumberToObject(cooldowns, topic.c_str(), timestamp);
+    }
+    return json;
+}
+
 std::string ResponseEnvelope(const std::string& response, cJSON* data) {
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "action", "RESPONSE");
@@ -343,6 +437,20 @@ void Application::Initialize() {
     callbacks.on_playback_drained = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     };
+    callbacks.on_critical_error = [this](const std::string& kind, int error_code,
+                                         bool recovered) {
+        Schedule([this, kind, error_code, recovered]() {
+            if (recovered) {
+                if (auto event = health_tracker_.Recover(kind, std::time(nullptr))) {
+                    QueueHealthEvent(*event);
+                }
+            } else if (auto event = health_tracker_.Raise(
+                           kind, proactive::Severity::kCritical, std::time(nullptr),
+                           {{"error_code", std::to_string(error_code)}})) {
+                QueueHealthEvent(*event);
+            }
+        });
+    };
     callbacks.on_pcm_rendered = [this](uint32_t generation, size_t samples,
                                        uint32_t sample_rate, size_t buffered_samples) {
         auto update = netease_lyrics_.OnPcmRendered(generation, samples, sample_rate,
@@ -375,6 +483,20 @@ void Application::Initialize() {
         settings.EraseKey("tasks");
         for (int i = 0; i < 8; ++i) settings.EraseKey("data" + std::to_string(i));
         schedule_manager_.Restore({}, 1);
+    }
+    try {
+        LoadProactive();
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "Failed to load proactive state; quarantining damaged data: %s",
+                 error.what());
+        Settings settings("proactive", true);
+        settings.SetString("last_error", error.what());
+        settings.SetInt("chunks", 0);
+        for (int i = 0; i < 8; ++i) settings.EraseKey("data" + std::to_string(i));
+        proactive_manager_.Restore({}, {});
+        schedule_follow_ups_.Restore({});
+        health_tracker_.Restore({});
+        proactive_queue_.Restore({});
     }
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
@@ -516,6 +638,17 @@ void Application::Run() {
                 pending_listening_start_ = false;
                 StartListeningAudio();
             }
+            if (pending_proactive_event_ && audio_service_.IsPlaybackIdle()) {
+                auto event = std::move(*pending_proactive_event_);
+                pending_proactive_event_.reset();
+                if (SendProactiveEvent(event)) {
+                    proactive_manager_.RecordDelivered(
+                        event, std::time(nullptr), has_server_time_.load());
+                } else {
+                    proactive_queue_.Push(std::move(event));
+                }
+                SaveProactive();
+            }
         }
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
@@ -578,6 +711,7 @@ void Application::Run() {
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
             CheckSchedules();
+            CheckProactiveEvents();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -593,6 +727,11 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    if (has_server_time_.load()) {
+        if (auto recovered = health_tracker_.Recover("network_flapping", std::time(nullptr))) {
+            QueueHealthEvent(*recovered);
+        }
+    }
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -619,6 +758,20 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    if (has_server_time_.load()) {
+        const auto now = std::time(nullptr);
+        network_disconnects_.push_back(now);
+        while (!network_disconnects_.empty() && now - network_disconnects_.front() > 300) {
+            network_disconnects_.pop_front();
+        }
+        if (network_disconnects_.size() >= 3) {
+            if (auto event = health_tracker_.Raise(
+                    "network_flapping", proactive::Severity::kWarning, now,
+                    {{"disconnects_in_5m", std::to_string(network_disconnects_.size())}})) {
+                QueueHealthEvent(*event);
+            }
+        }
+    }
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
@@ -639,6 +792,11 @@ void Application::HandleActivationDoneEvent() {
     SetDeviceState(kDeviceStateIdle);
 
     has_server_time_ = ota_->HasServerTime();
+    if (has_server_time_.load()) {
+        if (auto recovered = health_tracker_.Recover("time_unsynchronized", std::time(nullptr))) {
+            QueueHealthEvent(*recovered);
+        }
+    }
 
     auto display = Board::GetInstance().GetDisplay();
     std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
@@ -774,6 +932,14 @@ void Application::CheckNewVersion() {
         retry_delay = 10;  // Reset retry delay
 
         if (ota_->HasNewVersion()) {
+            const std::string firmware_version = ota_->GetFirmwareVersion();
+            Schedule([this, firmware_version]() {
+                if (auto event = health_tracker_.Raise(
+                        "ota_update_available", proactive::Severity::kInfo,
+                        std::time(nullptr), {{"version", firmware_version}})) {
+                    QueueHealthEvent(*event);
+                }
+            });
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
                 return;  // This line will never be reached after reboot
             }
@@ -905,6 +1071,20 @@ void Application::InitializeProtocol() {
                             active_schedule_task_.kind == schedule::Kind::kAlarm) {
                             ShowScheduleAlertPage();
                         } else if (schedule_alert_active_) {
+                            if (active_schedule_task_.kind == schedule::Kind::kReminder) {
+                                const auto now = std::time(nullptr);
+                                proactive::Event follow_up{
+                                    "follow-up-policy-" + std::to_string(active_schedule_task_.id),
+                                    "follow_up", proactive::Priority::kNormal,
+                                    "confirm reminder completion", now, now + 900,
+                                    "follow-up:" + std::to_string(active_schedule_task_.id), true, {}};
+                                if (proactive_manager_.ShouldDeliver(
+                                        follow_up, now, has_server_time_.load())) {
+                                    schedule_follow_ups_.Schedule(active_schedule_task_.id,
+                                                                 active_schedule_task_.label, now);
+                                    SaveProactive();
+                                }
+                            }
                             FinishScheduleAlert();
                         }
                         listening_mode_ = GetDefaultListeningMode();
@@ -1712,6 +1892,285 @@ void Application::SaveSchedules() const {
     settings.EraseKey("tasks");
 }
 
+void Application::LoadProactive() {
+    Settings settings("proactive");
+    std::string saved;
+    const int chunk_count = settings.GetInt("chunks", 0);
+    if (chunk_count < 0 || chunk_count > 8) throw std::runtime_error("NVS中的主动状态分片数无效");
+    for (int i = 0; i < chunk_count; ++i) {
+        const auto chunk = settings.GetString("data" + std::to_string(i));
+        if (chunk.empty()) throw std::runtime_error("NVS中的主动状态分片缺失");
+        saved += chunk;
+    }
+    if (saved.empty()) {
+        proactive_manager_.Restore({}, {});
+        return;
+    }
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(saved.c_str()), cJSON_Delete);
+    auto config_json = cJSON_GetObjectItem(root.get(), "config");
+    auto follow_ups = cJSON_GetObjectItem(root.get(), "follow_ups");
+    auto health = cJSON_GetObjectItem(root.get(), "health");
+    auto queue = cJSON_GetObjectItem(root.get(), "queue");
+    if (!cJSON_IsObject(root.get()) || !cJSON_IsObject(config_json) ||
+        !cJSON_IsArray(follow_ups) || !cJSON_IsObject(health) || !cJSON_IsArray(queue)) {
+        throw std::runtime_error("NVS中的主动状态JSON损坏");
+    }
+    auto mode = cJSON_GetObjectItem(config_json, "mode");
+    auto previous_mode = cJSON_GetObjectItem(config_json, "mode_before_silent");
+    auto silent_date = cJSON_GetObjectItem(config_json, "silent_date");
+    auto daily_limit = cJSON_GetObjectItem(config_json, "daily_limit");
+    auto allowed = cJSON_GetObjectItem(config_json, "allowed_topics");
+    auto blocked = cJSON_GetObjectItem(config_json, "blocked_topics");
+    auto budget_date = cJSON_GetObjectItem(config_json, "budget_date");
+    auto delivered = cJSON_GetObjectItem(config_json, "delivered_today");
+    auto cooldowns = cJSON_GetObjectItem(config_json, "last_delivered");
+    if (!cJSON_IsString(mode) || !cJSON_IsString(previous_mode) ||
+        !cJSON_IsNumber(silent_date) || !cJSON_IsNumber(daily_limit) ||
+        !cJSON_IsArray(allowed) || !cJSON_IsArray(blocked) ||
+        !cJSON_IsNumber(budget_date) || !cJSON_IsNumber(delivered) ||
+        !cJSON_IsObject(cooldowns)) {
+        throw std::runtime_error("NVS中的主动配置字段无效");
+    }
+    proactive::Config config;
+    config.mode = proactive::Manager::ParseMode(mode->valuestring);
+    config.mode_before_silent = proactive::Manager::ParseMode(previous_mode->valuestring);
+    config.silent_date = silent_date->valueint;
+    config.daily_limit = daily_limit->valueint;
+    auto quiet_start = cJSON_GetObjectItem(config_json, "quiet_start");
+    auto quiet_end = cJSON_GetObjectItem(config_json, "quiet_end");
+    if ((quiet_start == nullptr) != (quiet_end == nullptr) ||
+        (quiet_start && (!cJSON_IsNumber(quiet_start) || !cJSON_IsNumber(quiet_end)))) {
+        throw std::runtime_error("NVS中的安静时段无效");
+    }
+    if (quiet_start) {
+        config.quiet_start = quiet_start->valueint;
+        config.quiet_end = quiet_end->valueint;
+    }
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, allowed) {
+        if (!cJSON_IsString(item)) throw std::runtime_error("NVS中的允许主题无效");
+        config.allowed_topics.insert(item->valuestring);
+    }
+    cJSON_ArrayForEach(item, blocked) {
+        if (!cJSON_IsString(item)) throw std::runtime_error("NVS中的屏蔽主题无效");
+        config.blocked_topics.insert(item->valuestring);
+    }
+    proactive::RuntimeState runtime;
+    runtime.budget_date = budget_date->valueint;
+    runtime.delivered_today = delivered->valueint;
+    cJSON_ArrayForEach(item, cooldowns) {
+        if (!cJSON_IsNumber(item)) throw std::runtime_error("NVS中的主题冷却无效");
+        runtime.last_delivered[item->string] = static_cast<std::time_t>(item->valuedouble);
+    }
+    proactive_manager_.Restore(std::move(config), std::move(runtime));
+
+    std::vector<proactive::FollowUp> restored_follow_ups;
+    cJSON_ArrayForEach(item, follow_ups) {
+        auto source_id = cJSON_GetObjectItem(item, "source_id");
+        auto label = cJSON_GetObjectItem(item, "label");
+        auto triggered_at = cJSON_GetObjectItem(item, "source_triggered_at");
+        auto due_at = cJSON_GetObjectItem(item, "due_at");
+        auto expires_at = cJSON_GetObjectItem(item, "expires_at");
+        auto asked = cJSON_GetObjectItem(item, "asked");
+        if (!cJSON_IsNumber(source_id) || !cJSON_IsString(label) ||
+            !cJSON_IsNumber(triggered_at) || !cJSON_IsNumber(due_at) ||
+            !cJSON_IsNumber(expires_at) || !cJSON_IsBool(asked)) {
+            throw std::runtime_error("NVS中的追问字段无效");
+        }
+        restored_follow_ups.push_back({static_cast<uint32_t>(source_id->valuedouble),
+            label->valuestring, static_cast<std::time_t>(triggered_at->valuedouble),
+            static_cast<std::time_t>(due_at->valuedouble),
+            static_cast<std::time_t>(expires_at->valuedouble), cJSON_IsTrue(asked)});
+    }
+    schedule_follow_ups_.Restore(std::move(restored_follow_ups));
+
+    std::map<std::string, proactive::HealthTracker::Record> health_records;
+    cJSON_ArrayForEach(item, health) {
+        auto active = cJSON_GetObjectItem(item, "active");
+        auto changed = cJSON_GetObjectItem(item, "last_changed_at");
+        auto dedupe = cJSON_GetObjectItem(item, "dedupe_key");
+        if (!cJSON_IsObject(item) || !cJSON_IsBool(active) || !cJSON_IsNumber(changed) ||
+            !cJSON_IsString(dedupe)) throw std::runtime_error("NVS中的健康去重字段无效");
+        health_records[item->string] = {cJSON_IsTrue(active),
+            static_cast<std::time_t>(changed->valuedouble), dedupe->valuestring};
+    }
+    health_tracker_.Restore(std::move(health_records));
+    std::vector<proactive::Event> queued;
+    cJSON_ArrayForEach(item, queue) queued.push_back(ParseProactiveEvent(item));
+    proactive_queue_.Restore(std::move(queued));
+}
+
+void Application::SaveProactive() const {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "config",
+        ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state()));
+    cJSON* follow_ups = cJSON_AddArrayToObject(root, "follow_ups");
+    for (const auto& follow_up : schedule_follow_ups_.items()) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "source_id", follow_up.source_id);
+        cJSON_AddStringToObject(item, "label", follow_up.label.c_str());
+        cJSON_AddNumberToObject(item, "source_triggered_at", follow_up.source_triggered_at);
+        cJSON_AddNumberToObject(item, "due_at", follow_up.due_at);
+        cJSON_AddNumberToObject(item, "expires_at", follow_up.expires_at);
+        cJSON_AddBoolToObject(item, "asked", follow_up.asked);
+        cJSON_AddItemToArray(follow_ups, item);
+    }
+    cJSON* health = cJSON_AddObjectToObject(root, "health");
+    for (const auto& [kind, record] : health_tracker_.records()) {
+        cJSON* item = cJSON_AddObjectToObject(health, kind.c_str());
+        cJSON_AddBoolToObject(item, "active", record.active);
+        cJSON_AddNumberToObject(item, "last_changed_at", record.last_changed_at);
+        cJSON_AddStringToObject(item, "dedupe_key", record.dedupe_key.c_str());
+    }
+    cJSON* queue = cJSON_AddArrayToObject(root, "queue");
+    for (const auto& event : proactive_queue_.items()) {
+        cJSON_AddItemToArray(queue, ProactiveEventJson(event));
+    }
+    if (pending_proactive_event_) {
+        cJSON_AddItemToArray(queue, ProactiveEventJson(*pending_proactive_event_));
+    }
+    const std::string saved = JsonString(root);
+    static constexpr size_t kChunkSize = 1800;
+    const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
+    if (chunk_count > 8) throw std::runtime_error("主动状态JSON超过NVS容量限制");
+    Settings settings("proactive", true);
+    const int old_count = settings.GetInt("chunks", 0);
+    settings.SetInt("chunks", chunk_count);
+    for (int i = 0; i < chunk_count; ++i) {
+        settings.SetString("data" + std::to_string(i), saved.substr(i * kChunkSize, kChunkSize));
+    }
+    for (int i = chunk_count; i < old_count && i < 8; ++i) {
+        settings.EraseKey("data" + std::to_string(i));
+    }
+}
+
+void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
+    auto event = health.event;
+    event.metadata["health_kind"] = health.kind;
+    event.metadata["severity"] = proactive::HealthTracker::SeverityName(health.severity);
+    event.metadata["recovered"] = health.recovered ? "true" : "false";
+    for (const auto& [key, value] : health.details) {
+        event.metadata["detail." + key] = value;
+    }
+    if (!has_server_time_.load()) event.expires_at = 0;
+    proactive_queue_.Push(std::move(event));
+    Board::GetInstance().GetDisplay()->ShowNotification(
+        health.recovered ? "设备状态已恢复" : "检测到设备健康事件", 5000);
+    SaveProactive();
+}
+
+bool Application::SendProactiveEvent(const proactive::Event& event) {
+    if (protocol_ == nullptr) return false;
+    if (!protocol_->IsAudioChannelOpened()) {
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        if (!protocol_->OpenAudioChannel()) {
+            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            return false;
+        }
+    }
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    const bool health = event.metadata.count("health_kind") != 0;
+    const bool follow_up = event.metadata.count("source_id") != 0;
+    cJSON_AddStringToObject(root, "method", health ? "notifications/device/health" :
+                            (follow_up ? "notifications/schedule/follow_up" :
+                                         "notifications/assistant/proactive"));
+    cJSON* params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddNumberToObject(params, "version", 1);
+    cJSON_AddStringToObject(params, "event_id", event.event_id.c_str());
+    cJSON_AddStringToObject(params, "topic", event.topic.c_str());
+    cJSON_AddStringToObject(params, "priority", PriorityName(event.priority));
+    cJSON_AddStringToObject(params, "reason", event.reason.c_str());
+    cJSON_AddNumberToObject(params, "created_at", event.created_at);
+    cJSON_AddNumberToObject(params, "expires_at", event.expires_at);
+    cJSON_AddStringToObject(params, "dedupe_key", event.dedupe_key.c_str());
+    cJSON_AddBoolToObject(params, "requires_response", event.requires_response);
+    if (follow_up) {
+        cJSON_AddBoolToObject(params, "follow_up", true);
+        cJSON_AddNumberToObject(params, "source_id",
+                                std::strtoul(event.metadata.at("source_id").c_str(), nullptr, 10));
+        cJSON_AddStringToObject(params, "label", event.metadata.at("label").c_str());
+        cJSON_AddBoolToObject(params, "speak", true);
+    }
+    if (health) {
+        cJSON_AddStringToObject(params, "kind", event.metadata.at("health_kind").c_str());
+        cJSON_AddStringToObject(params, "severity", event.metadata.at("severity").c_str());
+        cJSON_AddNumberToObject(params, "occurred_at", event.created_at);
+        cJSON_AddBoolToObject(params, "recovered",
+                              event.metadata.at("recovered") == "true");
+        cJSON* details = cJSON_AddObjectToObject(params, "details");
+        for (const auto& [key, value] : event.metadata) {
+            if (key.rfind("detail.", 0) == 0) {
+                cJSON_AddStringToObject(details, key.substr(7).c_str(), value.c_str());
+            }
+        }
+    }
+    return protocol_->SendMcpMessage(JsonString(root));
+}
+
+void Application::CheckProactiveEvents() {
+    const auto now = std::time(nullptr);
+    bool changed = false;
+    if (has_server_time_.load()) {
+        const auto mode_before_refresh = proactive_manager_.config().mode;
+        proactive::Event date_refresh{"date-refresh", "maintenance",
+            proactive::Priority::kLow, "refresh local date", now, now,
+            "date-refresh", false, {}};
+        proactive_manager_.ShouldDeliver(date_refresh, now, true);
+        changed = mode_before_refresh != proactive_manager_.config().mode;
+    }
+    if (!has_server_time_.load() && clock_ticks_ >= 600 && !time_unsynced_health_reported_) {
+        time_unsynced_health_reported_ = true;
+        if (auto event = health_tracker_.Raise(
+                "time_unsynchronized", proactive::Severity::kWarning, now,
+                {{"uptime_seconds", std::to_string(clock_ticks_)}})) {
+            QueueHealthEvent(*event);
+        }
+    }
+    changed = schedule_follow_ups_.DropExpired(now) > 0 || changed;
+    if (has_server_time_.load()) {
+        for (const auto& follow_up : schedule_follow_ups_.Due(now)) {
+            proactive::Event event{
+                "follow-up-" + std::to_string(follow_up.source_id) + "-" +
+                    std::to_string(follow_up.due_at),
+                "follow_up", proactive::Priority::kHigh,
+                "confirm reminder completion", now, follow_up.expires_at,
+                "follow-up:" + std::to_string(follow_up.source_id), true, {}};
+            event.metadata["source_id"] = std::to_string(follow_up.source_id);
+            event.metadata["label"] = follow_up.label;
+            proactive_queue_.Push(std::move(event));
+            changed = true;
+        }
+    }
+    if (proactive_queue_.DropExpired(now) > 0) changed = true;
+    if (!pending_proactive_event_ && !schedule_alert_active_ &&
+        GetDeviceState() != kDeviceStateSpeaking) {
+        auto event = proactive_queue_.PopNext(now);
+        if (event) {
+            const bool health_event = event->metadata.count("health_kind") != 0;
+            if (!health_event &&
+                !proactive_manager_.ShouldDeliver(*event, now, has_server_time_.load())) {
+                proactive_queue_.Push(std::move(*event));
+            } else if (event->metadata.count("source_id") != 0) {
+                Board::GetInstance().GetDisplay()->ShowNotification(
+                    ("刚才提醒的" + event->metadata.at("label") + "完成了吗？").c_str(),
+                    10000);
+                pending_proactive_event_ = std::move(*event);
+                audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+                changed = true;
+            } else if (SendProactiveEvent(*event)) {
+                if (!health_event) {
+                    proactive_manager_.RecordDelivered(*event, now, has_server_time_.load());
+                }
+                changed = true;
+            } else {
+                proactive_queue_.Push(std::move(*event));
+            }
+        }
+    }
+    if (changed) SaveProactive();
+}
+
 bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
     if (protocol_ == nullptr) {
         ESP_LOGE(TAG, "Cannot deliver reminder notification: protocol is not initialized");
@@ -2022,6 +2481,100 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     cJSON_AddNumberToObject(data, "source_id", previous.id);
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(snoozed));
     return ResponseEnvelope("已延后" + std::to_string(minutes) + "分钟。", data);
+}
+
+std::string Application::ConfigureProactive(const std::string& mode, int daily_limit,
+                                            const std::string& quiet_start,
+                                            const std::string& quiet_end) {
+    if ((quiet_start.empty()) != (quiet_end.empty())) {
+        throw std::invalid_argument("quiet_start和quiet_end必须成对提供");
+    }
+    std::optional<int> start;
+    std::optional<int> end;
+    if (!quiet_start.empty()) {
+        start = proactive::Manager::ParseClock(quiet_start);
+        end = proactive::Manager::ParseClock(quiet_end);
+    }
+    proactive_manager_.Configure(proactive::Manager::ParseMode(mode),
+                                 daily_limit < 0 ? std::nullopt : std::optional<int>(daily_limit),
+                                 start, end);
+    SaveProactive();
+    return ProactiveStatus();
+}
+
+std::string Application::ProactiveStatus() {
+    const auto& config = proactive_manager_.config();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "mode", proactive::Manager::ModeName(config.mode));
+    cJSON_AddNumberToObject(data, "daily_limit", config.daily_limit);
+    cJSON_AddNumberToObject(data, "used_today", proactive_manager_.state().delivered_today);
+    if (config.quiet_start) {
+        cJSON_AddStringToObject(data, "quiet_start",
+            proactive::Manager::FormatClock(*config.quiet_start).c_str());
+        cJSON_AddStringToObject(data, "quiet_end",
+            proactive::Manager::FormatClock(*config.quiet_end).c_str());
+    } else {
+        cJSON_AddNullToObject(data, "quiet_start");
+        cJSON_AddNullToObject(data, "quiet_end");
+    }
+    cJSON* allowed = cJSON_AddArrayToObject(data, "allowed_topics");
+    for (const auto& topic : config.allowed_topics) {
+        cJSON_AddItemToArray(allowed, cJSON_CreateString(topic.c_str()));
+    }
+    cJSON* blocked = cJSON_AddArrayToObject(data, "blocked_topics");
+    for (const auto& topic : config.blocked_topics) {
+        cJSON_AddItemToArray(blocked, cJSON_CreateString(topic.c_str()));
+    }
+    return ResponseEnvelope("当前主动模式为" + std::string(proactive::Manager::ModeName(config.mode)) +
+                                "，每天最多" + std::to_string(config.daily_limit) + "次。",
+                            data);
+}
+
+std::string Application::MuteProactiveToday(const std::string& scope) {
+    if (scope != "today") throw std::invalid_argument("scope目前只支持today");
+    proactive_manager_.MuteToday(std::time(nullptr), has_server_time_.load());
+    SaveProactive();
+    cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
+    return ResponseEnvelope("今天已安静，明天自动恢复。", data);
+}
+
+std::string Application::AllowProactiveTopic(const std::string& topic) {
+    proactive_manager_.AllowTopic(topic);
+    SaveProactive();
+    cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
+    return ResponseEnvelope("已允许该主题。", data);
+}
+
+std::string Application::BlockProactiveTopic(const std::string& topic) {
+    proactive_manager_.BlockTopic(topic);
+    SaveProactive();
+    cJSON* data = ProactiveConfigJson(proactive_manager_.config(), proactive_manager_.state());
+    return ResponseEnvelope("已屏蔽该主题。", data);
+}
+
+std::string Application::CompleteRecentSchedule() {
+    const auto completed = schedule_follow_ups_.CompleteRecent(std::time(nullptr));
+    SaveProactive();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "source_id", completed.source_id);
+    return ResponseEnvelope("好的，已记为完成。", data);
+}
+
+std::string Application::FollowUpRecentSchedule(int minutes) {
+    const auto delayed = schedule_follow_ups_.DelayRecent(minutes, std::time(nullptr));
+    SaveProactive();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "source_id", delayed.source_id);
+    cJSON_AddNumberToObject(data, "due_at", delayed.due_at);
+    return ResponseEnvelope("好，" + std::to_string(minutes) + "分钟后再问。", data);
+}
+
+std::string Application::DismissScheduleFollowUp() {
+    const auto dismissed = schedule_follow_ups_.DismissRecent(std::time(nullptr));
+    SaveProactive();
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "source_id", dismissed.source_id);
+    return ResponseEnvelope("好的，不再追问。", data);
 }
 
 void Application::ResetProtocol() {

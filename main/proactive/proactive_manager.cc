@@ -1,0 +1,343 @@
+#include "proactive_manager.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <stdexcept>
+
+namespace proactive {
+namespace {
+
+int LocalDate(std::time_t now) {
+    std::tm local{};
+    if (localtime_r(&now, &local) == nullptr) throw std::runtime_error("无法读取本地日期");
+    return (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+}
+
+void ValidateTopic(const std::string& topic) {
+    if (topic.empty() || topic.size() > 64) {
+        throw std::invalid_argument("topic必须是1到64字节");
+    }
+}
+
+}  // namespace
+
+void Manager::Restore(Config config, RuntimeState state) {
+    const Mode effective_mode = config.mode == Mode::kTodaySilent ?
+        config.mode_before_silent : config.mode;
+    if (config.daily_limit < 0 || config.daily_limit > DefaultLimit(effective_mode)) {
+        throw std::invalid_argument("每日上限超过当前模式允许值");
+    }
+    if (config.quiet_start.has_value() != config.quiet_end.has_value()) {
+        throw std::invalid_argument("安静时段开始和结束必须成对");
+    }
+    if ((config.quiet_start && (*config.quiet_start < 0 || *config.quiet_start >= 1440)) ||
+        (config.quiet_end && (*config.quiet_end < 0 || *config.quiet_end >= 1440))) {
+        throw std::invalid_argument("安静时段超出一天范围");
+    }
+    config_ = std::move(config);
+    state_ = std::move(state);
+}
+
+void Manager::Configure(Mode mode, std::optional<int> daily_limit,
+                        std::optional<int> quiet_start, std::optional<int> quiet_end) {
+    if (mode == Mode::kTodaySilent) {
+        throw std::invalid_argument("today_silent只能通过mute工具设置");
+    }
+    if (quiet_start.has_value() != quiet_end.has_value()) {
+        throw std::invalid_argument("quiet_start和quiet_end必须成对提供");
+    }
+    if ((quiet_start && (*quiet_start < 0 || *quiet_start >= 1440)) ||
+        (quiet_end && (*quiet_end < 0 || *quiet_end >= 1440))) {
+        throw std::invalid_argument("安静时段超出一天范围");
+    }
+    const int limit = daily_limit.value_or(DefaultLimit(mode));
+    if (limit < 0 || limit > DefaultLimit(mode)) {
+        throw std::invalid_argument("daily_limit超过当前模式允许值");
+    }
+    config_.mode = mode;
+    config_.mode_before_silent = mode;
+    config_.silent_date = 0;
+    config_.daily_limit = limit;
+    if (quiet_start) {
+        config_.quiet_start = quiet_start;
+        config_.quiet_end = quiet_end;
+    }
+}
+
+void Manager::MuteToday(std::time_t now, bool time_valid) {
+    if (!time_valid) throw std::runtime_error("设备时间尚未同步，不能设置今天安静");
+    RefreshDate(now, true);
+    if (config_.mode != Mode::kTodaySilent) config_.mode_before_silent = config_.mode;
+    config_.mode = Mode::kTodaySilent;
+    config_.silent_date = LocalDate(now);
+}
+
+void Manager::AllowTopic(const std::string& topic) {
+    ValidateTopic(topic);
+    config_.blocked_topics.erase(topic);
+    config_.allowed_topics.insert(topic);
+}
+
+void Manager::BlockTopic(const std::string& topic) {
+    ValidateTopic(topic);
+    config_.allowed_topics.erase(topic);
+    config_.blocked_topics.insert(topic);
+}
+
+void Manager::RefreshDate(std::time_t now, bool time_valid) {
+    if (!time_valid) return;
+    const int date = LocalDate(now);
+    if (state_.budget_date != date) {
+        state_.budget_date = date;
+        state_.delivered_today = 0;
+    }
+    if (config_.mode == Mode::kTodaySilent && config_.silent_date != 0 &&
+        config_.silent_date != date) {
+        config_.mode = config_.mode_before_silent;
+        config_.silent_date = 0;
+    }
+}
+
+bool Manager::IsQuiet(std::time_t now) const {
+    if (!config_.quiet_start || !config_.quiet_end) return false;
+    std::tm local{};
+    if (localtime_r(&now, &local) == nullptr) return true;
+    const int minute = local.tm_hour * 60 + local.tm_min;
+    if (*config_.quiet_start == *config_.quiet_end) return true;
+    if (*config_.quiet_start < *config_.quiet_end) {
+        return minute >= *config_.quiet_start && minute < *config_.quiet_end;
+    }
+    return minute >= *config_.quiet_start || minute < *config_.quiet_end;
+}
+
+bool Manager::IsCritical(const Event& event) {
+    return event.priority == Priority::kCritical || event.topic == "alarm" ||
+        event.topic == "reminder" || event.topic == "health_critical";
+}
+
+bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid) {
+    RefreshDate(now, time_valid);
+    if (event.expires_at > 0 && event.expires_at < now) return false;
+    const bool critical = IsCritical(event);
+    if (!time_valid && !critical) return false;
+    if (config_.blocked_topics.count(event.topic) != 0) return false;
+    if (critical) return true;
+    if (config_.mode == Mode::kTodaySilent || config_.mode == Mode::kConservative) return false;
+    if (IsQuiet(now)) return false;
+    auto previous = state_.last_delivered.find(event.topic);
+    if (previous != state_.last_delivered.end() && now - previous->second < kCooldownSeconds) {
+        return false;
+    }
+    return state_.delivered_today < config_.daily_limit;
+}
+
+void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_valid) {
+    RefreshDate(now, time_valid);
+    state_.last_delivered[event.topic] = now;
+    if (time_valid && !IsCritical(event)) ++state_.delivered_today;
+}
+
+Mode Manager::ParseMode(const std::string& value) {
+    if (value == "conservative") return Mode::kConservative;
+    if (value == "active") return Mode::kActive;
+    if (value == "aggressive") return Mode::kAggressive;
+    if (value == "today_silent") return Mode::kTodaySilent;
+    throw std::invalid_argument("mode必须是conservative/active/aggressive/today_silent之一");
+}
+
+const char* Manager::ModeName(Mode mode) {
+    switch (mode) {
+        case Mode::kConservative: return "conservative";
+        case Mode::kActive: return "active";
+        case Mode::kAggressive: return "aggressive";
+        case Mode::kTodaySilent: return "today_silent";
+    }
+    throw std::invalid_argument("未知主动模式");
+}
+
+int Manager::DefaultLimit(Mode mode) {
+    if (mode == Mode::kConservative) return 0;
+    if (mode == Mode::kActive) return 3;
+    return 5;
+}
+
+int Manager::ParseClock(const std::string& value) {
+    int hour = -1, minute = -1;
+    char trailing = 0;
+    if (std::sscanf(value.c_str(), "%d:%d%c", &hour, &minute, &trailing) != 2 ||
+        value.size() != 5 || value[2] != ':' || hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59) {
+        throw std::invalid_argument("时间必须是HH:MM格式");
+    }
+    return hour * 60 + minute;
+}
+
+std::string Manager::FormatClock(int minutes) {
+    if (minutes < 0 || minutes >= 1440) throw std::invalid_argument("分钟数超出一天范围");
+    char buffer[6];
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes / 60, minutes % 60);
+    return buffer;
+}
+
+void FollowUpStore::Restore(std::vector<FollowUp> items) {
+    for (const auto& item : items) {
+        if (item.source_id == 0 || item.label.empty() || item.source_triggered_at <= 0 ||
+            item.due_at <= item.source_triggered_at || item.expires_at < item.due_at) {
+            throw std::invalid_argument("保存的追问字段无效");
+        }
+    }
+    items_ = std::move(items);
+}
+
+void FollowUpStore::Schedule(uint32_t source_id, const std::string& label,
+                             std::time_t triggered_at) {
+    if (source_id == 0 || label.empty() || triggered_at <= 0) {
+        throw std::invalid_argument("追问来源无效");
+    }
+    items_.erase(std::remove_if(items_.begin(), items_.end(),
+                                [source_id](const FollowUp& item) {
+                                    return item.source_id == source_id;
+                                }), items_.end());
+    items_.push_back({source_id, label, triggered_at,
+                      triggered_at + kDefaultDelaySeconds,
+                      triggered_at + kDefaultDelaySeconds + kLateGraceSeconds, false});
+}
+
+std::vector<FollowUp> FollowUpStore::Due(std::time_t now) {
+    DropExpired(now);
+    std::vector<FollowUp> result;
+    for (auto& item : items_) {
+        if (!item.asked && item.due_at <= now) {
+            item.asked = true;
+            result.push_back(item);
+        }
+    }
+    return result;
+}
+
+size_t FollowUpStore::FindRecent(std::time_t now) const {
+    size_t found = items_.size();
+    std::time_t latest = 0;
+    bool ambiguous = false;
+    for (size_t i = 0; i < items_.size(); ++i) {
+        if (items_[i].expires_at < now) continue;
+        if (items_[i].source_triggered_at > latest) {
+            found = i;
+            latest = items_[i].source_triggered_at;
+            ambiguous = false;
+        } else if (items_[i].source_triggered_at == latest) {
+            ambiguous = true;
+        }
+    }
+    if (found == items_.size()) throw std::runtime_error("当前没有未决的提醒确认");
+    if (ambiguous) throw std::runtime_error("有多个同一时间的未决提醒，请说明具体内容");
+    return found;
+}
+
+FollowUp FollowUpStore::CompleteRecent(std::time_t now) {
+    DropExpired(now);
+    const size_t index = FindRecent(now);
+    FollowUp result = items_[index];
+    items_.erase(items_.begin() + index);
+    return result;
+}
+
+FollowUp FollowUpStore::DelayRecent(int minutes, std::time_t now) {
+    if (minutes < 1 || minutes > 60) throw std::invalid_argument("分钟数必须在1到60之间");
+    DropExpired(now);
+    const size_t index = FindRecent(now);
+    items_[index].due_at = now + minutes * 60;
+    items_[index].expires_at = items_[index].due_at + kLateGraceSeconds;
+    items_[index].asked = false;
+    return items_[index];
+}
+
+FollowUp FollowUpStore::DismissRecent(std::time_t now) { return CompleteRecent(now); }
+
+size_t FollowUpStore::DropExpired(std::time_t now) {
+    const size_t before = items_.size();
+    items_.erase(std::remove_if(items_.begin(), items_.end(),
+                                [now](const FollowUp& item) { return item.expires_at < now; }),
+                 items_.end());
+    return before - items_.size();
+}
+
+void HealthTracker::Restore(std::map<std::string, Record> records) {
+    records_ = std::move(records);
+}
+
+std::optional<HealthEvent> HealthTracker::Raise(
+    const std::string& kind, Severity severity, std::time_t now,
+    std::map<std::string, std::string> details) {
+    ValidateTopic(kind);
+    auto& record = records_[kind];
+    if (record.active) return std::nullopt;
+    if (record.last_changed_at > 0 && now - record.last_changed_at < kCooldownSeconds) {
+        return std::nullopt;
+    }
+    if (record.dedupe_key.empty()) record.dedupe_key = "health:" + kind;
+    record.active = true;
+    record.last_changed_at = now;
+    const Priority priority = severity == Severity::kCritical ? Priority::kCritical :
+        (severity == Severity::kWarning ? Priority::kHigh : Priority::kNormal);
+    Event event{kind + ":" + std::to_string(now),
+                severity == Severity::kCritical ? "health_critical" : "health",
+                priority, "device health", now, now + 24 * 60 * 60,
+                record.dedupe_key, false, {}};
+    return HealthEvent{event, kind, severity, now, false, std::move(details)};
+}
+
+std::optional<HealthEvent> HealthTracker::Recover(const std::string& kind, std::time_t now) {
+    auto found = records_.find(kind);
+    if (found == records_.end() || !found->second.active) return std::nullopt;
+    found->second.active = false;
+    found->second.last_changed_at = now;
+    Event event{kind + ":recovered:" + std::to_string(now), "health", Priority::kNormal,
+                "device health recovered", now, now + 24 * 60 * 60,
+                found->second.dedupe_key, false, {}};
+    return HealthEvent{event, kind, Severity::kInfo, now, true, {}};
+}
+
+const char* HealthTracker::SeverityName(Severity severity) {
+    switch (severity) {
+        case Severity::kInfo: return "info";
+        case Severity::kWarning: return "warning";
+        case Severity::kCritical: return "critical";
+    }
+    throw std::invalid_argument("未知健康严重级别");
+}
+
+void DurableQueue::Restore(std::vector<Event> items) { items_ = std::move(items); }
+
+void DurableQueue::Push(Event event) {
+    if (event.event_id.empty() || event.topic.empty() || event.dedupe_key.empty()) {
+        throw std::invalid_argument("主动事件字段不完整");
+    }
+    auto found = std::find_if(items_.begin(), items_.end(), [&event](const Event& item) {
+        return item.event_id == event.event_id;
+    });
+    if (found == items_.end()) items_.push_back(std::move(event));
+}
+
+std::optional<Event> DurableQueue::PopNext(std::time_t now) {
+    DropExpired(now);
+    if (items_.empty()) return std::nullopt;
+    auto best = std::max_element(items_.begin(), items_.end(), [](const Event& left,
+                                                                  const Event& right) {
+        if (left.priority != right.priority) return left.priority < right.priority;
+        return left.created_at > right.created_at;
+    });
+    Event result = *best;
+    items_.erase(best);
+    return result;
+}
+
+size_t DurableQueue::DropExpired(std::time_t now) {
+    const size_t before = items_.size();
+    items_.erase(std::remove_if(items_.begin(), items_.end(), [now](const Event& item) {
+        return item.expires_at > 0 && item.expires_at < now;
+    }), items_.end());
+    return before - items_.size();
+}
+
+}  // namespace proactive

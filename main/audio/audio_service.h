@@ -85,6 +85,8 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_playback_drained;
     std::function<void(uint32_t lyrics_generation, size_t samples, uint32_t sample_rate,
                        size_t buffered_samples)> on_pcm_rendered;
+    std::function<void(const std::string& kind, int error_code, bool recovered)>
+        on_critical_error;
 };
 
 
@@ -188,6 +190,7 @@ private:
 
     bool audio_engine_initialized_ = false;
     bool voice_detected_ = false;
+    std::atomic<bool> decode_health_failed_{false};
 #if CONFIG_USE_DEVICE_AEC
     bool device_aec_enabled_ = true;
 #else

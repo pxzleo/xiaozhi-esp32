@@ -301,3 +301,40 @@ sequenceDiagram
 该通知通过共享 `Protocol::SendMcpMessage` 发送，因此 WebSocket 与 MQTT/UDP 使用相同语义。
 
 所有调度工具 envelope 中的 `response` 都必须是可直接向用户播报的权威结果，不能要求主模型再次读取 `data` 才能确认。创建和稍后提醒结果包含任务 id、规范化本地时间、重复规则与内容；查询会自然枚举这些字段或明确说明为空；删除、清空和停止结果包含具体 id、类型或数量。`data` 仍保留供结构化处理。
+
+### 主动策略与完成追踪工具
+
+- `self.proactive.configure(mode,daily_limit?,quiet_start?,quiet_end?)`：模式为 `conservative/active/aggressive`；安静时段必须成对使用 `HH:MM`。
+- `self.proactive.status`：返回规范化模式、上限、今日已用次数、安静时段及 allow/block topic。
+- `self.proactive.mute(scope=today)`：仅静默今天，本地次日恢复此前模式。
+- `self.proactive.allow_topic(topic)` / `self.proactive.block_topic(topic)`：更新主题规则。
+- `self.schedule.complete_recent`、`self.schedule.follow_up(minutes)`、`self.schedule.dismiss_follow_up`：完成、延后或取消最近唯一的提醒确认。
+
+这些工具的 `response` 是简短权威结论，`data` 是规范化配置或来源 id；“积极一点/更积极/少提醒/今天安静/每天最多 N 次/某主题不要再问”等自然语言应映射到相应工具，工具前不得先播报“我来处理一下”。
+
+完成确认通知使用 `notifications/schedule/follow_up`，`params` 至少含统一事件字段，以及 `version=1`、`follow_up=true`、`source_id`、`label`、`speak=true`。
+
+### 设备健康通知 v1
+
+`notifications/device/health` 的 `params` 包含：
+
+```json
+{
+  "version": 1,
+  "event_id": "network_flapping:1786150800",
+  "topic": "health",
+  "priority": "high",
+  "reason": "device health",
+  "created_at": 1786150800,
+  "expires_at": 1786237200,
+  "dedupe_key": "health:network_flapping",
+  "requires_response": false,
+  "kind": "network_flapping",
+  "severity": "warning",
+  "occurred_at": 1786150800,
+  "recovered": false,
+  "details": {"disconnects_in_5m": "3"}
+}
+```
+
+`severity` 只允许 `info/warning/critical`；`details` 由设备为每类事件生成受控字段，不含 URL 凭证、令牌或网络密码。恢复通知沿用同一 `dedupe_key` 且 `recovered=true`。设备持久保存活动去重状态和待发送 follow-up/health 队列；通道不可用不丢失事件，下一次可用时重试。

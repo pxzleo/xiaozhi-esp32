@@ -115,6 +115,53 @@ void McpServer::AddCommonTools() {
             [&app](const PropertyList& properties) -> ReturnValue {
                 return app.SnoozeScheduleAlert(properties["minutes"].value<int>());
             });
+    AddTool("self.schedule.complete_recent",
+            "用户明确说最近提醒的事情已完成、已处理时调用。取消最近且未过期的待确认；若存在同一时间的多个候选会明确报错，不能猜。直接调用，不要先说‘我来处理一下’。",
+            PropertyList(), [&app](const PropertyList&) -> ReturnValue {
+                return app.CompleteRecentSchedule();
+            });
+    AddTool("self.schedule.follow_up",
+            "用户主动要求稍后再确认最近提醒时调用，minutes为1到60。直接调用，不要先说‘我来处理一下’。",
+            PropertyList({Property("minutes", kPropertyTypeInteger, 10, 1, 60)}),
+            [&app](const PropertyList& properties) -> ReturnValue {
+                return app.FollowUpRecentSchedule(properties["minutes"].value<int>());
+            });
+    AddTool("self.schedule.dismiss_follow_up",
+            "用户明确表示不需要再追问最近提醒时调用。直接调用，不要先说‘我来处理一下’。",
+            PropertyList(), [&app](const PropertyList&) -> ReturnValue {
+                return app.DismissScheduleFollowUp();
+            });
+    AddTool("self.proactive.configure",
+            "配置设备主动程度。‘积极一点/更积极’用aggressive，‘少提醒’用conservative或active；daily_limit表示每天最多N次。quiet_start和quiet_end必须成对提供HH:MM，只有用户明确设置安静时段时才传。直接调用，不要先说‘我来处理一下’。",
+            PropertyList({Property("mode", kPropertyTypeString),
+                          Property("daily_limit", kPropertyTypeInteger, -1),
+                          Property("quiet_start", kPropertyTypeString, std::string()),
+                          Property("quiet_end", kPropertyTypeString, std::string())}),
+            [&app](const PropertyList& properties) -> ReturnValue {
+                return app.ConfigureProactive(properties["mode"].value<std::string>(),
+                                              properties["daily_limit"].value<int>(),
+                                              properties["quiet_start"].value<std::string>(),
+                                              properties["quiet_end"].value<std::string>());
+            });
+    AddTool("self.proactive.status", "查询设备当前主动模式、每日上限、安静时段和主题规则。直接调用，不要先说‘我来处理一下’。",
+            PropertyList(), [&app](const PropertyList&) -> ReturnValue {
+                return app.ProactiveStatus();
+            });
+    AddTool("self.proactive.mute", "用户说‘今天安静/今天别主动提醒’时调用，scope必须为today。直接调用，不要先说‘我来处理一下’。",
+            PropertyList({Property("scope", kPropertyTypeString, std::string("today"))}),
+            [&app](const PropertyList& properties) -> ReturnValue {
+                return app.MuteProactiveToday(properties["scope"].value<std::string>());
+            });
+    AddTool("self.proactive.allow_topic", "允许指定主动主题。直接调用，不要先说‘我来处理一下’。",
+            PropertyList({Property("topic", kPropertyTypeString)}),
+            [&app](const PropertyList& properties) -> ReturnValue {
+                return app.AllowProactiveTopic(properties["topic"].value<std::string>());
+            });
+    AddTool("self.proactive.block_topic", "用户说‘某主题不要再问/不要再提醒’时屏蔽该主题。直接调用，不要先说‘我来处理一下’。",
+            PropertyList({Property("topic", kPropertyTypeString)}),
+            [&app](const PropertyList& properties) -> ReturnValue {
+                return app.BlockProactiveTopic(properties["topic"].value<std::string>());
+            });
 
     auto& netease_music_service = netease_music::GetDeviceService();
     AddTool(

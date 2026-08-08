@@ -12,6 +12,7 @@
 #include <memory>
 #include <functional>
 #include <atomic>
+#include <optional>
 
 #include "protocol.h"
 #include "ota.h"
@@ -20,6 +21,7 @@
 #include "device_state_machine.h"
 #include "netease_music_lyrics.h"
 #include "schedule/schedule_manager.h"
+#include "proactive/proactive_manager.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -129,6 +131,16 @@ public:
     std::string StopScheduleAlert();
     bool TryStopScheduleAlert();
     std::string SnoozeScheduleAlert(int minutes);
+    std::string ConfigureProactive(const std::string& mode, int daily_limit,
+                                   const std::string& quiet_start,
+                                   const std::string& quiet_end);
+    std::string ProactiveStatus();
+    std::string MuteProactiveToday(const std::string& scope);
+    std::string AllowProactiveTopic(const std::string& topic);
+    std::string BlockProactiveTopic(const std::string& topic);
+    std::string CompleteRecentSchedule();
+    std::string FollowUpRecentSchedule(int minutes);
+    std::string DismissScheduleFollowUp();
     bool IsScheduleAlertActive() const { return schedule_alert_active_.load(); }
     
     /**
@@ -158,6 +170,11 @@ private:
     schedule::AlertQueue schedule_alert_queue_;
     schedule::ReminderDeliverySequence reminder_delivery_;
     schedule::Task active_schedule_task_;
+    proactive::Manager proactive_manager_;
+    proactive::FollowUpStore schedule_follow_ups_;
+    proactive::HealthTracker health_tracker_;
+    proactive::DurableQueue proactive_queue_;
+    std::optional<proactive::Event> pending_proactive_event_;
     std::atomic<bool> schedule_alert_active_{false};
     int64_t schedule_alert_deadline_us_ = 0;
     int64_t schedule_reminder_tts_deadline_us_ = 0;
@@ -173,6 +190,8 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    std::deque<std::time_t> network_disconnects_;
+    bool time_unsynced_health_reported_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -192,6 +211,11 @@ private:
     void ConfigureWakeWordForListening();
     void LoadSchedules();
     void SaveSchedules() const;
+    void LoadProactive();
+    void SaveProactive() const;
+    void CheckProactiveEvents();
+    void QueueHealthEvent(const proactive::HealthEvent& event);
+    bool SendProactiveEvent(const proactive::Event& event);
     void CheckSchedules();
     void StartNextScheduleAlert();
     void ShowScheduleAlertPage();

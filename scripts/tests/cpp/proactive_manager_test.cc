@@ -1,0 +1,146 @@
+#include "proactive_manager.h"
+
+#include <cassert>
+#include <cstdlib>
+#include <stdexcept>
+
+using namespace proactive;
+
+std::time_t At(int year, int month, int day, int hour, int minute = 0) {
+    std::tm value{};
+    value.tm_year = year - 1900;
+    value.tm_mon = month - 1;
+    value.tm_mday = day;
+    value.tm_hour = hour;
+    value.tm_min = minute;
+    value.tm_isdst = -1;
+    return std::mktime(&value);
+}
+
+Event Suggestion(std::string id, std::string topic, std::time_t now) {
+    return {std::move(id), std::move(topic), Priority::kNormal, "test", now,
+            now + 600, "suggestion", false, {}};
+}
+
+void TestModesBudgetDateAndTimeValidity() {
+    Manager manager;
+    assert(manager.config().mode == Mode::kAggressive);
+    assert(manager.config().daily_limit == 5);
+    const auto day = At(2026, 8, 8, 9);
+    assert(!manager.ShouldDeliver(Suggestion("0", "weather", day), day, false));
+    for (int i = 0; i < 5; ++i) {
+        auto event = Suggestion(std::to_string(i + 1), "topic" + std::to_string(i), day + i);
+        assert(manager.ShouldDeliver(event, day + i, true));
+        manager.RecordDelivered(event, day + i, true);
+    }
+    assert(!manager.ShouldDeliver(Suggestion("6", "sixth", day + 10), day + 10, true));
+    assert(manager.ShouldDeliver(Suggestion("7", "next", At(2026, 8, 9, 9)),
+                                 At(2026, 8, 9, 9), true));
+
+    manager.Configure(Mode::kActive, std::nullopt, std::nullopt, std::nullopt);
+    assert(manager.config().daily_limit == 3);
+    manager.Configure(Mode::kConservative, std::nullopt, std::nullopt, std::nullopt);
+    assert(!manager.ShouldDeliver(Suggestion("8", "weather", At(2026, 8, 10, 9)),
+                                  At(2026, 8, 10, 9), true));
+    Event critical{"9", "health", Priority::kCritical, "critical health", day,
+                   day + 60, "health-critical", false, {}};
+    assert(manager.ShouldDeliver(critical, day, false));
+}
+
+void TestQuietMuteTopicAndCooldown() {
+    Manager manager;
+    const auto day = At(2026, 8, 8, 22, 30);
+    manager.Configure(Mode::kAggressive, 5, 22 * 60, 7 * 60);
+    assert(!manager.ShouldDeliver(Suggestion("1", "weather", day), day, true));
+    assert(manager.ShouldDeliver(Suggestion("2", "weather", At(2026, 8, 9, 8)),
+                                 At(2026, 8, 9, 8), true));
+    manager.BlockTopic("weather");
+    assert(!manager.ShouldDeliver(Suggestion("3", "weather", At(2026, 8, 9, 9)),
+                                  At(2026, 8, 9, 9), true));
+    manager.AllowTopic("weather");
+    auto first = Suggestion("4", "weather", At(2026, 8, 9, 9));
+    assert(manager.ShouldDeliver(first, first.created_at, true));
+    manager.RecordDelivered(first, first.created_at, true);
+    assert(!manager.ShouldDeliver(Suggestion("5", "weather", first.created_at + 60),
+                                  first.created_at + 60, true));
+
+    manager.MuteToday(At(2026, 8, 9, 10), true);
+    assert(manager.config().mode == Mode::kTodaySilent);
+    assert(!manager.ShouldDeliver(Suggestion("6", "other", At(2026, 8, 9, 11)),
+                                  At(2026, 8, 9, 11), true));
+    assert(manager.ShouldDeliver(Suggestion("7", "other", At(2026, 8, 10, 8)),
+                                 At(2026, 8, 10, 8), true));
+    assert(manager.config().mode == Mode::kAggressive);
+}
+
+void TestFollowUpLifecycleAndRecovery() {
+    FollowUpStore store;
+    const auto now = At(2026, 8, 8, 9);
+    store.Schedule(42, "吃药", now);
+    assert(store.Due(now + 599).empty());
+    auto due = store.Due(now + 600);
+    assert(due.size() == 1 && due[0].source_id == 42 && due[0].asked);
+    assert(store.Due(now + 601).empty());  // 最多追问一次。
+    store.DelayRecent(15, now + 601);
+    assert(store.Due(now + 1500).empty());
+    assert(store.Due(now + 1501).size() == 1);
+    assert(store.CompleteRecent(now + 1502).source_id == 42);
+    assert(store.items().empty());
+
+    store.Schedule(7, "关窗", now);
+    FollowUpStore restored;
+    restored.Restore(store.items());
+    assert(restored.Due(now + 600).size() == 1);
+    store.Schedule(8, "喝水", now + 1);
+    assert(store.DismissRecent(now + 2).source_id == 8);
+    assert(store.DismissRecent(now + 2).source_id == 7);
+    bool no_recent = false;
+    try { store.DismissRecent(now + 2); } catch (const std::runtime_error&) { no_recent = true; }
+    assert(no_recent);
+
+    FollowUpStore ambiguous;
+    ambiguous.Schedule(10, "甲", now);
+    ambiguous.Schedule(11, "乙", now);
+    bool ambiguity_reported = false;
+    try { ambiguous.CompleteRecent(now + 1); }
+    catch (const std::runtime_error&) { ambiguity_reported = true; }
+    assert(ambiguity_reported && ambiguous.items().size() == 2);
+
+    FollowUpStore expired;
+    expired.Schedule(9, "过期", now);
+    assert(expired.Due(now + 901).empty());
+    assert(expired.items().empty());
+}
+
+void TestHealthDedupRecoveryAndQueueOrdering() {
+    HealthTracker health;
+    const auto now = At(2026, 8, 8, 9);
+    auto raised = health.Raise("network_flapping", Severity::kWarning, now,
+                               {{"disconnects", "3"}});
+    assert(raised && raised->event.topic == "health");
+    assert(!health.Raise("network_flapping", Severity::kWarning, now + 1, {}));
+    auto recovered = health.Recover("network_flapping", now + 2);
+    assert(recovered && recovered->event.dedupe_key == raised->event.dedupe_key);
+    assert(!health.Recover("network_flapping", now + 3));
+    assert(!health.Raise("network_flapping", Severity::kWarning, now + 4, {}));
+    assert(health.Raise("network_flapping", Severity::kWarning, now + 1803, {}));
+
+    DurableQueue queue;
+    queue.Push(Suggestion("normal", "tip", now));
+    Event alarm{"alarm", "alarm", Priority::kCritical, "alarm", now + 1,
+                now + 60, "alarm-1", true, {}};
+    queue.Push(alarm);
+    assert(queue.PopNext(now + 1)->event_id == "alarm");
+    queue.Push(Suggestion("expired", "tip", now - 1000));
+    assert(queue.DropExpired(now + 1) == 1);
+}
+
+int main() {
+    setenv("TZ", "UTC", 1);
+    tzset();
+    TestModesBudgetDateAndTimeValidity();
+    TestQuietMuteTopicAndCooldown();
+    TestFollowUpLifecycleAndRecovery();
+    TestHealthDedupRecoveryAndQueueOrdering();
+    return 0;
+}
