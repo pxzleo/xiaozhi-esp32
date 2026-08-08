@@ -67,46 +67,50 @@ void McpServer::AddCommonTools() {
     auto& app = Application::GetInstance();
     AddTool(
         "self.schedule.create",
-        "创建对话式闹铃、提醒或倒计时。用户说‘明早七点叫我起床’、‘半小时后提醒我喝水’、‘工作日九点提醒开会’等意图时使用。kind只能是alarm或reminder；repeat只能是once/daily/weekdays/weekends/weekly；label是1到80个Unicode字符。绝对本地时间用trigger_at（YYYY-MM-DDTHH:MM:SS），相对时间用delay_seconds，二者必须且只能给一个，且delay_seconds只支持once。weekly必须用weekdays给出1到7（周一到周日）的逗号分隔列表。日期、时间、上午下午、重复方式或提醒内容缺失/有歧义时，必须先自然追问用户，不得猜测。response是可直接播报的权威结果，data保留结构化结果。确认信息齐全后直接调用，不要先说‘我来处理一下’。",
+        "创建对话式闹铃、提醒、倒计时或每日简报。用户要求定时播报天气/新闻时kind传briefing，sections只能是weather、news或weather,news；包含weather时location必须是明确地点，缺失时先追问。其他任务kind只能是alarm或reminder且不得传简报字段。repeat只能是once/daily/weekdays/weekends/weekly；label是1到80个Unicode字符。绝对本地时间用trigger_at（YYYY-MM-DDTHH:MM:SS），相对时间用delay_seconds，二者必须且只能给一个，且delay_seconds只支持once。weekly必须用weekdays给出1到7（周一到周日）的逗号分隔列表。日期、时间、上午下午、重复方式、内容或地点缺失/有歧义时，必须先自然追问，不得猜测。确认信息齐全后直接调用，不要先说‘我来处理一下’。",
         PropertyList({Property("kind", kPropertyTypeString),
                       Property("repeat", kPropertyTypeString),
                       Property("label", kPropertyTypeString),
                       Property("trigger_at", kPropertyTypeString, std::string()),
                       Property("delay_seconds", kPropertyTypeInteger, 0),
-                      Property("weekdays", kPropertyTypeString, std::string())}),
+                      Property("weekdays", kPropertyTypeString, std::string()),
+                      Property("sections", kPropertyTypeString, std::string()),
+                      Property("location", kPropertyTypeString, std::string())}),
         [&app](const PropertyList& properties) -> ReturnValue {
             return app.CreateSchedule(properties["kind"].value<std::string>(),
                                       properties["repeat"].value<std::string>(),
                                       properties["label"].value<std::string>(),
                                       properties["trigger_at"].value<std::string>(),
                                       properties["delay_seconds"].value<int>(),
-                                      properties["weekdays"].value<std::string>());
+                                      properties["weekdays"].value<std::string>(),
+                                      properties["sections"].value<std::string>(),
+                                      properties["location"].value<std::string>());
         });
     AddTool("self.schedule.list",
-            "按类型列出设备上的闹铃和提醒。用户询问已有闹铃、提醒、倒计时或它们何时触发时使用。kind可为all/alarm/reminder，默认all；若用户明确只问闹铃或只问提醒，应传对应类型。response可直接对用户播报且包含权威结果，data保留结构化结果；直接调用，不要先说‘我来处理一下’。",
+            "按类型列出设备上的闹铃、提醒和每日简报。kind可为all/alarm/reminder/briefing，默认all。response可直接播报权威结果；直接调用，不要先说‘我来处理一下’。",
             PropertyList({Property("kind", kPropertyTypeString, std::string("all"))}),
             [&app](const PropertyList& properties) -> ReturnValue {
                 return app.ListSchedules(properties["kind"].value<std::string>());
             });
     AddTool("self.schedule.delete",
-            "按权威任务id删除一个尚未触发的闹铃或提醒。若用户只描述内容而没有明确唯一id，应先调用self.schedule.list；匹配不唯一时必须追问，不得猜测。response可直接播报并包含删除的id和类型，data保留结构化结果；直接调用，不要先说‘我来处理一下’。",
+            "按权威任务id删除一个尚未触发的闹铃、提醒或每日简报。若用户没有明确唯一id，应先调用self.schedule.list；匹配不唯一时必须追问。",
             PropertyList({Property("id", kPropertyTypeInteger, 1, 2147483647)}),
             [&app](const PropertyList& properties) -> ReturnValue {
                 return app.DeleteSchedule(properties["id"].value<int>());
             });
     AddTool("self.schedule.clear",
-            "按类型清空设备上尚未触发的任务。kind可为all/alarm/reminder，默认all。用户明确说全部时用all，只说清空闹铃时用alarm，只说清空提醒时用reminder；范围有歧义必须先追问，不得猜测。response可直接对用户播报且包含权威清空数量，data保留结构化结果；直接调用，不要先说‘我来处理一下’。",
+            "按类型清空设备上尚未触发的任务。kind可为all/alarm/reminder/briefing，默认all；范围有歧义必须先追问。",
             PropertyList({Property("kind", kPropertyTypeString, std::string("all"))}),
             [&app](const PropertyList& properties) -> ReturnValue {
                 return app.ClearSchedules(properties["kind"].value<std::string>());
             });
     AddTool("self.schedule.stop",
-            "立即停止当前正在响铃或展示的闹铃/提醒。用户说停止、关闭、别响了时直接使用，无需追问。response可直接播报并包含停止的id和类型，data保留结构化结果；不要先说‘我来处理一下’。",
+            "立即停止当前正在响铃或展示的闹铃、提醒或每日简报。用户说停止、关闭、别响了时直接使用，无需追问。",
             PropertyList(), [&app](const PropertyList&) -> ReturnValue {
                 return app.StopScheduleAlert();
             });
     AddTool("self.schedule.snooze",
-            "把当前正在响铃或展示的闹铃/提醒稍后再次提醒。minutes为1到60，用户未说明时默认5分钟；用户说‘稍后提醒’、‘再睡五分钟’时使用。response可直接播报并包含新任务的id、时间、重复规则和内容，data保留结构化结果；直接调用，不要先说‘我来处理一下’。",
+            "把当前正在响铃或展示的闹铃/提醒稍后再次提醒；每日简报不支持。minutes为1到60，用户未说明时默认5分钟。",
             PropertyList({Property("minutes", kPropertyTypeInteger, 5, 1, 60)}),
             [&app](const PropertyList& properties) -> ReturnValue {
                 return app.SnoozeScheduleAlert(properties["minutes"].value<int>());

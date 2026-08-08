@@ -121,7 +121,8 @@ public:
     AudioService& GetAudioService() { return audio_service_; }
     std::string CreateSchedule(const std::string& kind, const std::string& repeat,
                                const std::string& label, const std::string& trigger_at,
-                               int delay_seconds, const std::string& weekdays);
+                               int delay_seconds, const std::string& weekdays,
+                               const std::string& sections, const std::string& location);
     std::string ListSchedules(const std::string& kind) const;
     std::string DeleteSchedule(uint32_t id);
     std::string ClearSchedules(const std::string& kind);

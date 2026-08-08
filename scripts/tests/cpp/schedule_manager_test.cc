@@ -124,7 +124,8 @@ void TestShortCreationDescription() {
     assert(Manager::DescribeCreation(day_after, now) == "已设置后天9点的闹铃。");
     assert(Manager::DescribeCreation(tomorrow, now).find("任务ID") == std::string::npos);
 
-    Task weekly{9, Kind::kReminder, Repeat::kWeekly, "吃药", At(2026, 8, 7, 9), {1, 5}};
+    Task weekly{9, Kind::kReminder, Repeat::kWeekly, "吃药", At(2026, 8, 7, 9),
+                {1, 5}, "", ""};
     assert(Manager::DescribeCreation(weekly, now) == "已设置每周一、五9点提醒你吃药。");
 }
 
@@ -159,7 +160,7 @@ void TestWhitespaceLabels() {
     Manager restored;
     bool rejected_restore = false;
     try {
-        restored.Restore({{1, Kind::kReminder, Repeat::kOnce, "　", when, {}}}, 2);
+        restored.Restore({{1, Kind::kReminder, Repeat::kOnce, "　", when, {}, "", ""}}, 2);
     } catch (const std::invalid_argument&) {
         rejected_restore = true;
     }
@@ -169,9 +170,9 @@ void TestWhitespaceLabels() {
 void TestRecoveryAndOrderingAndDeduplication() {
     const auto now = At(2026, 8, 7, 10);
     Manager recovery;
-    recovery.Restore({{1, Kind::kAlarm, Repeat::kOnce, "补响", now - 300, {}},
-                      {2, Kind::kReminder, Repeat::kOnce, "错过", now - 301, {}},
-                      {3, Kind::kAlarm, Repeat::kDaily, "重复", At(2026, 1, 1, 9), {}}},
+    recovery.Restore({{1, Kind::kAlarm, Repeat::kOnce, "补响", now - 300, {}, "", ""},
+                      {2, Kind::kReminder, Repeat::kOnce, "错过", now - 301, {}, "", ""},
+                      {3, Kind::kAlarm, Repeat::kDaily, "重复", At(2026, 1, 1, 9), {}, "", ""}},
                      4);
     auto recovered = recovery.Tick(now, true);
     assert(recovered.triggered.size() == 1 && recovered.triggered[0].id == 1);
@@ -183,11 +184,20 @@ void TestRecoveryAndOrderingAndDeduplication() {
     auto reminder = Add(manager, Kind::kReminder, Repeat::kOnce, now);
     auto alarm2 = Add(manager, Kind::kAlarm, Repeat::kOnce, now);
     auto alarm1 = Add(manager, Kind::kAlarm, Repeat::kOnce, now);
+    CreateRequest briefing_request;
+    briefing_request.kind = Kind::kBriefing;
+    briefing_request.repeat = Repeat::kOnce;
+    briefing_request.label = "简报";
+    briefing_request.trigger_at = now;
+    briefing_request.sections = "weather,news";
+    briefing_request.location = "广州";
+    auto briefing = manager.Create(briefing_request, now - 10);
     auto due = manager.Tick(now, true);
-    assert(due.triggered.size() == 3);
+    assert(due.triggered.size() == 4);
     assert(due.triggered[0].id == alarm2.id);
     assert(due.triggered[1].id == alarm1.id);
     assert(due.triggered[2].id == reminder.id);
+    assert(due.triggered[3].id == briefing.id);
     assert(manager.Tick(now + 1, true).triggered.empty());
 }
 
@@ -246,6 +256,40 @@ void TestReminderDeliverySequence() {
     assert(sequence.state() == ReminderDeliveryState::kWaitingForCue);
 }
 
+void TestBriefingValidationAndFilter() {
+    const auto when = At(2026, 8, 10, 8);
+    Manager manager;
+    CreateRequest request;
+    request.kind = Kind::kBriefing;
+    request.repeat = Repeat::kWeekdays;
+    request.label = "广州天气和新闻";
+    request.trigger_at = when;
+    request.sections = "weather,news";
+    request.location = "广州";
+    const auto briefing = manager.Create(request, when - 60);
+    assert(briefing.kind == Kind::kBriefing);
+    assert(manager.List(KindFilter::kBriefing).size() == 1);
+    assert(Manager::DescribeCreation(briefing, when - 60) ==
+           "已设置工作日8点的每日简报。");
+    bool snooze_rejected = false;
+    try {
+        manager.Snooze(briefing, 5, when);
+    } catch (const std::invalid_argument&) {
+        snooze_rejected = true;
+    }
+    assert(snooze_rejected);
+
+    request.location.clear();
+    bool location_rejected = false;
+    try {
+        Manager invalid;
+        invalid.Create(request, when - 60);
+    } catch (const std::invalid_argument&) {
+        location_rejected = true;
+    }
+    assert(location_rejected);
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -260,5 +304,6 @@ int main() {
     TestRecoveryAndOrderingAndDeduplication();
     TestInvalidTimeStopAndSnooze();
     TestReminderDeliverySequence();
+    TestBriefingValidationAndFilter();
     return 0;
 }

@@ -80,7 +80,27 @@ int IsoWeekday(const std::tm& local) { return local.tm_wday == 0 ? 7 : local.tm_
 bool MatchesFilter(const Task& task, KindFilter filter) {
     return filter == KindFilter::kAll ||
         (filter == KindFilter::kAlarm && task.kind == Kind::kAlarm) ||
-        (filter == KindFilter::kReminder && task.kind == Kind::kReminder);
+        (filter == KindFilter::kReminder && task.kind == Kind::kReminder) ||
+        (filter == KindFilter::kBriefing && task.kind == Kind::kBriefing);
+}
+
+void ValidateBriefing(const Kind kind, const std::string& sections,
+                      const std::string& location) {
+    if (kind != Kind::kBriefing) {
+        if (!sections.empty() || !location.empty()) {
+            throw std::invalid_argument("只有briefing任务可以提供sections和location");
+        }
+        return;
+    }
+    if (sections != "weather" && sections != "news" && sections != "weather,news") {
+        throw std::invalid_argument("sections必须是weather/news/weather,news之一");
+    }
+    const auto place = AnalyzeUtf8(location);
+    if (!place.valid || place.count > 40 ||
+        (sections.find("weather") != std::string::npos &&
+         (place.count < 1 || !place.has_non_whitespace))) {
+        throw std::invalid_argument("天气简报地点必须是1到40个Unicode字符");
+    }
 }
 
 const char* WeekdayChinese(int weekday) {
@@ -114,6 +134,7 @@ void Manager::Restore(std::vector<Task> tasks, uint32_t next_id) {
         if (task.repeat == Repeat::kWeekly && task.weekdays.empty()) {
             throw std::invalid_argument("保存的weekly任务缺少weekdays");
         }
+        ValidateBriefing(task.kind, task.sections, task.location);
         for (int day : task.weekdays) {
             if (day < 1 || day > 7) throw std::invalid_argument("保存的weekday超出1到7");
         }
@@ -133,6 +154,7 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
     if (!label.valid || label.count < 1 || label.count > 80 || !label.has_non_whitespace) {
         throw std::invalid_argument("内容必须是1到80个Unicode字符且不能全为空白");
     }
+    ValidateBriefing(request.kind, request.sections, request.location);
     const bool has_absolute = request.trigger_at > 0;
     const bool has_delay = request.delay_seconds > 0;
     if (has_absolute == has_delay) {
@@ -172,6 +194,8 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
     task.kind = request.kind;
     task.repeat = request.repeat;
     task.label = request.label;
+    task.sections = request.sections;
+    task.location = request.location;
     task.trigger_at = first_trigger;
     task.weekdays = request.weekdays;
     std::sort(task.weekdays.begin(), task.weekdays.end());
@@ -182,6 +206,9 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
 }
 
 Task Manager::Snooze(const Task& source, int minutes, std::time_t now) {
+    if (source.kind == Kind::kBriefing) {
+        throw std::invalid_argument("每日简报不支持稍后提醒");
+    }
     if (minutes < 1 || minutes > 60) {
         throw std::invalid_argument("稍后提醒分钟数必须在1到60之间");
     }
@@ -295,13 +322,19 @@ TickResult Manager::Tick(std::time_t now, bool time_valid) {
     recovery_pending_ = false;
     std::sort(result.triggered.begin(), result.triggered.end(), [](const Task& left, const Task& right) {
         if (left.trigger_at != right.trigger_at) return left.trigger_at < right.trigger_at;
-        if (left.kind != right.kind) return left.kind == Kind::kAlarm;
+        const bool left_alarm = left.kind == Kind::kAlarm;
+        const bool right_alarm = right.kind == Kind::kAlarm;
+        if (left_alarm != right_alarm) return left_alarm;
         return left.id < right.id;
     });
     return result;
 }
 
-const char* Manager::KindName(Kind kind) { return kind == Kind::kAlarm ? "alarm" : "reminder"; }
+const char* Manager::KindName(Kind kind) {
+    if (kind == Kind::kAlarm) return "alarm";
+    if (kind == Kind::kReminder) return "reminder";
+    return "briefing";
+}
 
 const char* Manager::RepeatName(Repeat repeat) {
     switch (repeat) {
@@ -317,14 +350,16 @@ const char* Manager::RepeatName(Repeat repeat) {
 Kind Manager::ParseKind(const std::string& value) {
     if (value == "alarm") return Kind::kAlarm;
     if (value == "reminder") return Kind::kReminder;
-    throw std::invalid_argument("kind必须是alarm或reminder");
+    if (value == "briefing") return Kind::kBriefing;
+    throw std::invalid_argument("kind必须是alarm/reminder/briefing之一");
 }
 
 KindFilter Manager::ParseKindFilter(const std::string& value) {
     if (value == "all") return KindFilter::kAll;
     if (value == "alarm") return KindFilter::kAlarm;
     if (value == "reminder") return KindFilter::kReminder;
-    throw std::invalid_argument("kind必须是all/alarm/reminder之一");
+    if (value == "briefing") return KindFilter::kBriefing;
+    throw std::invalid_argument("kind必须是all/alarm/reminder/briefing之一");
 }
 
 Repeat Manager::ParseRepeat(const std::string& value) {
@@ -343,7 +378,8 @@ std::string Manager::DescribeTask(const Task& task) {
     }
     char timestamp[20];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &local);
-    const char* kind = task.kind == Kind::kAlarm ? "闹铃" : "提醒";
+    const char* kind = task.kind == Kind::kAlarm ? "闹铃" :
+        (task.kind == Kind::kReminder ? "提醒" : "每日简报");
     std::string repeat;
     switch (task.repeat) {
         case Repeat::kOnce: repeat = "单次"; break;
@@ -358,8 +394,13 @@ std::string Manager::DescribeTask(const Task& task) {
             }
             break;
     }
-    return "任务ID " + std::to_string(task.id) + "，类型" + kind + "，时间" + timestamp +
-        "，重复规则" + repeat + "，内容“" + task.label + "”";
+    std::string result = "任务ID " + std::to_string(task.id) + "，类型" + kind +
+        "，时间" + timestamp + "，重复规则" + repeat + "，内容“" + task.label + "”";
+    if (task.kind == Kind::kBriefing) {
+        result += "，模块" + task.sections;
+        if (!task.location.empty()) result += "，地点" + task.location;
+    }
+    return result;
 }
 
 std::string Manager::DescribeCreation(const Task& task, std::time_t now) {
@@ -409,6 +450,7 @@ std::string Manager::DescribeCreation(const Task& task, std::time_t now) {
     }
     when += FormatClock(task.trigger_at);
     if (task.kind == Kind::kAlarm) return "已设置" + when + "的闹铃。";
+    if (task.kind == Kind::kBriefing) return "已设置" + when + "的每日简报。";
     return "已设置" + when + "提醒你" + task.label + "。";
 }
 

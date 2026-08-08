@@ -49,6 +49,9 @@ class ScheduleManagerTest(unittest.TestCase):
             ).read_text(encoding="utf-8"),
         ]
         self.assertIn('"notifications/schedule/triggered"', application)
+        self.assertIn('"notifications/assistant/triggered"', application)
+        self.assertIn("kBriefingTtsStartTimeoutSeconds = 30", application)
+        self.assertIn('Property("sections", kPropertyTypeString', mcp)
         self.assertIn("speak", application)
         for tool in ("create", "list", "delete", "clear", "stop", "snooze"):
             self.assertIn(f'"self.schedule.{tool}"', mcp)
@@ -73,10 +76,28 @@ class ScheduleManagerTest(unittest.TestCase):
             'if (strcmp(state->valuestring, "start") == 0)', 1
         )[1].split('strcmp(state->valuestring, "stop")', 1)[0]
         self.assertLess(
-            tts_start.index("ReminderDeliveryState::kWaitingForCue"),
+            tts_start.index("!reminder_delivery_.OnTtsStarted()"),
             tts_start.index("SetDeviceState(kDeviceStateSpeaking)"),
         )
-        self.assertIn("return;", tts_start)
+        self.assertIn("Ignoring unexpected TTS start for schedule alert", tts_start)
+        tts_stop = application.split(
+            'strcmp(state->valuestring, "stop") == 0', 1
+        )[1].split('strcmp(state->valuestring, "sentence_start")', 1)[0]
+        self.assertLess(
+            tts_stop.index("reminder_delivery_.OnTtsStopped()"),
+            tts_stop.index("FinishScheduleAlert()"),
+        )
+        self.assertLess(
+            tts_stop.index("FinishScheduleAlert()"),
+            tts_stop.index("SetDeviceState(kDeviceStateListening)"),
+        )
+        timeout_handler = application.split(
+            "now_us >= schedule_reminder_tts_deadline_us_", 1
+        )[1].split("if (!schedule_alert_active_", 1)[0]
+        self.assertLess(
+            timeout_handler.index("CancelWaitingForTts()"),
+            timeout_handler.index("AbortSpeaking(kAbortReasonNone)"),
+        )
         drained_handler = application.split(
             "if (bits & MAIN_EVENT_PLAYBACK_DRAINED)", 1
         )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]

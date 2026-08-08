@@ -12,8 +12,8 @@ namespace schedule {
 
 bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revision);
 
-enum class Kind { kAlarm, kReminder };
-enum class KindFilter { kAll, kAlarm, kReminder };
+enum class Kind { kAlarm, kReminder, kBriefing };
+enum class KindFilter { kAll, kAlarm, kReminder, kBriefing };
 enum class Repeat { kOnce, kDaily, kWeekdays, kWeekends, kWeekly };
 enum class ReminderDeliveryState { kInactive, kWaitingForCue, kWaitingForTts, kSpeaking };
 
@@ -24,6 +24,8 @@ struct Task {
     std::string label;
     std::time_t trigger_at = 0;
     std::vector<int> weekdays;
+    std::string sections;
+    std::string location;
 };
 
 struct CreateRequest {
@@ -33,6 +35,8 @@ struct CreateRequest {
     std::time_t trigger_at = 0;
     int delay_seconds = 0;
     std::vector<int> weekdays;
+    std::string sections;
+    std::string location;
 };
 
 struct TickResult {

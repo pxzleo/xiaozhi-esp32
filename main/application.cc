@@ -15,6 +15,7 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -29,6 +30,7 @@ namespace {
 constexpr int kScheduleAlertMinimumVolume = 80;
 constexpr int kReminderCueRepeats = 2;
 constexpr int kReminderTtsStartTimeoutSeconds = 15;
+constexpr int kBriefingTtsStartTimeoutSeconds = 30;
 
 struct ToolStatusTranslation {
     std::string_view keyword;
@@ -183,6 +185,10 @@ cJSON* ScheduleTaskJson(const schedule::Task& task) {
     cJSON_AddStringToObject(json, "kind", schedule::Manager::KindName(task.kind));
     cJSON_AddStringToObject(json, "repeat", schedule::Manager::RepeatName(task.repeat));
     cJSON_AddStringToObject(json, "label", task.label.c_str());
+    if (task.kind == schedule::Kind::kBriefing) {
+        cJSON_AddStringToObject(json, "sections", task.sections.c_str());
+        cJSON_AddStringToObject(json, "location", task.location.c_str());
+    }
     cJSON_AddStringToObject(json, "trigger_at", FormatLocalDateTime(task.trigger_at).c_str());
     if (!task.weekdays.empty()) {
         cJSON* weekdays = cJSON_AddArrayToObject(json, "weekdays");
@@ -202,7 +208,8 @@ std::string ResponseEnvelope(const std::string& response, cJSON* data) {
 const char* KindFilterChinese(schedule::KindFilter filter) {
     if (filter == schedule::KindFilter::kAlarm) return "闹铃";
     if (filter == schedule::KindFilter::kReminder) return "提醒";
-    return "闹铃和提醒";
+    if (filter == schedule::KindFilter::kBriefing) return "每日简报";
+    return "闹铃、提醒和每日简报";
 }
 
 bool ParseLyricsStart(const cJSON* params, netease_music::LyricsPlayback& playback) {
@@ -491,8 +498,11 @@ void Application::Run() {
                 audio_service_.IsPlaybackIdle() &&
                 reminder_delivery_.OnPlaybackDrained()) {
                 if (NotifyReminderTriggered(active_schedule_task_, std::time(nullptr))) {
+                    const int timeout_seconds = active_schedule_task_.kind ==
+                        schedule::Kind::kBriefing ? kBriefingTtsStartTimeoutSeconds :
+                        kReminderTtsStartTimeoutSeconds;
                     schedule_reminder_tts_deadline_us_ = esp_timer_get_time() +
-                        kReminderTtsStartTimeoutSeconds * 1000000LL;
+                        timeout_seconds * 1000000LL;
                 } else {
                     reminder_delivery_.CancelWaitingForTts();
                     RestoreScheduleAlertVolumeAfterDelivery();
@@ -876,13 +886,11 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
-                    if (schedule_alert_active_ &&
-                        reminder_delivery_.state() ==
-                            schedule::ReminderDeliveryState::kWaitingForCue) {
-                        ESP_LOGW(TAG, "Ignoring stale TTS start while schedule cue is playing");
-                        return;
-                    }
-                    if (reminder_delivery_.OnTtsStarted()) {
+                    if (schedule_alert_active_) {
+                        if (!reminder_delivery_.OnTtsStarted()) {
+                            ESP_LOGW(TAG, "Ignoring unexpected TTS start for schedule alert");
+                            return;
+                        }
                         schedule_reminder_tts_deadline_us_ = 0;
                     }
                     aborted_ = false;
@@ -896,6 +904,8 @@ void Application::InitializeProtocol() {
                         if (schedule_alert_active_ &&
                             active_schedule_task_.kind == schedule::Kind::kAlarm) {
                             ShowScheduleAlertPage();
+                        } else if (schedule_alert_active_) {
+                            FinishScheduleAlert();
                         }
                         listening_mode_ = GetDefaultListeningMode();
                         SetDeviceState(kDeviceStateListening);
@@ -1637,6 +1647,8 @@ void Application::LoadSchedules() {
         cJSON* label = cJSON_GetObjectItem(item, "label");
         cJSON* trigger_at = cJSON_GetObjectItem(item, "trigger_at");
         cJSON* weekdays = cJSON_GetObjectItem(item, "weekdays");
+        cJSON* sections = cJSON_GetObjectItem(item, "sections");
+        cJSON* location = cJSON_GetObjectItem(item, "location");
         if (!cJSON_IsNumber(id) || id->valuedouble < 1 || !cJSON_IsString(kind) ||
             !cJSON_IsString(repeat) || !cJSON_IsString(label) || !cJSON_IsNumber(trigger_at)) {
             throw std::runtime_error("NVS中的定时任务条目无效");
@@ -1646,6 +1658,15 @@ void Application::LoadSchedules() {
         task.kind = schedule::Manager::ParseKind(kind->valuestring);
         task.repeat = schedule::Manager::ParseRepeat(repeat->valuestring);
         task.label = label->valuestring;
+        if (task.kind == schedule::Kind::kBriefing) {
+            if (!cJSON_IsString(sections) || !cJSON_IsString(location)) {
+                throw std::runtime_error("NVS中的每日简报字段无效");
+            }
+            task.sections = sections->valuestring;
+            task.location = location->valuestring;
+        } else if (sections != nullptr || location != nullptr) {
+            throw std::runtime_error("NVS中的普通定时任务包含简报字段");
+        }
         task.trigger_at = static_cast<std::time_t>(trigger_at->valuedouble);
         if (weekdays != nullptr) {
             if (!cJSON_IsArray(weekdays)) {
@@ -1707,13 +1728,36 @@ bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
-    cJSON_AddStringToObject(root, "method", "notifications/schedule/triggered");
+    const bool briefing = task.kind == schedule::Kind::kBriefing;
+    cJSON_AddStringToObject(root, "method", briefing ?
+        "notifications/assistant/triggered" : "notifications/schedule/triggered");
     cJSON* params = cJSON_AddObjectToObject(root, "params");
     cJSON_AddNumberToObject(params, "version", 1);
     cJSON_AddNumberToObject(params, "id", task.id);
-    cJSON_AddStringToObject(params, "kind", schedule::Manager::KindName(task.kind));
-    cJSON_AddStringToObject(params, "label", task.label.c_str());
-    cJSON_AddStringToObject(params, "triggered_at", FormatLocalDateTime(now).c_str());
+    if (briefing) {
+        const std::string triggered_at = FormatLocalDateTime(task.trigger_at);
+        std::string event_timestamp = triggered_at;
+        event_timestamp.erase(std::remove(event_timestamp.begin(), event_timestamp.end(), '-'),
+                              event_timestamp.end());
+        event_timestamp.erase(std::remove(event_timestamp.begin(), event_timestamp.end(), ':'),
+                              event_timestamp.end());
+        const std::string event_id = std::to_string(task.id) + "-" + event_timestamp;
+        cJSON_AddStringToObject(params, "event_id", event_id.c_str());
+        cJSON_AddStringToObject(params, "workflow", "daily_briefing");
+        cJSON* sections = cJSON_AddArrayToObject(params, "sections");
+        if (task.sections.find("weather") != std::string::npos) {
+            cJSON_AddItemToArray(sections, cJSON_CreateString("weather"));
+        }
+        if (task.sections.find("news") != std::string::npos) {
+            cJSON_AddItemToArray(sections, cJSON_CreateString("news"));
+        }
+        cJSON_AddStringToObject(params, "location", task.location.c_str());
+        cJSON_AddStringToObject(params, "triggered_at", triggered_at.c_str());
+    } else {
+        cJSON_AddStringToObject(params, "kind", schedule::Manager::KindName(task.kind));
+        cJSON_AddStringToObject(params, "label", task.label.c_str());
+        cJSON_AddStringToObject(params, "triggered_at", FormatLocalDateTime(now).c_str());
+    }
     cJSON_AddBoolToObject(params, "speak", true);
     return protocol_->SendMcpMessage(JsonString(root));
 }
@@ -1741,6 +1785,7 @@ void Application::CheckSchedules() {
         now_us >= schedule_reminder_tts_deadline_us_ &&
         reminder_delivery_.CancelWaitingForTts()) {
         schedule_reminder_tts_deadline_us_ = 0;
+        AbortSpeaking(kAbortReasonNone);
         RestoreScheduleAlertVolumeAfterDelivery();
     }
     if (!schedule_alert_active_ &&
@@ -1750,7 +1795,7 @@ void Application::CheckSchedules() {
     if (!schedule_alert_active_) return;
     if (now_us >= schedule_alert_deadline_us_) {
         const bool reminder_delivery_pending =
-            active_schedule_task_.kind == schedule::Kind::kReminder &&
+            active_schedule_task_.kind != schedule::Kind::kAlarm &&
             reminder_delivery_.state() != schedule::ReminderDeliveryState::kInactive;
         FinishScheduleAlert(active_schedule_task_.kind == schedule::Kind::kAlarm,
                             !reminder_delivery_pending);
@@ -1798,10 +1843,13 @@ void Application::StartNextScheduleAlert() {
 }
 
 void Application::ShowScheduleAlertPage() {
-    std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒";
+    std::string page = active_schedule_task_.kind == schedule::Kind::kAlarm ? "闹铃" :
+        (active_schedule_task_.kind == schedule::Kind::kReminder ? "提醒" : "每日简报");
     page += "  " + FormatLocalDateTime(active_schedule_task_.trigger_at).substr(11, 5) + "\n";
     page += active_schedule_task_.label;
-    page += "\n开始收听键停止 / 可语音稍后提醒";
+    page += active_schedule_task_.kind == schedule::Kind::kBriefing ?
+        "\n正在准备简报 / 开始收听键停止" :
+        "\n开始收听键停止 / 可语音稍后提醒";
     Board::GetInstance().GetDisplay()->SetChatMessage("system", page.c_str());
 }
 
@@ -1818,7 +1866,7 @@ void Application::RestoreScheduleAlertVolume() {
 
 void Application::RestoreScheduleAlertVolumeAfterDelivery() {
     if (!schedule_alert_active_ ||
-        active_schedule_task_.kind == schedule::Kind::kReminder) {
+        active_schedule_task_.kind != schedule::Kind::kAlarm) {
         RestoreScheduleAlertVolume();
     }
 }
@@ -1841,12 +1889,16 @@ void Application::FinishScheduleAlert(bool reset_decoder, bool reset_delivery) {
 std::string Application::CreateSchedule(const std::string& kind, const std::string& repeat,
                                         const std::string& label,
                                         const std::string& trigger_at, int delay_seconds,
-                                        const std::string& weekdays) {
+                                        const std::string& weekdays,
+                                        const std::string& sections,
+                                        const std::string& location) {
     if (!has_server_time_.load()) throw std::runtime_error("设备时间尚未同步，请稍后重试");
     schedule::CreateRequest request;
     request.kind = schedule::Manager::ParseKind(kind);
     request.repeat = schedule::Manager::ParseRepeat(repeat);
     request.label = label;
+    request.sections = sections == "news,weather" ? "weather,news" : sections;
+    request.location = location;
     if (delay_seconds < 0) throw std::invalid_argument("delay_seconds必须大于0");
     request.trigger_at = trigger_at.empty() ? 0 : ParseLocalDateTime(trigger_at);
     request.delay_seconds = delay_seconds;
@@ -1876,7 +1928,9 @@ std::string Application::ListSchedules(const std::string& kind) const {
          (filter == schedule::KindFilter::kAlarm &&
           active_schedule_task_.kind == schedule::Kind::kAlarm) ||
          (filter == schedule::KindFilter::kReminder &&
-          active_schedule_task_.kind == schedule::Kind::kReminder));
+          active_schedule_task_.kind == schedule::Kind::kReminder) ||
+         (filter == schedule::KindFilter::kBriefing &&
+          active_schedule_task_.kind == schedule::Kind::kBriefing));
     cJSON_AddBoolToObject(data, "alert_active", active_matches);
     if (active_matches) {
         cJSON_AddItemToObject(data, "active", ScheduleTaskJson(active_schedule_task_));
@@ -1916,14 +1970,16 @@ std::string Application::ClearSchedules(const std::string& kind) {
 }
 
 std::string Application::StopScheduleAlert() {
-    if (!schedule_alert_active_) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
+    if (!schedule_alert_active_) throw std::runtime_error("当前没有正在触发的定时任务");
     const auto stopped = active_schedule_task_;
-    if (!TryStopScheduleAlert()) throw std::runtime_error("当前没有正在响铃的闹铃或提醒");
+    if (!TryStopScheduleAlert()) throw std::runtime_error("当前没有正在触发的定时任务");
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "stopped_id", stopped.id);
     cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(stopped.kind));
     return ResponseEnvelope("已停止任务ID " + std::to_string(stopped.id) + "，类型" +
-                                (stopped.kind == schedule::Kind::kAlarm ? "闹铃" : "提醒") +
+                                (stopped.kind == schedule::Kind::kAlarm ? "闹铃" :
+                                 (stopped.kind == schedule::Kind::kReminder ? "提醒" :
+                                  "每日简报")) +
                                 "。",
                             data);
 }
