@@ -292,6 +292,7 @@ cJSON* ProactiveConfigJson(const proactive::Config& config,
                             proactive::Manager::ModeName(config.mode_before_silent));
     cJSON_AddNumberToObject(json, "silent_date", config.silent_date);
     cJSON_AddNumberToObject(json, "daily_limit", config.daily_limit);
+    cJSON_AddNumberToObject(json, "previous_daily_limit", config.previous_daily_limit);
     if (config.quiet_start) {
         cJSON_AddNumberToObject(json, "quiet_start", *config.quiet_start);
         cJSON_AddNumberToObject(json, "quiet_end", *config.quiet_end);
@@ -2141,6 +2142,7 @@ void Application::LoadProactive() {
     auto previous_mode = cJSON_GetObjectItem(config_json, "mode_before_silent");
     auto silent_date = cJSON_GetObjectItem(config_json, "silent_date");
     auto daily_limit = cJSON_GetObjectItem(config_json, "daily_limit");
+    auto previous_daily_limit = cJSON_GetObjectItem(config_json, "previous_daily_limit");
     auto allowed = cJSON_GetObjectItem(config_json, "allowed_topics");
     auto blocked = cJSON_GetObjectItem(config_json, "blocked_topics");
     auto budget_date = cJSON_GetObjectItem(config_json, "budget_date");
@@ -2148,6 +2150,7 @@ void Application::LoadProactive() {
     auto cooldowns = cJSON_GetObjectItem(config_json, "last_delivered");
     if (!cJSON_IsString(mode) || !cJSON_IsString(previous_mode) ||
         !cJSON_IsNumber(silent_date) || !cJSON_IsNumber(daily_limit) ||
+        (previous_daily_limit != nullptr && !cJSON_IsNumber(previous_daily_limit)) ||
         !cJSON_IsArray(allowed) || !cJSON_IsArray(blocked) ||
         !cJSON_IsNumber(budget_date) || !cJSON_IsNumber(delivered) ||
         !cJSON_IsObject(cooldowns)) {
@@ -2158,6 +2161,8 @@ void Application::LoadProactive() {
     config.mode_before_silent = proactive::Manager::ParseMode(previous_mode->valuestring);
     config.silent_date = silent_date->valueint;
     config.daily_limit = daily_limit->valueint;
+    config.previous_daily_limit = previous_daily_limit != nullptr ?
+        previous_daily_limit->valueint : config.daily_limit;
     auto quiet_start = cJSON_GetObjectItem(config_json, "quiet_start");
     auto quiet_end = cJSON_GetObjectItem(config_json, "quiet_end");
     if ((quiet_start == nullptr) != (quiet_end == nullptr) ||
@@ -3075,8 +3080,11 @@ std::string Application::ProactiveStatus() {
     for (const auto& topic : config.blocked_topics) {
         cJSON_AddItemToArray(blocked, cJSON_CreateString(topic.c_str()));
     }
+    const std::string limit_description = config.mode == proactive::Mode::kAggressive ?
+        "，普通主动发言不限次数。" :
+        "，每天最多" + std::to_string(config.daily_limit) + "次。";
     return ResponseEnvelope("当前主动模式为" + std::string(proactive::Manager::ModeName(config.mode)) +
-                                "，每天最多" + std::to_string(config.daily_limit) + "次。",
+                                limit_description,
                             data);
 }
 

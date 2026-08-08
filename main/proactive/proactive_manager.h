@@ -29,12 +29,13 @@ struct Event {
 
 struct Config {
     Mode mode = Mode::kAggressive;
-    int daily_limit = 5;
+    int daily_limit = 0;
     std::optional<int> quiet_start;
     std::optional<int> quiet_end;
     std::set<std::string> allowed_topics;
     std::set<std::string> blocked_topics;
     Mode mode_before_silent = Mode::kAggressive;
+    int previous_daily_limit = 0;
     int silent_date = 0;
 };
 

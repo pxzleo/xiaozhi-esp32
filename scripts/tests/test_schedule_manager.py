@@ -40,19 +40,26 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertTrue(can_replace(142, half_required, 3600))  # Grow back to max.
         self.assertFalse(can_replace(100, max_required, 3600))  # Other namespaces full.
 
+    def test_proactive_state_serializes_and_restores_previous_daily_limit(self):
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        self.assertIn('cJSON_AddNumberToObject(json, "previous_daily_limit"', application)
+        self.assertIn('cJSON_GetObjectItem(config_json, "previous_daily_limit")', application)
+        self.assertIn('previous_daily_limit != nullptr ?', application)
+
     def test_maximum_proactive_state_fits_persistence_budget(self):
         topics = ["reminder", "calendar", "weather", "music", "health", "habit", "system"]
         config = {
             "mode": "aggressive",
             "mode_before_silent": "aggressive",
+            "previous_daily_limit": 0,
             "silent_date": 20260808,
-            "daily_limit": 5,
+            "daily_limit": 0,
             "quiet_start": 1439,
             "quiet_end": 1439,
             "allowed_topics": topics[:4],
             "blocked_topics": topics[4:],
             "budget_date": 20260808,
-            "delivered_today": 5,
+            "delivered_today": 6,
             "last_delivered": {topics[i]: 1786159999 for i in range(5)},
         }
         follow_ups = [

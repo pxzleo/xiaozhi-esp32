@@ -132,7 +132,7 @@ void McpServer::AddCommonTools() {
                 return app.DismissScheduleFollowUp();
             });
     AddTool("self.proactive.configure",
-            "配置设备主动程度。‘积极一点/更积极’用aggressive，‘少提醒’用conservative或active；daily_limit表示每天最多N次。quiet_start和quiet_end必须成对提供HH:MM，只有用户明确设置安静时段时才传。直接调用，不要先说‘我来处理一下’。",
+            "配置设备主动程度。‘积极一点/更积极’用aggressive且daily_limit必须为0，表示普通主动发言不限每日次数；active允许daily_limit为1到5且默认5；conservative固定为1。quiet_start和quiet_end必须成对提供HH:MM，只有用户明确设置安静时段时才传。直接调用，不要先说‘我来处理一下’。",
             PropertyList({Property("mode", kPropertyTypeString),
                           Property("daily_limit", kPropertyTypeInteger, -1),
                           Property("quiet_start", kPropertyTypeString, std::string()),

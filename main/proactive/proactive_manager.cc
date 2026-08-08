@@ -198,7 +198,27 @@ std::string StateCodec::Decompress(const uint8_t* data, size_t size, size_t max_
 void Manager::Restore(Config config, RuntimeState state) {
     const Mode effective_mode = config.mode == Mode::kTodaySilent ?
         config.mode_before_silent : config.mode;
-    if (config.daily_limit < 0 || config.daily_limit > DefaultLimit(effective_mode)) {
+    if (config.mode == Mode::kAggressive && config.daily_limit >= 0 && config.daily_limit <= 5) {
+        config.daily_limit = 0;
+    }
+    if (config.mode == Mode::kTodaySilent) {
+        if (config.daily_limit < 0 || config.daily_limit > 5) {
+            throw std::invalid_argument("静默模式每日上限无效");
+        }
+        config.daily_limit = 0;
+        if (config.mode_before_silent == Mode::kAggressive &&
+            config.previous_daily_limit >= 0 && config.previous_daily_limit <= 5) {
+            config.previous_daily_limit = 0;
+        }
+    } else {
+        config.previous_daily_limit = config.daily_limit;
+    }
+    const int effective_limit = config.mode == Mode::kTodaySilent ?
+        config.previous_daily_limit : config.daily_limit;
+    const bool valid_limit = effective_mode == Mode::kAggressive ? effective_limit == 0 :
+        (effective_mode == Mode::kConservative ? effective_limit == 1 :
+         effective_limit >= 1 && effective_limit <= 5);
+    if (!valid_limit) {
         throw std::invalid_argument("每日上限超过当前模式允许值");
     }
     if (config.quiet_start.has_value() != config.quiet_end.has_value()) {
@@ -244,13 +264,16 @@ void Manager::Configure(Mode mode, std::optional<int> daily_limit,
         throw std::invalid_argument("安静时段超出一天范围");
     }
     const int limit = daily_limit.value_or(DefaultLimit(mode));
-    if (limit < 0 || limit > DefaultLimit(mode)) {
+    const bool valid_limit = mode == Mode::kAggressive ? limit == 0 :
+        (mode == Mode::kConservative ? limit == 1 : limit >= 1 && limit <= 5);
+    if (!valid_limit) {
         throw std::invalid_argument("daily_limit超过当前模式允许值");
     }
     config_.mode = mode;
     config_.mode_before_silent = mode;
     config_.silent_date = 0;
     config_.daily_limit = limit;
+    config_.previous_daily_limit = limit;
     if (quiet_start) {
         config_.quiet_start = quiet_start;
         config_.quiet_end = quiet_end;
@@ -260,8 +283,12 @@ void Manager::Configure(Mode mode, std::optional<int> daily_limit,
 void Manager::MuteToday(std::time_t now, bool time_valid) {
     if (!time_valid) throw std::runtime_error("设备时间尚未同步，不能设置今天安静");
     RefreshDate(now, true);
-    if (config_.mode != Mode::kTodaySilent) config_.mode_before_silent = config_.mode;
+    if (config_.mode != Mode::kTodaySilent) {
+        config_.mode_before_silent = config_.mode;
+        config_.previous_daily_limit = config_.daily_limit;
+    }
     config_.mode = Mode::kTodaySilent;
+    config_.daily_limit = 0;
     config_.silent_date = LocalDate(now);
 }
 
@@ -296,6 +323,7 @@ void Manager::RefreshDate(std::time_t now, bool time_valid) {
     if (config_.mode == Mode::kTodaySilent && config_.silent_date != 0 &&
         config_.silent_date != date) {
         config_.mode = config_.mode_before_silent;
+        config_.daily_limit = config_.previous_daily_limit;
         config_.silent_date = 0;
     }
 }
@@ -333,7 +361,8 @@ bool Manager::ShouldDeliver(const Event& event, std::time_t now, bool time_valid
     if (previous != state_.last_delivered.end() && now - previous->second < kCooldownSeconds) {
         return false;
     }
-    return state_.delivered_today < config_.daily_limit;
+    return config_.mode == Mode::kAggressive ||
+        state_.delivered_today < config_.daily_limit;
 }
 
 void Manager::RecordDelivered(const Event& event, std::time_t now, bool time_valid) {
@@ -370,8 +399,8 @@ const char* Manager::ModeName(Mode mode) {
 
 int Manager::DefaultLimit(Mode mode) {
     if (mode == Mode::kConservative) return 1;
-    if (mode == Mode::kActive) return 3;
-    return 5;
+    if (mode == Mode::kActive) return 5;
+    return 0;
 }
 
 int Manager::ParseClock(const std::string& value) {

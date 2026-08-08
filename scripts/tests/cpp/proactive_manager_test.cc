@@ -43,7 +43,7 @@ Event QueuedHealth(std::string id, Severity severity, std::time_t now) {
 void TestModesBudgetDateAndTimeValidity() {
     Manager manager;
     assert(manager.config().mode == Mode::kAggressive);
-    assert(manager.config().daily_limit == 5);
+    assert(manager.config().daily_limit == 0);
     const auto day = At(2026, 8, 8, 9);
     assert(!manager.ShouldDeliver(Suggestion("0", "weather", day), day, false));
     for (int i = 0; i < 5; ++i) {
@@ -51,12 +51,21 @@ void TestModesBudgetDateAndTimeValidity() {
         assert(manager.ShouldDeliver(event, day + i, true));
         manager.RecordDelivered(event, day + i, true);
     }
-    assert(!manager.ShouldDeliver(Suggestion("6", "sixth", day + 10), day + 10, true));
+    assert(manager.ShouldDeliver(Suggestion("6", "sixth", day + 10), day + 10, true));
     assert(manager.ShouldDeliver(Suggestion("7", "next", At(2026, 8, 9, 9)),
                                  At(2026, 8, 9, 9), true));
 
     manager.Configure(Mode::kActive, std::nullopt, std::nullopt, std::nullopt);
-    assert(manager.config().daily_limit == 3);
+    assert(manager.config().daily_limit == 5);
+    for (int i = 0; i < 5; ++i) {
+        auto event = Suggestion("active-" + std::to_string(i),
+                                "active-topic-" + std::to_string(i),
+                                At(2026, 8, 10, 8) + i);
+        assert(manager.ShouldDeliver(event, event.created_at, true));
+        manager.RecordDelivered(event, event.created_at, true);
+    }
+    assert(!manager.ShouldDeliver(Suggestion("active-6", "active-sixth", At(2026, 8, 10, 9)),
+                                  At(2026, 8, 10, 9), true));
     manager.Configure(Mode::kConservative, std::nullopt, std::nullopt, std::nullopt);
     assert(manager.config().daily_limit == 1);
     assert(!manager.ShouldDeliver(Suggestion("8", "weather", At(2026, 8, 10, 9)),
@@ -69,7 +78,7 @@ void TestModesBudgetDateAndTimeValidity() {
 void TestQuietMuteTopicAndCooldown() {
     Manager manager;
     const auto day = At(2026, 8, 8, 22, 30);
-    manager.Configure(Mode::kAggressive, 5, 22 * 60, 7 * 60);
+    manager.Configure(Mode::kAggressive, 0, 22 * 60, 7 * 60);
     assert(!manager.ShouldDeliver(Suggestion("1", "weather", day), day, true));
     assert(manager.ShouldDeliver(Suggestion("2", "weather", At(2026, 8, 9, 8)),
                                  At(2026, 8, 9, 8), true));
@@ -92,11 +101,36 @@ void TestQuietMuteTopicAndCooldown() {
 
     manager.MuteToday(At(2026, 8, 9, 10), true);
     assert(manager.config().mode == Mode::kTodaySilent);
+    assert(manager.config().daily_limit == 0);
+    assert(manager.config().previous_daily_limit == 0);
     assert(!manager.ShouldDeliver(Suggestion("6", "music", At(2026, 8, 9, 11)),
                                   At(2026, 8, 9, 11), true));
     assert(manager.ShouldDeliver(Suggestion("7", "music", At(2026, 8, 10, 8)),
                                  At(2026, 8, 10, 8), true));
     assert(manager.config().mode == Mode::kAggressive);
+    assert(manager.config().daily_limit == 0);
+}
+
+void TestLegacyAggressiveLimitIsNormalized() {
+    Manager manager;
+    Config legacy;
+    legacy.mode = Mode::kAggressive;
+    legacy.daily_limit = 4;
+    manager.Restore(legacy, {});
+    assert(manager.config().daily_limit == 0);
+
+    legacy.mode = Mode::kTodaySilent;
+    legacy.mode_before_silent = Mode::kAggressive;
+    legacy.daily_limit = 0;
+    legacy.previous_daily_limit = 3;
+    manager.Restore(legacy, {});
+    assert(manager.config().previous_daily_limit == 0);
+
+    legacy.daily_limit = 6;
+    bool invalid_silent_limit_rejected = false;
+    try { manager.Restore(legacy, {}); }
+    catch (const std::invalid_argument&) { invalid_silent_limit_rejected = true; }
+    assert(invalid_silent_limit_rejected);
 }
 
 void TestFollowUpLifecycleAndRecovery() {
@@ -411,6 +445,7 @@ int main() {
     tzset();
     TestModesBudgetDateAndTimeValidity();
     TestQuietMuteTopicAndCooldown();
+    TestLegacyAggressiveLimitIsNormalized();
     TestFollowUpLifecycleAndRecovery();
     TestHealthDedupRecoveryAndQueueOrdering();
     TestFourHealthKindsReplaceInPersistentQueue();
