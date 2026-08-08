@@ -290,6 +290,45 @@ void TestBriefingValidationAndFilter() {
     assert(location_rejected);
 }
 
+void TestRepeatingSuggestionUsesRealTasks() {
+    const auto first_time = At(2026, 8, 10, 8);
+    Manager manager;
+    auto first = Add(manager, Kind::kReminder, Repeat::kOnce, first_time);
+    assert(!Manager::ShouldSuggestRepeating(manager.tasks(), first));
+
+    CreateRequest request;
+    request.kind = Kind::kReminder;
+    request.repeat = Repeat::kOnce;
+    request.label = first.label;
+    request.trigger_at = At(2026, 8, 11, 8);
+    auto second = manager.Create(request, first_time - 60);
+    assert(Manager::ShouldSuggestRepeating(manager.tasks(), second));
+
+    request.label = "不同内容";
+    request.trigger_at = At(2026, 8, 12, 8);
+    auto different = manager.Create(request, first_time - 60);
+    assert(!Manager::ShouldSuggestRepeating(manager.tasks(), different));
+
+    Manager same_day_manager;
+    auto same_day_base = Add(
+        same_day_manager, Kind::kReminder, Repeat::kOnce, first_time);
+    request.label = same_day_base.label;
+    request.trigger_at = first_time + 30;
+    auto same_day_different_second =
+        same_day_manager.Create(request, first_time - 60);
+    assert(!Manager::ShouldSuggestRepeating(
+        same_day_manager.tasks(), same_day_different_second));
+
+    Manager seconds_manager;
+    auto seconds_base = Add(
+        seconds_manager, Kind::kReminder, Repeat::kOnce, first_time);
+    request.label = seconds_base.label;
+    request.trigger_at = At(2026, 8, 13, 8) + 30;
+    auto different_second = seconds_manager.Create(request, first_time - 60);
+    assert(!Manager::ShouldSuggestRepeating(
+        seconds_manager.tasks(), different_second));
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -305,5 +344,6 @@ int main() {
     TestInvalidTimeStopAndSnooze();
     TestReminderDeliverySequence();
     TestBriefingValidationAndFilter();
+    TestRepeatingSuggestionUsesRealTasks();
     return 0;
 }

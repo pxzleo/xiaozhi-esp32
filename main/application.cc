@@ -1908,7 +1908,13 @@ std::string Application::CreateSchedule(const std::string& kind, const std::stri
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(task));
-    return ResponseEnvelope(schedule::Manager::DescribeCreation(task, now), data);
+    std::string response = schedule::Manager::DescribeCreation(task, now);
+    if (schedule::Manager::ShouldSuggestRepeating(schedule_manager_.tasks(), task)) {
+        response += " 你已经多次设置相同时间和内容，要不要改成重复任务？";
+        cJSON_AddStringToObject(
+            data, "suggestion", "convert_to_repeating_schedule");
+    }
+    return ResponseEnvelope(response, data);
 }
 
 std::string Application::ListSchedules(const std::string& kind) const {

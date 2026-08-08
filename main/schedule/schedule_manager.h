@@ -69,6 +69,8 @@ public:
     static Repeat ParseRepeat(const std::string& value);
     static std::string DescribeTask(const Task& task);
     static std::string DescribeCreation(const Task& task, std::time_t now);
+    static bool ShouldSuggestRepeating(const std::vector<Task>& tasks,
+                                       const Task& created);
 
 private:
     std::vector<Task> tasks_;

@@ -67,7 +67,7 @@ void McpServer::AddCommonTools() {
     auto& app = Application::GetInstance();
     AddTool(
         "self.schedule.create",
-        "创建对话式闹铃、提醒、倒计时或每日简报。用户要求定时播报天气/新闻时kind传briefing，sections只能是weather、news或weather,news；包含weather时location必须是明确地点，缺失时先追问。其他任务kind只能是alarm或reminder且不得传简报字段。repeat只能是once/daily/weekdays/weekends/weekly；label是1到80个Unicode字符。绝对本地时间用trigger_at（YYYY-MM-DDTHH:MM:SS），相对时间用delay_seconds，二者必须且只能给一个，且delay_seconds只支持once。weekly必须用weekdays给出1到7（周一到周日）的逗号分隔列表。日期、时间、上午下午、重复方式、内容或地点缺失/有歧义时，必须先自然追问，不得猜测。确认信息齐全后直接调用，不要先说‘我来处理一下’。",
+        "创建对话式闹铃、提醒、倒计时或每日简报。用户要求定时播报天气/新闻时kind传briefing，sections只能是weather、news或weather,news；包含weather时location必须是明确地点，缺失时先追问。其他任务kind只能是alarm或reminder且不得传简报字段。repeat只能是once/daily/weekdays/weekends/weekly；label是1到80个Unicode字符。绝对本地时间用trigger_at（YYYY-MM-DDTHH:MM:SS），相对时间用delay_seconds，二者必须且只能给一个，且delay_seconds只支持once。weekly必须用weekdays给出1到7（周一到周日）的逗号分隔列表。日期、时间、上午下午、重复方式、内容或地点缺失/有歧义时，必须先自然追问，不得猜测。用户只说‘晚点、有空、回头’要做某事但没有明确要求提醒时，主动问是否需要提醒以及具体时间，不能直接创建。确认信息齐全后直接调用，不要先说‘我来处理一下’。",
         PropertyList({Property("kind", kPropertyTypeString),
                       Property("repeat", kPropertyTypeString),
                       Property("label", kPropertyTypeString),

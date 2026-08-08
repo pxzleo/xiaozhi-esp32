@@ -9,6 +9,18 @@ bool ShouldRestoreTemporaryVolume(uint32_t start_revision, uint32_t current_revi
     return start_revision == current_revision;
 }
 
+static bool SameLocalClockOnDifferentDate(std::time_t left, std::time_t right) {
+    std::tm left_time{};
+    std::tm right_time{};
+    localtime_r(&left, &left_time);
+    localtime_r(&right, &right_time);
+    const bool different_date = left_time.tm_year != right_time.tm_year ||
+                                left_time.tm_yday != right_time.tm_yday;
+    return different_date && left_time.tm_hour == right_time.tm_hour &&
+           left_time.tm_min == right_time.tm_min &&
+           left_time.tm_sec == right_time.tm_sec;
+}
+
 namespace {
 
 struct Utf8Stats {
@@ -452,6 +464,19 @@ std::string Manager::DescribeCreation(const Task& task, std::time_t now) {
     if (task.kind == Kind::kAlarm) return "已设置" + when + "的闹铃。";
     if (task.kind == Kind::kBriefing) return "已设置" + when + "的每日简报。";
     return "已设置" + when + "提醒你" + task.label + "。";
+}
+
+bool Manager::ShouldSuggestRepeating(const std::vector<Task>& tasks,
+                                     const Task& created) {
+    if (created.repeat != Repeat::kOnce ||
+        (created.kind != Kind::kAlarm && created.kind != Kind::kReminder)) {
+        return false;
+    }
+    return std::any_of(tasks.begin(), tasks.end(), [&created](const Task& task) {
+        return task.id != created.id && task.kind == created.kind &&
+               task.repeat == Repeat::kOnce && task.label == created.label &&
+               SameLocalClockOnDifferentDate(task.trigger_at, created.trigger_at);
+    });
 }
 
 const Task* AlertQueue::StartNext() {

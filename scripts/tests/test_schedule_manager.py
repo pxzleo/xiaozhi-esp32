@@ -60,6 +60,8 @@ class ScheduleManagerTest(unittest.TestCase):
         )
         self.assertIn("Manager::DescribeTask", application)
         self.assertIn("Manager::DescribeCreation(task, now)", application)
+        self.assertIn("convert_to_repeating_schedule", application)
+        self.assertIn("用户只说‘晚点、有空、回头’", mcp)
         self.assertIn("ParseKindFilter", application)
         self.assertIn("std::unique_ptr<cJSON, decltype(&cJSON_Delete)>", application)
         self.assertIn("last_load_error", application)
