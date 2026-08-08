@@ -19,6 +19,12 @@ void ValidateTopic(const std::string& topic) {
     }
 }
 
+void ValidateHealthKind(const std::string& kind) {
+    if (!HealthTracker::IsSupportedKind(kind)) {
+        throw std::invalid_argument("不支持的健康事件kind");
+    }
+}
+
 }  // namespace
 
 void Manager::Restore(Config config, RuntimeState state) {
@@ -296,14 +302,15 @@ size_t FollowUpStore::DropExpired(std::time_t now) {
 }
 
 void HealthTracker::Restore(std::map<std::string, Record> records) {
-    if (records.size() > 8) throw std::invalid_argument("保存的健康状态超过8项");
+    if (records.size() > 4) throw std::invalid_argument("保存的健康状态超过4项");
+    for (const auto& item : records) ValidateHealthKind(item.first);
     records_ = std::move(records);
 }
 
 std::optional<HealthEvent> HealthTracker::Raise(
     const std::string& kind, Severity severity, std::time_t now,
     std::map<std::string, std::string> details) {
-    ValidateTopic(kind);
+    ValidateHealthKind(kind);
     auto& record = records_[kind];
     if (record.active) return std::nullopt;
     if (record.last_changed_at > 0 && now - record.last_changed_at < kCooldownSeconds) {
@@ -322,6 +329,7 @@ std::optional<HealthEvent> HealthTracker::Raise(
 }
 
 std::optional<HealthEvent> HealthTracker::Recover(const std::string& kind, std::time_t now) {
+    ValidateHealthKind(kind);
     auto found = records_.find(kind);
     if (found == records_.end() || !found->second.active) return std::nullopt;
     found->second.active = false;
@@ -330,6 +338,11 @@ std::optional<HealthEvent> HealthTracker::Recover(const std::string& kind, std::
                 "device health recovered", now, now + 24 * 60 * 60,
                 found->second.dedupe_key, false, {}};
     return HealthEvent{event, kind, Severity::kInfo, now, true, {}};
+}
+
+bool HealthTracker::IsSupportedKind(const std::string& kind) {
+    return kind == "network_flapping" || kind == "time_unsynchronized" ||
+           kind == "ota_update_available" || kind == "audio_decode_failed";
 }
 
 const char* HealthTracker::SeverityName(Severity severity) {
@@ -352,9 +365,12 @@ std::optional<Event> DurableQueue::Push(Event event) {
         throw std::invalid_argument("主动事件字段不完整");
     }
     auto found = std::find_if(items_.begin(), items_.end(), [&event](const Event& item) {
-        return item.event_id == event.event_id;
+        return item.event_id == event.event_id || item.dedupe_key == event.dedupe_key;
     });
-    if (found != items_.end()) return std::nullopt;
+    if (found != items_.end()) {
+        *found = std::move(event);
+        return std::nullopt;
+    }
     std::optional<Event> evicted;
     if (items_.size() >= kMaxItems) {
         auto importance = [](const Event& item) {
@@ -363,14 +379,21 @@ std::optional<Event> DurableQueue::Push(Event event) {
             return static_cast<int>(item.priority) * 2 +
                 (item.metadata.count("health_kind") != 0 ? 1 : 0);
         };
-        auto lowest = std::min_element(items_.begin(), items_.end(),
-            [&importance](const Event& left, const Event& right) {
-                if (importance(left) != importance(right)) {
-                    return importance(left) < importance(right);
-                }
-                return left.created_at < right.created_at;
-            });
-        if (importance(event) <= importance(*lowest)) {
+        const bool incoming_health = event.metadata.count("health_kind") != 0;
+        auto lowest = items_.end();
+        for (auto item = items_.begin(); item != items_.end(); ++item) {
+            if (item->metadata.count("health_kind") != 0 ||
+                item->priority == Priority::kCritical) {
+                continue;
+            }
+            if (lowest == items_.end() || importance(*item) < importance(*lowest) ||
+                (importance(*item) == importance(*lowest) &&
+                 item->created_at < lowest->created_at)) {
+                lowest = item;
+            }
+        }
+        if (lowest == items_.end() ||
+            (!incoming_health && importance(event) <= importance(*lowest))) {
             throw std::runtime_error("主动事件队列已满且没有可淘汰的低优先级事件");
         }
         evicted = std::move(*lowest);

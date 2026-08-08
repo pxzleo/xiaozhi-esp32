@@ -163,6 +163,57 @@ void TestHealthDedupRecoveryAndQueueOrdering() {
     assert(queue.DropExpired(now + 1) == 1);
 }
 
+void TestFourHealthKindsReplaceInPersistentQueue() {
+    const auto now = At(2026, 8, 8, 10);
+    HealthTracker health;
+    DurableQueue queue;
+    for (int i = 0; i < 4; ++i) {
+        auto ordinary = Suggestion("ordinary-four-" + std::to_string(i), "tip", now + i);
+        ordinary.dedupe_key = ordinary.event_id;
+        queue.Push(std::move(ordinary));
+    }
+    const std::vector<std::pair<std::string, Severity>> kinds{
+        {"network_flapping", Severity::kWarning},
+        {"time_unsynchronized", Severity::kWarning},
+        {"ota_update_available", Severity::kInfo},
+        {"audio_decode_failed", Severity::kCritical},
+    };
+    for (const auto& [kind, severity] : kinds) {
+        auto raised = health.Raise(kind, severity, now, {});
+        assert(raised);
+        raised->event.metadata["health_kind"] = kind;
+        raised->event.metadata["recovered"] = "false";
+        queue.Push(raised->event);
+    }
+    assert(queue.items().size() == DurableQueue::kMaxItems);
+    auto recovered = health.Recover("network_flapping", now + 1);
+    assert(recovered);
+    recovered->event.metadata["health_kind"] = "network_flapping";
+    recovered->event.metadata["recovered"] = "true";
+    assert(!queue.Push(recovered->event));
+    assert(queue.items().size() == DurableQueue::kMaxItems);
+    assert(std::count_if(queue.items().begin(), queue.items().end(),
+               [](const Event& item) { return item.dedupe_key == "health:network_flapping"; }) == 1);
+    assert(std::any_of(queue.items().begin(), queue.items().end(),
+               [](const Event& item) { return item.event_id.find(":recovered:") != std::string::npos; }));
+    DurableQueue restored;
+    restored.Restore(queue.items());
+    assert(restored.items().size() == DurableQueue::kMaxItems);
+    size_t compact_serialized_upper_bound = 512;
+    for (const auto& item : restored.items()) {
+        compact_serialized_upper_bound += item.event_id.size() + item.topic.size() +
+            item.reason.size() + item.dedupe_key.size() + 96;
+        for (const auto& metadata : item.metadata) {
+            compact_serialized_upper_bound += metadata.first.size() + metadata.second.size() + 8;
+        }
+    }
+    assert(compact_serialized_upper_bound < 3600);
+    bool unknown_rejected = false;
+    try { health.Raise("unknown_health", Severity::kInfo, now, {}); }
+    catch (const std::invalid_argument&) { unknown_rejected = true; }
+    assert(unknown_rejected);
+}
+
 void TestRetryBackoffIsBounded() {
     RetryBackoff backoff;
     assert(backoff.Ready(0));
@@ -290,6 +341,7 @@ int main() {
     TestQuietMuteTopicAndCooldown();
     TestFollowUpLifecycleAndRecovery();
     TestHealthDedupRecoveryAndQueueOrdering();
+    TestFourHealthKindsReplaceInPersistentQueue();
     TestRetryBackoffIsBounded();
     TestPersistentCapacityLimits();
     TestTopicRuleMigrationAtCapacity();

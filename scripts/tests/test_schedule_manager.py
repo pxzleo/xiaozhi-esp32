@@ -112,23 +112,26 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn('"proactive_conn", 4096 * 2, this, 11', application)
         self.assertLess(worker.index("Schedule([this, shutdown_token"),
                         worker.index("xSemaphoreGive(proactive_connection_done_)"))
+        self.assertLess(worker.index("proactive_connection_running_.store(false)"),
+                        worker.index("xSemaphoreGive(proactive_connection_done_)"))
         finish = application.split("void Application::FinishProactiveConnection", 1)[1]
         finish = finish.split("void Application::CheckProactiveEvents", 1)[0]
         self.assertLess(
             finish.index("xSemaphoreTake(proactive_connection_done_"),
-            finish.index("proactive_connection_running_.store(false)"),
+            finish.index("proactive_connection_task_handle_ = nullptr"),
         )
         self.assertNotIn("Schedule([this", finish)
         self.assertIn("proactive_finish_pending_ = true", finish)
         destructor = application.split("Application::~Application()", 1)[1]
         destructor = destructor.split("bool Application::SetDeviceState", 1)[0]
+        self.assertIn("if (proactive_connection_task_handle_ != nullptr)", destructor)
         self.assertIn("xSemaphoreTake(proactive_connection_done_, portMAX_DELAY)", destructor)
         self.assertIn("deferred_bits | MAIN_EVENT_CLOCK_TICK", finish)
         for method in ("ContinueOpenAudioChannel", "ContinueWakeWordInvoke",
                        "NotifyReminderTriggered"):
             body = application.split(f"Application::{method}", 1)[1]
-            self.assertIn("proactive_connection_running_.load()", body[:1200])
-        self.assertLess(proactive_check.index("proactive_connection_running_.load()"),
+            self.assertIn("IsProactiveConnectionBusy()", body[:1200])
+        self.assertLess(proactive_check.index("IsProactiveConnectionBusy()"),
                         proactive_check.index("protocol_->IsAudioChannelOpened()"))
         reset = application.split("void Application::ResetProtocol()", 1)[1]
         self.assertIn("proactive_reset_pending_ = true", reset)
@@ -149,30 +152,16 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertEqual(application.count("SaveProactive();"), 1)
         self.assertIn("recovered_health ||", application)
         self.assertNotIn("event.priority = proactive::Priority::kCritical", application)
-        self.assertIn('cJSON_AddArrayToObject(root, "pending_health")', application)
-        self.assertIn("pending_health_events_.push_back", application)
-        self.assertIn("kMaxPendingHealthEvents = 8", application_h)
-        preserve_health = application.split("bool Application::PreservePendingHealth", 1)[1]
-        preserve_health = preserve_health.split("void Application::QueueHealthEvent", 1)[0]
-        self.assertNotIn("pop_front", preserve_health)
-        self.assertIn("return false", preserve_health)
-        load_proactive = application.split("void Application::LoadProactive()", 1)[1]
-        load_proactive = load_proactive.split("void Application::SaveProactive()", 1)[0]
-        self.assertIn('cJSON_GetObjectItem(root.get(), "pending_health")', load_proactive)
-        self.assertIn("ParseProactiveEvent(item)", load_proactive)
-        save_proactive = application.split("void Application::SaveProactive()", 1)[1]
-        save_proactive = save_proactive.split("bool Application::TrySaveProactive", 1)[0]
-        self.assertIn("for (const auto& event : pending_health_events_)", save_proactive)
+        self.assertNotIn("pending_health_events_", application + application_h)
         health_queue = application.split("void Application::QueueHealthEvent", 1)[1]
         health_queue = health_queue.split("bool Application::SendProactiveEvent", 1)[0]
         self.assertIn("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)", health_queue)
-        recovery = health_queue.split("if (health.recovered)", 1)[1]
-        self.assertLess(recovery.index("pending_health_events_.erase"),
-                        recovery.index("proactive_queue_.Push(event)"))
+        self.assertIn("HealthTracker::IsSupportedKind(health.kind)", health_queue)
+        self.assertIn("proactive_queue_.Push(event)", health_queue)
         wake_invoke = application.split("void Application::WakeWordInvoke", 1)[1]
         wake_invoke = wake_invoke.split("bool Application::CanEnterSleepMode", 1)[0]
         self.assertLess(wake_invoke.index("Schedule([this, wake_word]"),
-                        wake_invoke.index("proactive_connection_running_.load()"))
+                        wake_invoke.index("IsProactiveConnectionBusy()"))
         self.assertIn("proactive_deferred_wake_word_ = wake_word", wake_invoke)
         network_callback = application.split("case NetworkEvent::Scanning:", 1)[1]
         scanning = network_callback.split("case NetworkEvent::Connecting", 1)[0]

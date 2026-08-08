@@ -425,7 +425,7 @@ Application::Application() {
 Application::~Application() {
     proactive_shutdown_.store(true);
     proactive_shutdown_token_->store(true);
-    if (proactive_connection_running_.load()) {
+    if (proactive_connection_task_handle_ != nullptr) {
         xSemaphoreTake(proactive_connection_done_, portMAX_DELAY);
         proactive_connection_running_.store(false);
     }
@@ -530,7 +530,6 @@ void Application::Initialize() {
         schedule_follow_ups_.Restore({});
         health_tracker_.Restore({});
         proactive_queue_.Restore({});
-        pending_health_events_.clear();
     }
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
@@ -656,7 +655,7 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
-            if (!proactive_connection_running_.load() && schedule_alert_active_ &&
+            if (!IsProactiveConnectionBusy() && schedule_alert_active_ &&
                 audio_service_.IsPlaybackIdle() &&
                 reminder_delivery_.OnPlaybackDrained()) {
                 if (NotifyReminderTriggered(active_schedule_task_, std::time(nullptr))) {
@@ -678,7 +677,7 @@ void Application::Run() {
                 pending_listening_start_ = false;
                 StartListeningAudio();
             }
-            if (!proactive_connection_running_.load() && pending_proactive_event_ &&
+            if (!IsProactiveConnectionBusy() && pending_proactive_event_ &&
                 audio_service_.IsPlaybackIdle()) {
                 auto event = std::move(*pending_proactive_event_);
                 pending_proactive_event_.reset();
@@ -713,7 +712,7 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            if (proactive_connection_running_.load()) {
+            if (IsProactiveConnectionBusy()) {
                 proactive_deferred_event_bits_ |= MAIN_EVENT_SEND_AUDIO;
             } else {
                 while (auto packet = audio_service_.PopPacketFromSendQueue()) {
@@ -829,7 +828,7 @@ void Application::HandleNetworkDisconnectedEvent() {
     }
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
-    if (!proactive_connection_running_.load() &&
+    if (!IsProactiveConnectionBusy() &&
         (state == kDeviceStateConnecting || state == kDeviceStateListening ||
          state == kDeviceStateSpeaking)) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
@@ -1376,7 +1375,7 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_TOGGLE_CHAT;
         return;
     }
@@ -1421,7 +1420,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
     }
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_open_mode_ = mode;
         return;
     }
@@ -1443,7 +1442,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_START_LISTENING;
         return;
     }
@@ -1478,7 +1477,7 @@ void Application::HandleStartListeningEvent() {
 }
 
 void Application::HandleStopListeningEvent() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_STOP_LISTENING;
         return;
     }
@@ -1497,7 +1496,7 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_WAKE_WORD_DETECTED;
         return;
     }
@@ -1535,7 +1534,7 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::BeginWakeWordInvoke(const std::string& wake_word) {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_wake_word_ = wake_word;
         return;
     }
@@ -1567,7 +1566,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
     }
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_wake_word_ = wake_word;
         return;
     }
@@ -1682,7 +1681,7 @@ void Application::StartListeningAudio() {
     if (GetDeviceState() != kDeviceStateListening) {
         return;
     }
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_STATE_CHANGED;
         return;
     }
@@ -1719,7 +1718,7 @@ void Application::Schedule(std::function<void()>&& callback) {
 }
 
 void Application::AbortSpeaking(AbortReason reason) {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         ESP_LOGW(TAG, "Deferring abort while proactive connection worker owns protocol");
         proactive_deferred_event_bits_ |= MAIN_EVENT_TOGGLE_CHAT;
         return;
@@ -1741,7 +1740,7 @@ ListeningMode Application::GetDefaultListeningMode() const {
 }
 
 void Application::Reboot() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_reboot_pending_ = true;
         return;
     }
@@ -1758,7 +1757,7 @@ void Application::Reboot() {
 }
 
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         ESP_LOGE(TAG, "Cannot start firmware upgrade while proactive channel is connecting");
         return false;
     }
@@ -1820,7 +1819,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     // This API may be called by a board callback task. All shared proactive and
     // protocol state is therefore inspected and changed only in the main task.
     Schedule([this, wake_word]() {
-        if (proactive_connection_running_.load()) {
+        if (IsProactiveConnectionBusy()) {
             proactive_deferred_wake_word_ = wake_word;
             return;
         }
@@ -1837,7 +1836,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         return false;
     }
     if (GetDeviceState() != kDeviceStateIdle) {
@@ -1863,7 +1862,7 @@ void Application::RegisterMcpBroadcastCallback(std::function<void(const std::str
 void Application::SendMcpMessage(const std::string& payload) {
     // Always schedule to run in main task for thread safety
     Schedule([this, payload]() {
-        if (proactive_connection_running_.load()) {
+        if (IsProactiveConnectionBusy()) {
             if (proactive_deferred_mcp_messages_.size() >= 8) {
                 ESP_LOGE(TAG, "Deferred MCP queue is full while proactive channel connects");
             } else {
@@ -1899,7 +1898,7 @@ void Application::SetAecMode(AecMode mode) {
         }
 
         // If the AEC mode is changed, close the audio channel
-        if (proactive_connection_running_.load()) {
+        if (IsProactiveConnectionBusy()) {
             proactive_close_pending_ = true;
         } else if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();
@@ -2026,10 +2025,8 @@ void Application::LoadProactive() {
     auto follow_ups = cJSON_GetObjectItem(root.get(), "follow_ups");
     auto health = cJSON_GetObjectItem(root.get(), "health");
     auto queue = cJSON_GetObjectItem(root.get(), "queue");
-    auto pending_health = cJSON_GetObjectItem(root.get(), "pending_health");
     if (!cJSON_IsObject(root.get()) || !cJSON_IsObject(config_json) ||
-        !cJSON_IsArray(follow_ups) || !cJSON_IsObject(health) || !cJSON_IsArray(queue) ||
-        (pending_health != nullptr && !cJSON_IsArray(pending_health))) {
+        !cJSON_IsArray(follow_ups) || !cJSON_IsObject(health) || !cJSON_IsArray(queue)) {
         throw std::runtime_error("NVS中的主动状态JSON损坏");
     }
     auto mode = cJSON_GetObjectItem(config_json, "mode");
@@ -2122,20 +2119,6 @@ void Application::LoadProactive() {
         }
     }
     proactive_queue_.Restore(std::move(queued));
-    pending_health_events_.clear();
-    if (pending_health != nullptr) {
-        if (cJSON_GetArraySize(pending_health) >
-            static_cast<int>(kMaxPendingHealthEvents)) {
-            throw std::runtime_error("NVS中的待重试健康事件超过8项");
-        }
-        cJSON_ArrayForEach(item, pending_health) {
-            auto event = ParseProactiveEvent(item);
-            if (event.metadata.count("health_kind") == 0) {
-                throw std::runtime_error("NVS中的待重试健康事件类型无效");
-            }
-            pending_health_events_.push_back(std::move(event));
-        }
-    }
 }
 
 void Application::SaveProactive() const {
@@ -2166,10 +2149,6 @@ void Application::SaveProactive() const {
     }
     if (pending_proactive_event_) {
         cJSON_AddItemToArray(queue, ProactiveEventJson(*pending_proactive_event_));
-    }
-    cJSON* pending_health = cJSON_AddArrayToObject(root, "pending_health");
-    for (const auto& event : pending_health_events_) {
-        cJSON_AddItemToArray(pending_health, ProactiveEventJson(event));
     }
     const std::string saved = JsonString(root);
     static constexpr size_t kChunkSize = 1800;
@@ -2242,31 +2221,12 @@ bool Application::TrySaveProactive(const char* context, bool force) {
     }
 }
 
-bool Application::PreservePendingHealth(proactive::Event event) {
-    if (event.metadata.count("health_kind") == 0) {
-        throw std::invalid_argument("只有健康事件可以进入健康待重试槽");
-    }
-    pending_health_events_.erase(
-        std::remove_if(pending_health_events_.begin(), pending_health_events_.end(),
-            [&event](const proactive::Event& existing) {
-                return existing.dedupe_key == event.dedupe_key;
-            }),
-        pending_health_events_.end());
-    if (pending_health_events_.size() >= kMaxPendingHealthEvents) {
-        ESP_LOGE(TAG, "Health pending queue reached fixed limit; rejected event id=%s",
-                 event.event_id.c_str());
-        Board::GetInstance().GetDisplay()->ShowNotification(
-            "健康事件待上报队列已满，请检查设备", 10000);
-        health_pending_overflow_alert_ = true;
-        health_overflow_alert_after_us_ = esp_timer_get_time() + 60LL * 1000000;
-        return false;
-    }
-    pending_health_events_.push_back(std::move(event));
-    health_pending_overflow_alert_ = false;
-    return true;
-}
-
 void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
+    if (!proactive::HealthTracker::IsSupportedKind(health.kind)) {
+        ESP_LOGE(TAG, "Rejected unsupported health event kind=%s", health.kind.c_str());
+        Board::GetInstance().GetDisplay()->ShowNotification("不支持的设备健康事件", 5000);
+        return;
+    }
     auto event = health.event;
     event.metadata["health_kind"] = health.kind;
     event.metadata["severity"] = proactive::HealthTracker::SeverityName(health.severity);
@@ -2276,34 +2236,14 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
     }
     if (!has_server_time_.load()) event.expires_at = 0;
     try {
-        if (health.recovered) {
-            proactive_queue_.RemoveByDedupeKey(event.dedupe_key);
-            pending_health_events_.erase(
-                std::remove_if(pending_health_events_.begin(), pending_health_events_.end(),
-                    [&event](const proactive::Event& pending) {
-                        return pending.dedupe_key == event.dedupe_key;
-                    }),
-                pending_health_events_.end());
-        }
         auto evicted = proactive_queue_.Push(event);
         if (evicted) {
             ESP_LOGW(TAG, "Evicted lower priority proactive event id=%s for health event",
                      evicted->event_id.c_str());
-            if (evicted->metadata.count("health_kind") != 0) {
-                if (!PreservePendingHealth(*evicted)) {
-                    proactive_queue_.RemoveByDedupeKey(event.dedupe_key);
-                    proactive_queue_.Push(std::move(*evicted));
-                    throw std::runtime_error("健康待重试槽已满，未接纳新的健康事件");
-                }
-                ESP_LOGW(TAG, "Preserved evicted health event in retry queue");
-            }
         }
     } catch (const std::exception& error) {
         ESP_LOGE(TAG, "Cannot persist health event: %s", error.what());
         Board::GetInstance().GetDisplay()->ShowNotification("健康事件存储已满", 5000);
-        PreservePendingHealth(std::move(event));
-        health_enqueue_backoff_.OnFailure(esp_timer_get_time());
-        TrySaveProactive("pending health event", true);
         return;
     }
     Board::GetInstance().GetDisplay()->ShowNotification(
@@ -2316,7 +2256,7 @@ void Application::QueueHealthEvent(const proactive::HealthEvent& health) {
 }
 
 bool Application::SendProactiveEvent(const proactive::Event& event) {
-    if (proactive_connection_running_.load() || !network_connected_.load() ||
+    if (IsProactiveConnectionBusy() || !network_connected_.load() ||
         protocol_ == nullptr) return false;
     if (!protocol_->IsAudioChannelOpened()) return false;
     cJSON* root = cJSON_CreateObject();
@@ -2377,7 +2317,7 @@ void Application::RecordProactiveSendResult(bool success) {
 }
 
 bool Application::StartProactiveConnectionWorker() {
-    if (proactive_connection_running_.load() || protocol_ == nullptr ||
+    if (IsProactiveConnectionBusy() || protocol_ == nullptr ||
         !network_connected_.load() ||
         GetDeviceState() != kDeviceStateIdle || schedule_alert_active_ ||
         protocol_->IsAudioChannelOpened()) {
@@ -2418,9 +2358,10 @@ void Application::ProactiveConnectionTask(uint32_t protocol_generation) {
                 FinishProactiveConnection(success, protocol_generation);
             }
         });
-    } else {
-        proactive_connection_running_.store(false);
     }
+    proactive_connection_running_.store(false);
+    // This must remain the worker's final access to Application state. The task
+    // entry only calls vTaskDelete after this method returns.
     xSemaphoreGive(proactive_connection_done_);
 }
 
@@ -2449,7 +2390,6 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     proactive_deferred_wake_word_.reset();
     const EventBits_t deferred_bits = proactive_deferred_event_bits_;
     proactive_deferred_event_bits_ = 0;
-    proactive_connection_running_.store(false);
     if (reset_pending) {
         ResetProtocol();
         return;
@@ -2484,44 +2424,12 @@ void Application::CheckProactiveEvents() {
         const uint32_t generation = proactive_finish_generation_;
         proactive_finish_pending_ = false;
         FinishProactiveConnection(success, generation);
-        if (proactive_connection_running_.load()) return;
+        if (IsProactiveConnectionBusy()) return;
     }
     const auto now = std::time(nullptr);
     bool changed = false;
-    if (health_pending_overflow_alert_ &&
-        esp_timer_get_time() >= health_overflow_alert_after_us_) {
-        Board::GetInstance().GetDisplay()->ShowNotification(
-            "健康事件待上报队列仍满，请检查设备", 10000);
-        health_overflow_alert_after_us_ = esp_timer_get_time() + 60LL * 1000000;
-    }
     if (proactive_save_pending_ && proactive_save_backoff_.Ready(esp_timer_get_time())) {
         TrySaveProactive("scheduled retry");
-    }
-    if (!pending_health_events_.empty() &&
-        health_enqueue_backoff_.Ready(esp_timer_get_time())) {
-        try {
-            auto retrying_health = pending_health_events_.front();
-            auto evicted = proactive_queue_.Push(retrying_health);
-            pending_health_events_.pop_front();
-            if (evicted) {
-                ESP_LOGW(TAG, "Evicted proactive event id=%s for retried health event",
-                         evicted->event_id.c_str());
-                if (evicted->metadata.count("health_kind") != 0) {
-                    if (!PreservePendingHealth(std::move(*evicted))) {
-                        throw std::runtime_error("健康事件重试导致待重试槽满载");
-                    }
-                    ESP_LOGW(TAG, "Preserved health event evicted by recovery retry");
-                }
-            }
-            health_enqueue_backoff_.OnSuccess();
-            if (pending_health_events_.size() < kMaxPendingHealthEvents) {
-                health_pending_overflow_alert_ = false;
-            }
-            changed = true;
-        } catch (const std::exception& error) {
-            ESP_LOGE(TAG, "Health event retry still blocked: %s", error.what());
-            health_enqueue_backoff_.OnFailure(esp_timer_get_time());
-        }
     }
     if (has_server_time_.load()) {
         const auto mode_before_refresh = proactive_manager_.config().mode;
@@ -2556,22 +2464,16 @@ void Application::CheckProactiveEvents() {
             event.metadata["source_id"] = std::to_string(follow_up.source_id);
             const auto old_follow_ups = schedule_follow_ups_.items();
             const auto old_queue = proactive_queue_.items();
-            const auto old_pending_health = pending_health_events_;
             try {
                 auto evicted = proactive_queue_.Push(event);
                 if (evicted) {
                     ESP_LOGW(TAG, "Evicted proactive event id=%s for due follow-up",
                              evicted->event_id.c_str());
-                    if (evicted->metadata.count("health_kind") != 0 &&
-                        !PreservePendingHealth(std::move(*evicted))) {
-                        throw std::runtime_error("健康待重试槽已满，追问暂缓入队");
-                    }
                 }
                 schedule_follow_ups_.MarkAsked(follow_up.source_id, follow_up.due_at);
                 if (!TrySaveProactive("due follow-up transaction", true)) {
                     schedule_follow_ups_.Restore(old_follow_ups);
                     proactive_queue_.Restore(old_queue);
-                    pending_health_events_ = old_pending_health;
                     follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
                     ESP_LOGE(TAG, "Rolled back due follow-up id=%lu after save failure",
                              static_cast<unsigned long>(follow_up.source_id));
@@ -2581,7 +2483,6 @@ void Application::CheckProactiveEvents() {
             } catch (const std::exception& error) {
                 schedule_follow_ups_.Restore(old_follow_ups);
                 proactive_queue_.Restore(old_queue);
-                pending_health_events_ = old_pending_health;
                 ESP_LOGE(TAG, "Cannot enqueue due follow-up id=%lu: %s",
                          static_cast<unsigned long>(follow_up.source_id), error.what());
                 follow_up_enqueue_backoff_.OnFailure(esp_timer_get_time());
@@ -2590,7 +2491,7 @@ void Application::CheckProactiveEvents() {
         }
     }
     if (proactive_queue_.DropExpired(now) > 0) changed = true;
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         if (changed) TrySaveProactive("proactive tick while connecting");
         return;
     }
@@ -2655,7 +2556,7 @@ void Application::CheckProactiveEvents() {
 }
 
 bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
-    if (proactive_connection_running_.load()) {
+    if (IsProactiveConnectionBusy()) {
         proactive_deferred_event_bits_ |= MAIN_EVENT_PLAYBACK_DRAINED;
         return false;
     }
@@ -3139,7 +3040,7 @@ std::string Application::DismissScheduleFollowUp() {
 
 void Application::ResetProtocol() {
     Schedule([this]() {
-        if (proactive_connection_running_.load()) {
+        if (IsProactiveConnectionBusy()) {
             proactive_reset_pending_ = true;
             ESP_LOGW(TAG, "Deferring protocol reset until proactive connection finishes");
             return;

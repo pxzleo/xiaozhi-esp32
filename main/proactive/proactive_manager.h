@@ -128,6 +128,7 @@ public:
                                      std::map<std::string, std::string> details);
     std::optional<HealthEvent> Recover(const std::string& kind, std::time_t now);
     static const char* SeverityName(Severity severity);
+    static bool IsSupportedKind(const std::string& kind);
 
 private:
     std::map<std::string, Record> records_;
