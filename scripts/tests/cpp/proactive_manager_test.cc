@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <random>
 #include <stdexcept>
 
 using namespace proactive;
@@ -352,6 +353,15 @@ void TestStateCodec() {
         StateCodec::Decompress(compressed.data(), compressed.size(), state.size() - 1);
     } catch (const std::runtime_error&) { limit_failed = true; }
     assert(limit_failed);
+
+    std::mt19937 generator(0x5a17u);
+    std::string random_state(2048, '\0');
+    for (char& value : random_state) {
+        value = static_cast<char>(generator() & 0xff);
+    }
+    const auto random_compressed = StateCodec::Compress(random_state);
+    assert(StateCodec::Decompress(random_compressed.data(), random_compressed.size(),
+                                  random_state.size()) == random_state);
 }
 
 int main() {
