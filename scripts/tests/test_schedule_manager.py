@@ -234,6 +234,10 @@ class ScheduleManagerTest(unittest.TestCase):
             "pending_proactive_event_ &&", 1
         )[1].split("if (bits & MAIN_EVENT_TOGGLE_CHAT)", 1)[0]
         self.assertIn("SendProactiveEvent(event)", drained)
+        self.assertIn("StartProactiveConnectionWorker()", drained)
+        self.assertLess(drained.index("SendProactiveEvent(event)"),
+                        drained.index("pending_proactive_event_.reset()"))
+        self.assertNotIn("proactive_queue_.Push(event)", drained)
         send_proactive = application.split("bool Application::SendProactiveEvent", 1)[1]
         send_proactive = send_proactive.split("std::string Application::FindFollowUpLabel", 1)[0]
         self.assertIn("protocol_->IsAudioChannelOpened()", send_proactive)
@@ -248,6 +252,15 @@ class ScheduleManagerTest(unittest.TestCase):
             proactive_check.index("audio_service_.PlaySound(Lang::Sounds::OGG_POPUP)"),
         )
         self.assertIn("StartProactiveConnectionWorker()", proactive_check)
+        pending_progress = proactive_check.split("if (pending_proactive_event_", 1)[1]
+        pending_progress = pending_progress.split("if (!pending_proactive_event_", 1)[0]
+        self.assertIn("StartProactiveConnectionWorker()", pending_progress)
+        self.assertIn("MAIN_EVENT_PLAYBACK_DRAINED", pending_progress)
+        send_mcp = application.split("void Application::SendMcpMessage", 1)[1]
+        send_mcp = send_mcp.split("void Application::SetAecMode", 1)[0]
+        self.assertIn("bool accepted = false", send_mcp)
+        self.assertIn("accepted && mcp_broadcast_callback_", send_mcp)
+        self.assertIn("消息等待队列已满", send_mcp)
         worker = application.split("void Application::ProactiveConnectionTask", 1)[1]
         worker = worker.split("void Application::CheckProactiveEvents", 1)[0]
         self.assertIn("protocol_->OpenAudioChannel()", worker)

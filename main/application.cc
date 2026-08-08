@@ -712,24 +712,23 @@ void Application::Run() {
                 StartListeningAudio();
             }
             if (!IsProactiveConnectionBusy() && pending_proactive_event_ &&
-                audio_service_.IsPlaybackIdle()) {
-                auto event = std::move(*pending_proactive_event_);
-                pending_proactive_event_.reset();
+                audio_service_.IsPlaybackIdle() &&
+                proactive_retry_backoff_.Ready(esp_timer_get_time())) {
+                if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
+                    StartProactiveConnectionWorker();
+                    continue;
+                }
+                auto& event = *pending_proactive_event_;
                 const bool sent = SendProactiveEvent(event);
                 RecordProactiveSendResult(sent);
                 if (sent) {
                     proactive_manager_.RecordDelivered(
                         event, std::time(nullptr), has_server_time_.load());
+                    pending_proactive_event_.reset();
+                    TrySaveProactive("pending proactive sent");
                 } else {
                     event.metadata["cue_played"] = "true";
-                    try {
-                        proactive_queue_.Push(event);
-                    } catch (const std::exception& error) {
-                        ESP_LOGE(TAG, "Cannot requeue proactive follow-up: %s", error.what());
-                        pending_proactive_event_ = std::move(event);
-                    }
                 }
-                TrySaveProactive("playback drained");
             }
         }
 
@@ -1931,16 +1930,21 @@ void Application::RegisterMcpBroadcastCallback(std::function<void(const std::str
 void Application::SendMcpMessage(const std::string& payload) {
     // Always schedule to run in main task for thread safety
     Schedule([this, payload]() {
+        bool accepted = false;
         if (IsProactiveConnectionBusy()) {
             if (proactive_deferred_mcp_messages_.size() >= 8) {
                 ESP_LOGE(TAG, "Deferred MCP queue is full while proactive channel connects");
+                Board::GetInstance().GetDisplay()->ShowNotification(
+                    "消息等待队列已满，请稍后重试", 5000);
             } else {
                 proactive_deferred_mcp_messages_.push_back(payload);
+                accepted = true;
             }
         } else if (protocol_) {
             protocol_->SendMcpMessage(payload);
+            accepted = true;
         }
-        if (mcp_broadcast_callback_) {
+        if (accepted && mcp_broadcast_callback_) {
             mcp_broadcast_callback_(payload);
         }
     });
@@ -2632,6 +2636,17 @@ void Application::CheckProactiveEvents() {
     if (proactive_queue_.DropExpired(now) > 0) changed = true;
     if (IsProactiveConnectionBusy()) {
         if (changed) TrySaveProactive("proactive tick while connecting");
+        return;
+    }
+    if (pending_proactive_event_ && !schedule_alert_active_ &&
+        audio_service_.IsPlaybackIdle() &&
+        proactive_retry_backoff_.Ready(esp_timer_get_time())) {
+        if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
+            StartProactiveConnectionWorker();
+        } else {
+            xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+        }
+        if (changed) TrySaveProactive("pending proactive progress");
         return;
     }
     if (!pending_proactive_event_ && !schedule_alert_active_ &&
