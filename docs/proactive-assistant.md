@@ -37,6 +37,7 @@
 ## 服务端外界监测探测（v3）
 
 - 设备完成激活并获得可靠服务端时间后，按设备 MAC 的固定散列在 0 至 30 秒内错峰启动探测；之后空闲时每 5 分钟使用设备鉴权请求 `GET /device/proactive/pending`。请求沿用 manager-api 基址、`Device-Id`、`Client-Id` 与 WebSocket Bearer 令牌，不记录令牌。失败从 5 分钟开始指数退避，最多 30 分钟；成功空结果采用服务端 `retry_after_seconds`，当前为 300 秒。监测开关、城市、来源和存量默认值都由服务端控制，固件不保存第二套配置。
+- manager-api 正常返回带准确非零 `Content-Length` 的 UTF-8 JSON。设备仍兼容中间代理改写出的 `Transfer-Encoding: chunked` 或连接关闭定界响应：声明长度时必须精确读满，未声明长度时读到 HTTP 客户端报告正文结束；两种路径都严格限制正文最多 2048 字节，空正文、截断、读取失败或超限均明确失败并进入探测退避。
 - 安全信封只接受 `pending/event_id/topic/priority/created_at/expires_at/retry_after_seconds`；topic 仅允许 `weather/news`，事件 ID、优先级、时间范围和过期状态都要校验。信封不包含且设备不请求播报文本、事实、新闻链接或事件类型；非法或已过期事件只写受控日志并丢弃。
 - 空结果绝不建立音频 WebSocket。有待播事件且设备空闲、没有闹铃/提醒、本地主动事件、播放、录音或其他连接 worker 时，复用单一主动建链 worker。连接成功后设备只发送 `notifications/assistant/external_triggered`：
 

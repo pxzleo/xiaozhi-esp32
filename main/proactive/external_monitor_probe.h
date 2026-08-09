@@ -1,8 +1,10 @@
 #ifndef EXTERNAL_MONITOR_PROBE_H
 #define EXTERNAL_MONITOR_PROBE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <functional>
 #include <string>
 
 namespace external_monitor {
@@ -39,6 +41,9 @@ private:
 bool IsSupportedTopic(const std::string& topic);
 bool IsSupportedPriority(const std::string& priority);
 bool ParseManagerDateTime(const std::string& value, std::time_t& timestamp);
+bool ReadBoundedResponseBody(size_t declared_length, size_t maximum_length,
+                             const std::function<int(char*, size_t)>& read,
+                             std::string& body, std::string& error);
 
 }  // namespace external_monitor
 

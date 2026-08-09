@@ -220,6 +220,9 @@ class ScheduleManagerTest(unittest.TestCase):
         client = (
             ROOT / "main" / "proactive" / "external_monitor_device.cc"
         ).read_text(encoding="utf-8")
+        probe = (
+            ROOT / "main" / "proactive" / "external_monitor_probe.cc"
+        ).read_text(encoding="utf-8")
         manager = (
             ROOT / "main" / "proactive" / "proactive_manager.cc"
         ).read_text(encoding="utf-8")
@@ -239,7 +242,9 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("kMaximumPendingResponseBytes", client)
         self.assertIn("GetBodyLength()", client)
         self.assertNotIn("ReadAll()", client)
-        self.assertIn("pending响应读取不完整", client)
+        self.assertIn("ReadBoundedResponseBody", client)
+        self.assertIn("pending响应读取不完整", probe)
+        self.assertIn("pending响应超过大小限制", probe)
         self.assertNotIn('"payload"', client)
         self.assertNotIn('"reason"', client)
 

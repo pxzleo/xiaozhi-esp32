@@ -158,21 +158,16 @@ ProbeResult ProbePendingEvent() {
         return {.error = "pending探测HTTP " + std::to_string(status_code)};
     }
     const size_t content_length = http->GetBodyLength();
-    if (content_length == 0 || content_length > kMaximumPendingResponseBytes) {
+    std::string body;
+    std::string error;
+    if (!ReadBoundedResponseBody(
+            content_length, kMaximumPendingResponseBytes,
+            [&http](char* buffer, size_t size) { return http->Read(buffer, size); },
+            body, error)) {
         http->Close();
-        ESP_LOGE(TAG, "Pending probe invalid response length=%u",
-                 static_cast<unsigned>(content_length));
-        return {.error = "pending响应大小无效"};
-    }
-    std::string body(content_length, '\0');
-    size_t total_read = 0;
-    while (total_read < content_length) {
-        const int read = http->Read(body.data() + total_read, content_length - total_read);
-        if (read <= 0 || static_cast<size_t>(read) > content_length - total_read) {
-            http->Close();
-            return {.error = "pending响应读取不完整"};
-        }
-        total_read += static_cast<size_t>(read);
+        ESP_LOGE(TAG, "Pending probe response read failed declared_length=%u error=%s",
+                 static_cast<unsigned>(content_length), error.c_str());
+        return {.error = std::move(error)};
     }
     http->Close();
     return ParseResponse(body);

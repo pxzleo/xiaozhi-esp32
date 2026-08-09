@@ -1,6 +1,7 @@
 #include "external_monitor_probe.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -100,6 +101,63 @@ bool ParseManagerDateTime(const std::string& value, std::time_t& timestamp) {
     }
     timestamp = static_cast<std::time_t>(unix_seconds);
     return true;
+}
+
+bool ReadBoundedResponseBody(size_t declared_length, size_t maximum_length,
+                             const std::function<int(char*, size_t)>& read,
+                             std::string& body, std::string& error) {
+    body.clear();
+    error.clear();
+    if (maximum_length == 0 || declared_length > maximum_length) {
+        error = "pending响应超过大小限制";
+        return false;
+    }
+
+    if (declared_length > 0) {
+        body.resize(declared_length);
+        size_t total_read = 0;
+        while (total_read < declared_length) {
+            const size_t remaining = declared_length - total_read;
+            const int count = read(body.data() + total_read, remaining);
+            if (count < 0) {
+                body.clear();
+                error = "pending响应读取失败";
+                return false;
+            }
+            if (count == 0 || static_cast<size_t>(count) > remaining) {
+                body.clear();
+                error = "pending响应读取不完整";
+                return false;
+            }
+            total_read += static_cast<size_t>(count);
+        }
+        return true;
+    }
+
+    std::array<char, 256> buffer;
+    while (true) {
+        const size_t remaining = maximum_length - body.size();
+        const size_t request_size = remaining < buffer.size() ? remaining + 1 : buffer.size();
+        const int count = read(buffer.data(), request_size);
+        if (count < 0 || static_cast<size_t>(count) > request_size) {
+            body.clear();
+            error = "pending响应读取失败";
+            return false;
+        }
+        if (count == 0) {
+            if (body.empty()) {
+                error = "pending响应为空";
+                return false;
+            }
+            return true;
+        }
+        if (static_cast<size_t>(count) > remaining) {
+            body.clear();
+            error = "pending响应超过大小限制";
+            return false;
+        }
+        body.append(buffer.data(), static_cast<size_t>(count));
+    }
 }
 
 }  // namespace external_monitor

@@ -1,7 +1,10 @@
 #include "external_monitor_probe.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 
 using external_monitor::ProbeSchedule;
 
@@ -48,6 +51,55 @@ int main() {
     assert(!external_monitor::ParseManagerDateTime("2023-02-29 23:59:59", manager_time));
     assert(!external_monitor::ParseManagerDateTime("2026-13-01 00:00:00", manager_time));
     assert(!external_monitor::ParseManagerDateTime("2026-08-09T08:00:00+08:00", manager_time));
+
+    std::string body;
+    std::string error;
+    std::string known_payload = "known-body";
+    size_t known_offset = 0;
+    assert(external_monitor::ReadBoundedResponseBody(
+        known_payload.size(), 32,
+        [&](char* buffer, size_t size) {
+            const size_t count = std::min({size, known_payload.size() - known_offset,
+                                           static_cast<size_t>(3)});
+            std::memcpy(buffer, known_payload.data() + known_offset, count);
+            known_offset += count;
+            return static_cast<int>(count);
+        },
+        body, error));
+    assert(body == known_payload);
+    assert(error.empty());
+
+    std::string chunked_payload = "chunked-body";
+    size_t chunked_offset = 0;
+    assert(external_monitor::ReadBoundedResponseBody(
+        0, 32,
+        [&](char* buffer, size_t size) {
+            if (chunked_offset == chunked_payload.size()) return 0;
+            const size_t count = std::min({size, chunked_payload.size() - chunked_offset,
+                                           static_cast<size_t>(2)});
+            std::memcpy(buffer, chunked_payload.data() + chunked_offset, count);
+            chunked_offset += count;
+            return static_cast<int>(count);
+        },
+        body, error));
+    assert(body == chunked_payload);
+    assert(error.empty());
+
+    assert(!external_monitor::ReadBoundedResponseBody(
+        0, 4, [](char* buffer, size_t) {
+            std::memcpy(buffer, "12345", 5);
+            return 5;
+        }, body, error));
+    assert(error == "pending响应超过大小限制");
+    assert(!external_monitor::ReadBoundedResponseBody(
+        5, 32, [](char*, size_t) { return 0; }, body, error));
+    assert(error == "pending响应读取不完整");
+    assert(!external_monitor::ReadBoundedResponseBody(
+        0, 32, [](char*, size_t) { return -1; }, body, error));
+    assert(error == "pending响应读取失败");
+    assert(!external_monitor::ReadBoundedResponseBody(
+        0, 32, [](char*, size_t) { return 0; }, body, error));
+    assert(error == "pending响应为空");
 
     bool empty_rejected = false;
     try {
