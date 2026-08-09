@@ -2639,7 +2639,6 @@ void Application::FinishProactiveConnection(bool success, uint32_t protocol_gene
     proactive_deferred_event_bits_ = 0;
     const bool external_preempted = external_connection &&
         (!success || reset_pending || close_pending || reboot_pending ||
-         !proactive_deferred_mcp_messages_.empty() ||
          !proactive_deferred_actions_.empty());
     if (external_preempted) {
         proactive_connection_purpose_ = ProactiveConnectionPurpose::kNone;

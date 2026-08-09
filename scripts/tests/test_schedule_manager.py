@@ -294,6 +294,12 @@ class ScheduleManagerTest(unittest.TestCase):
         )[1].split("void Application::ProactiveConnectionTask", 1)[0]
         self.assertIn("purpose == ProactiveConnectionPurpose::kExternal", connection_start)
         self.assertIn("external_delivery_retry_after_us_", connection_start)
+        finish = application.split("void Application::FinishProactiveConnection", 1)[1]
+        finish = finish.split("bool Application::StartExternalProbeWorker", 1)[0]
+        external_preempted = finish.split("const bool external_preempted", 1)[1]
+        external_preempted = external_preempted.split(";", 1)[0]
+        self.assertNotIn("proactive_deferred_mcp_messages_", external_preempted)
+        self.assertIn("proactive_deferred_actions_", external_preempted)
 
     def test_device_integration_contract(self):
         application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
