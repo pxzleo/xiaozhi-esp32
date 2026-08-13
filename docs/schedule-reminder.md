@@ -36,3 +36,11 @@
 ## 验证范围
 
 主机测试覆盖容量上限、五种重复、跨天、重启恢复与补响、到期去重、删除、清空、停止、稍后提醒、提醒交付状态机，以及完成确认的 10 分钟到期、完成、延后、取消、重启恢复、过期丢弃和不递归契约；静态检查 MCP 与 Application 接线。完整的“提醒 TTS→10 分钟追问→自动收听”链路仍需真机验证，同时验证 NVS 掉电恢复、系统时间同步、提示音循环时长、80% 临时音量、WebSocket/MQTT 网络切换、圆屏布局和 BOOT 实体按键。
+
+## 账号级共享与离线副本
+
+服务端是共享日程及其版本的权威来源，设备继续保留 `schedule::Manager` 作为最多 16 项的离线执行副本。旧 NVS 任务启动时以本地数字 ID 迁移为稳定 `source_schedule_id`，在服务端注册成功后由 `notifications/schedule/sync` 增量写回 UUID、版本和下一触发时间；只有 `is_local_source=true` 才能用来源 ID 绑定未注册本地任务，远端任务只能按 UUID 匹配。普通增量只有明确的 delete tombstone 才删除副本；`full_snapshot=true` 开始的完整快照会跨页持久累计权威 UUID，仅在成功保存末页后一次清除本轮缺席的已绑定副本，未绑定本地任务保留，失败或中断不会半清理。容量不足时整批变更明确失败并保留原状态。
+
+Python 连接层代持 manager-api 凭据，音箱不直接访问内部 API。同步和动作分别使用 `notifications/schedule/sync` 与 `notifications/schedule/action`；设备成功写入 NVS 后才回发 `notifications/schedule/sync_applied` 或 `notifications/schedule/action_applied`。stop/complete/delete 会停止匹配的当前铃声并移除排队项；snooze 使用服务端统一的 `snoozed_until`，重复任务仍按 `next_trigger_at` 保留原下一次计划。重复 revision 可安全重放。
+
+本地到点仍先响，不因服务端不可达而失效。每次到期以 `schedule_uuid + occurrence_at`（尚未绑定时用 `source_schedule_id + occurrence_at`）写入持久离线记录；普通重试队列已满时按日程写入受控溢出记录（保存首次时间、最新时间和累计次数），仍按时响铃并推进本地重复周期。容量释放后溢出记录自动转入普通队列，重启不会重复响，连接恢复后以 `speak=false` 重报，服务端按同一 occurrence 幂等。权威同步返回相同或更新的 `last_triggered_at`，或收到对应 stop/complete/delete 后，设备清除该离线记录。

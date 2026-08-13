@@ -232,6 +232,8 @@ private:
     ProactiveConnectionPurpose proactive_connection_purpose_ =
         ProactiveConnectionPurpose::kNone;
     int64_t external_delivery_retry_after_us_ = 0;
+    int64_t schedule_replay_retry_after_us_ = 0;
+    bool schedule_outbox_full_reported_ = false;
     int64_t external_non_owned_channel_idle_since_us_ = 0;
     external_monitor::ProbeResult external_probe_finish_result_;
     TaskHandle_t activation_task_handle_ = nullptr;
@@ -283,7 +285,8 @@ private:
     void FinishScheduleAlert(bool reset_decoder = true, bool reset_delivery = true);
     void RestoreScheduleAlertVolume();
     void RestoreScheduleAlertVolumeAfterDelivery();
-    bool NotifyReminderTriggered(const schedule::Task& task, std::time_t now);
+    bool NotifyReminderTriggered(const schedule::Task& task, std::time_t occurrence_at,
+                                 bool speak = true);
 
     // Activation task (runs in background)
     void ActivationTask();
@@ -293,6 +296,9 @@ private:
     void CheckNewVersion();
     void InitializeProtocol();
     bool HandleNeteaseLyricsNotification(const cJSON* payload);
+    bool HandleScheduleSyncNotification(const cJSON* payload);
+    bool HandleScheduleActionNotification(const cJSON* payload);
+    void SendScheduleSyncApplied(uint64_t through_revision, bool action);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

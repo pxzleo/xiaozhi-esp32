@@ -1,7 +1,9 @@
 #include "schedule_manager.h"
 
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace schedule {
 
@@ -130,31 +132,142 @@ std::string FormatClock(std::time_t timestamp) {
     return result;
 }
 
+bool IsUuidV4(const std::string& value) {
+    if (value.size() != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' ||
+        value[23] != '-' || value[14] != '4' ||
+        std::string("89abAB").find(value[19]) == std::string::npos) {
+        return false;
+    }
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
+        if (!std::isxdigit(static_cast<unsigned char>(value[i]))) return false;
+    }
+    return true;
+}
+
+bool IsSourceScheduleId(const std::string& value) {
+    return !value.empty() && value.size() <= 64 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isdigit(character) != 0;
+        });
+}
+
+void ValidateTaskFields(const Task& task) {
+    const auto label = AnalyzeUtf8(task.label);
+    if (task.id == 0 || task.trigger_at <= 0 || !label.valid || label.count < 1 ||
+        label.count > 80 || !label.has_non_whitespace) {
+        throw std::invalid_argument("保存的定时任务字段无效");
+    }
+    if (task.repeat == Repeat::kWeekly && task.weekdays.empty()) {
+        throw std::invalid_argument("保存的weekly任务缺少weekdays");
+    }
+    ValidateBriefing(task.kind, task.sections, task.location);
+    for (int day : task.weekdays) {
+        if (day < 1 || day > 7) throw std::invalid_argument("保存的weekday超出1到7");
+    }
+    if (!task.source_schedule_id.empty() && !IsSourceScheduleId(task.source_schedule_id)) {
+        throw std::invalid_argument("保存的源日程ID无效");
+    }
+    if (!task.schedule_uuid.empty() && !IsUuidV4(task.schedule_uuid)) {
+        throw std::invalid_argument("保存的共享日程UUID无效");
+    }
+    if (task.sync_state == SyncState::kSynced &&
+        (task.schedule_uuid.empty() || task.schedule_version == 0)) {
+        throw std::invalid_argument("已同步日程缺少权威版本");
+    }
+}
+
 }  // namespace
 
-void Manager::Restore(std::vector<Task> tasks, uint32_t next_id) {
+void Manager::Restore(std::vector<Task> tasks, uint32_t next_id,
+                      std::vector<PendingOccurrence> pending_occurrences,
+                      uint64_t snapshot_revision, uint64_t action_revision,
+                      bool full_snapshot_in_progress,
+                      std::vector<std::string> full_snapshot_seen_uuids,
+                      std::vector<AuthorityTask> full_snapshot_staged_tasks,
+                      std::vector<OverflowOccurrence> overflow_occurrences) {
     if (tasks.size() > kMaxTasks) {
         throw std::invalid_argument("保存的定时任务超过16项");
     }
     uint32_t max_id = 0;
-    for (const auto& task : tasks) {
-        const auto label = AnalyzeUtf8(task.label);
-        if (task.id == 0 || task.trigger_at <= 0 || !label.valid || label.count < 1 ||
-            label.count > 80 || !label.has_non_whitespace) {
-            throw std::invalid_argument("保存的定时任务字段无效");
-        }
-        if (task.repeat == Repeat::kWeekly && task.weekdays.empty()) {
-            throw std::invalid_argument("保存的weekly任务缺少weekdays");
-        }
-        ValidateBriefing(task.kind, task.sections, task.location);
-        for (int day : task.weekdays) {
-            if (day < 1 || day > 7) throw std::invalid_argument("保存的weekday超出1到7");
-        }
+    for (auto& task : tasks) {
+        if (task.source_schedule_id.empty()) task.source_schedule_id = std::to_string(task.id);
+        ValidateTaskFields(task);
         max_id = std::max(max_id, task.id);
     }
     if (next_id <= max_id) throw std::invalid_argument("保存的next_id没有递增");
+    if (pending_occurrences.size() > kMaxPendingOccurrences) {
+        throw std::invalid_argument("保存的离线触发记录超过16项");
+    }
+    for (const auto& occurrence : pending_occurrences) {
+        if (occurrence.local_id == 0 || occurrence.occurrence_at <= 0 ||
+            !IsSourceScheduleId(occurrence.source_schedule_id) ||
+            (!occurrence.schedule_uuid.empty() && !IsUuidV4(occurrence.schedule_uuid))) {
+            throw std::invalid_argument("保存的离线触发记录无效");
+        }
+    }
+    if (overflow_occurrences.size() > kMaxTasks) {
+        throw std::invalid_argument("保存的离线触发溢出记录超过16项");
+    }
+    for (const auto& overflow : overflow_occurrences) {
+        const auto& occurrence = overflow.occurrence;
+        if (overflow.count == 0 || overflow.first_at <= 0 ||
+            occurrence.local_id == 0 || occurrence.occurrence_at < overflow.first_at ||
+            !IsSourceScheduleId(occurrence.source_schedule_id) ||
+            (!occurrence.schedule_uuid.empty() && !IsUuidV4(occurrence.schedule_uuid))) {
+            throw std::invalid_argument("保存的离线触发溢出记录无效");
+        }
+    }
+    if (!full_snapshot_in_progress && !full_snapshot_seen_uuids.empty()) {
+        throw std::invalid_argument("未进行完整快照时不能保存已见UUID");
+    }
+    if (!full_snapshot_in_progress && !full_snapshot_staged_tasks.empty()) {
+        throw std::invalid_argument("未进行完整快照时不能保存暂存任务");
+    }
+    if (full_snapshot_seen_uuids.size() > kMaxTasks) {
+        throw std::invalid_argument("完整快照已见UUID超过本地容量");
+    }
+    std::unordered_set<std::string> seen;
+    for (const auto& uuid : full_snapshot_seen_uuids) {
+        if (!IsUuidV4(uuid) || !seen.insert(uuid).second) {
+            throw std::invalid_argument("完整快照已见UUID无效");
+        }
+    }
+    if (full_snapshot_staged_tasks.size() > kMaxTasks) {
+        throw std::invalid_argument("完整快照暂存任务超过本地容量");
+    }
+    std::unordered_set<std::string> staged_uuids;
+    for (const auto& authority : full_snapshot_staged_tasks) {
+        if (authority.deleted || authority.revision == 0 ||
+            !IsUuidV4(authority.schedule_uuid) || authority.version == 0 ||
+            !IsSourceScheduleId(authority.source_schedule_id) ||
+            !staged_uuids.insert(authority.schedule_uuid).second) {
+            throw std::invalid_argument("完整快照暂存任务无效");
+        }
+        Task staged;
+        staged.id = 1;
+        staged.kind = authority.kind;
+        staged.repeat = authority.repeat;
+        staged.label = authority.label;
+        staged.trigger_at = authority.trigger_at;
+        staged.weekdays = authority.weekdays;
+        staged.sections = authority.sections;
+        staged.location = authority.location;
+        staged.source_schedule_id = authority.source_schedule_id;
+        staged.schedule_uuid = authority.schedule_uuid;
+        staged.schedule_version = authority.version;
+        staged.sync_state = SyncState::kSynced;
+        ValidateTaskFields(staged);
+    }
     tasks_ = std::move(tasks);
+    pending_occurrences_ = std::move(pending_occurrences);
+    overflow_occurrences_ = std::move(overflow_occurrences);
     next_id_ = std::max<uint32_t>(next_id, 1);
+    snapshot_revision_ = snapshot_revision;
+    action_revision_ = action_revision;
+    full_snapshot_in_progress_ = full_snapshot_in_progress;
+    full_snapshot_seen_uuids_ = std::move(full_snapshot_seen_uuids);
+    full_snapshot_staged_tasks_ = std::move(full_snapshot_staged_tasks);
     recovery_pending_ = true;
 }
 
@@ -213,6 +326,8 @@ Task Manager::Create(const CreateRequest& request, std::time_t now) {
     std::sort(task.weekdays.begin(), task.weekdays.end());
     task.weekdays.erase(std::unique(task.weekdays.begin(), task.weekdays.end()),
                         task.weekdays.end());
+    task.source_schedule_id = std::to_string(task.id);
+    task.local_source = true;
     tasks_.push_back(task);
     return task;
 }
@@ -229,7 +344,14 @@ Task Manager::Snooze(const Task& source, int minutes, std::time_t now) {
     request.repeat = Repeat::kOnce;
     request.label = source.label;
     request.delay_seconds = minutes * 60;
-    return Create(request, now);
+    const auto created = Create(request, now);
+    auto found = std::find_if(tasks_.begin(), tasks_.end(),
+                              [id = created.id](const Task& task) { return task.id == id; });
+    found->source_schedule_id = source.source_schedule_id;
+    found->schedule_uuid = source.schedule_uuid;
+    found->schedule_version = source.schedule_version;
+    found->sync_state = source.schedule_uuid.empty() ? SyncState::kPending : SyncState::kDirty;
+    return *found;
 }
 
 bool Manager::Delete(uint32_t id) {
@@ -240,16 +362,494 @@ bool Manager::Delete(uint32_t id) {
     return tasks_.size() != old_size;
 }
 
+bool Manager::DeleteByScheduleUuid(const std::string& schedule_uuid) {
+    const auto old_size = tasks_.size();
+    tasks_.erase(std::remove_if(tasks_.begin(), tasks_.end(),
+        [&schedule_uuid](const Task& task) { return task.schedule_uuid == schedule_uuid; }),
+        tasks_.end());
+    return tasks_.size() != old_size;
+}
+
 const Task* Manager::Find(uint32_t id) const {
     auto found = std::find_if(tasks_.begin(), tasks_.end(),
                               [id](const Task& task) { return task.id == id; });
     return found == tasks_.end() ? nullptr : &*found;
 }
 
-std::vector<Task> Manager::List(KindFilter filter) const {
+const Task* Manager::FindByScheduleUuid(const std::string& schedule_uuid) const {
+    auto found = std::find_if(tasks_.begin(), tasks_.end(),
+                              [&schedule_uuid](const Task& task) {
+                                  return task.schedule_uuid == schedule_uuid;
+                              });
+    return found == tasks_.end() ? nullptr : &*found;
+}
+
+bool Manager::BindAuthority(uint32_t local_id, const std::string& schedule_uuid,
+                            uint32_t version) {
+    if (!IsUuidV4(schedule_uuid) || version == 0) {
+        throw std::invalid_argument("共享日程权威标识无效");
+    }
+    auto found = std::find_if(tasks_.begin(), tasks_.end(),
+                              [local_id](const Task& task) { return task.id == local_id; });
+    if (found == tasks_.end()) return false;
+    const auto duplicate = std::find_if(tasks_.begin(), tasks_.end(),
+        [&schedule_uuid, local_id](const Task& task) {
+            return task.id != local_id && task.schedule_uuid == schedule_uuid;
+        });
+    if (duplicate != tasks_.end()) throw std::invalid_argument("共享日程UUID重复");
+    found->schedule_uuid = schedule_uuid;
+    found->schedule_version = version;
+    found->sync_state = SyncState::kSynced;
+    return true;
+}
+
+bool Manager::RecordOccurrence(const Task& task, std::time_t occurrence_at) {
+    if (occurrence_at <= 0) throw std::invalid_argument("触发时间无效");
+    const auto duplicate = std::find_if(pending_occurrences_.begin(),
+        pending_occurrences_.end(), [&task, occurrence_at](const PendingOccurrence& item) {
+            return item.local_id == task.id && item.occurrence_at == occurrence_at;
+        });
+    if (duplicate != pending_occurrences_.end()) return true;
+    if (pending_occurrences_.size() >= kMaxPendingOccurrences) {
+        auto overflow = std::find_if(overflow_occurrences_.begin(),
+            overflow_occurrences_.end(), [&](const OverflowOccurrence& item) {
+                return !task.schedule_uuid.empty()
+                    ? item.occurrence.schedule_uuid == task.schedule_uuid
+                    : item.occurrence.local_id == task.id;
+            });
+        if (overflow == overflow_occurrences_.end()) {
+            if (overflow_occurrences_.size() >= kMaxTasks) return false;
+            PendingOccurrence occurrence{task.id, task.source_schedule_id,
+                task.schedule_uuid, task.kind, task.label, task.sections, task.location,
+                occurrence_at};
+            overflow_occurrences_.push_back({std::move(occurrence), occurrence_at, 1});
+        } else {
+            overflow->occurrence.occurrence_at = occurrence_at;
+            ++overflow->count;
+        }
+        return true;
+    }
+    pending_occurrences_.push_back({task.id, task.source_schedule_id, task.schedule_uuid,
+                                    task.kind, task.label, task.sections, task.location,
+                                    occurrence_at});
+    return true;
+}
+
+bool Manager::PromoteOverflowOccurrence() {
+    if (overflow_occurrences_.empty() ||
+        pending_occurrences_.size() >= kMaxPendingOccurrences) return false;
+    pending_occurrences_.push_back(overflow_occurrences_.front().occurrence);
+    overflow_occurrences_.erase(overflow_occurrences_.begin());
+    return true;
+}
+
+bool Manager::AcknowledgeOccurrence(const std::string& schedule_uuid, uint32_t local_id,
+                                    std::time_t occurrence_at) {
+    const auto old_size = pending_occurrences_.size();
+    pending_occurrences_.erase(std::remove_if(pending_occurrences_.begin(),
+        pending_occurrences_.end(), [&](const PendingOccurrence& item) {
+            const bool same_schedule = !schedule_uuid.empty()
+                ? item.schedule_uuid == schedule_uuid : item.local_id == local_id;
+            return same_schedule && item.occurrence_at <= occurrence_at;
+        }), pending_occurrences_.end());
+    const bool removed = pending_occurrences_.size() != old_size;
+    PromoteOverflowOccurrence();
+    return removed;
+}
+
+size_t Manager::RemovePendingOccurrences(const std::string& schedule_uuid,
+                                         const std::string& source_schedule_id,
+                                         bool local_source,
+                                         std::time_t through_occurrence) {
+    const auto old_size = pending_occurrences_.size();
+    pending_occurrences_.erase(std::remove_if(pending_occurrences_.begin(),
+        pending_occurrences_.end(), [&](const PendingOccurrence& occurrence) {
+            const bool matches = (!schedule_uuid.empty() &&
+                                  occurrence.schedule_uuid == schedule_uuid) ||
+                (local_source && occurrence.schedule_uuid.empty() &&
+                 occurrence.source_schedule_id == source_schedule_id);
+            return matches && (through_occurrence <= 0 ||
+                               occurrence.occurrence_at <= through_occurrence);
+        }), pending_occurrences_.end());
+    overflow_occurrences_.erase(std::remove_if(overflow_occurrences_.begin(),
+        overflow_occurrences_.end(), [&](const OverflowOccurrence& item) {
+            const auto& occurrence = item.occurrence;
+            const bool matches = (!schedule_uuid.empty() &&
+                                  occurrence.schedule_uuid == schedule_uuid) ||
+                (local_source && occurrence.schedule_uuid.empty() &&
+                 occurrence.source_schedule_id == source_schedule_id);
+            return matches && (through_occurrence <= 0 ||
+                               occurrence.occurrence_at <= through_occurrence);
+        }), overflow_occurrences_.end());
+    while (PromoteOverflowOccurrence()) {}
+    return old_size - pending_occurrences_.size();
+}
+
+SnapshotResult Manager::ApplyAuthorityChanges(
+    uint64_t cursor, const std::vector<AuthorityTask>& authority_tasks,
+    bool full_snapshot, bool has_more) {
+    if (cursor == 0) {
+        if (!authority_tasks.empty()) {
+            throw std::invalid_argument("零游标不能携带共享日程变更");
+        }
+    }
+    const bool starting_full_snapshot = full_snapshot;
+    const bool collecting_full_snapshot = starting_full_snapshot || full_snapshot_in_progress_;
+    const uint64_t validation_revision = starting_full_snapshot ? 0 : snapshot_revision_;
+    if (!collecting_full_snapshot && cursor <= snapshot_revision_) return {};
+    if (collecting_full_snapshot && !starting_full_snapshot && cursor < snapshot_revision_) {
+        throw std::invalid_argument("完整快照分页游标倒退");
+    }
+    std::unordered_set<std::string> uuids;
+    for (const auto& authority : authority_tasks) {
+        if (authority.revision == 0 || authority.revision > cursor ||
+            authority.revision <= validation_revision ||
+            !IsUuidV4(authority.schedule_uuid) ||
+            authority.version == 0 || !IsSourceScheduleId(authority.source_schedule_id)) {
+            throw std::invalid_argument("共享日程变更版本无效");
+        }
+        if (authority.deleted) continue;
+        Task validated;
+        validated.id = 1;
+        validated.kind = authority.kind;
+        validated.repeat = authority.repeat;
+        validated.label = authority.label;
+        validated.trigger_at = authority.trigger_at;
+        validated.weekdays = authority.weekdays;
+        validated.sections = authority.sections;
+        validated.location = authority.location;
+        validated.source_schedule_id = authority.source_schedule_id;
+        validated.schedule_uuid = authority.schedule_uuid;
+        validated.schedule_version = authority.version;
+        validated.sync_state = SyncState::kSynced;
+        ValidateTaskFields(validated);
+        if (!uuids.insert(authority.schedule_uuid).second) {
+            throw std::invalid_argument("共享日程快照UUID重复");
+        }
+    }
+
+    std::vector<AuthorityTask> staged = starting_full_snapshot
+        ? std::vector<AuthorityTask>{} : full_snapshot_staged_tasks_;
+    if (collecting_full_snapshot) {
+        for (const auto& authority : authority_tasks) {
+            auto found = std::find_if(staged.begin(), staged.end(), [&](const AuthorityTask& item) {
+                return item.schedule_uuid == authority.schedule_uuid;
+            });
+            if (authority.deleted) {
+                if (found != staged.end()) staged.erase(found);
+                continue;
+            }
+            if (found == staged.end()) {
+                if (staged.size() >= kMaxTasks) {
+                    throw std::runtime_error("完整快照权威任务超过16项容量");
+                }
+                staged.push_back(authority);
+            } else {
+                *found = authority;
+            }
+        }
+        if (tasks_.size() + staged.size() + pending_occurrences_.size() >
+            kMaxPersistentFullRecords) {
+            throw std::runtime_error("完整快照与离线记录超过NVS持久预算");
+        }
+        if (has_more) {
+            full_snapshot_in_progress_ = true;
+            full_snapshot_staged_tasks_ = std::move(staged);
+            full_snapshot_seen_uuids_.clear();
+            for (const auto& authority : full_snapshot_staged_tasks_) {
+                full_snapshot_seen_uuids_.push_back(authority.schedule_uuid);
+            }
+            snapshot_revision_ = cursor;
+            return {true, {}};
+        }
+    }
+
+    const auto& applied_authority_tasks = collecting_full_snapshot ? staged : authority_tasks;
+
+    auto updated = tasks_;
+    auto updated_occurrences = pending_occurrences_;
+    auto updated_overflow = overflow_occurrences_;
+    uint32_t updated_next_id = next_id_;
+    SnapshotResult result;
+    if (collecting_full_snapshot) {
+        const auto present = [&](const std::string& uuid) {
+            return std::any_of(staged.begin(), staged.end(), [&](const AuthorityTask& item) {
+                return item.schedule_uuid == uuid;
+            });
+        };
+        updated.erase(std::remove_if(updated.begin(), updated.end(), [&](const Task& task) {
+            if (task.schedule_uuid.empty() || present(task.schedule_uuid)) return false;
+            result.removed_local_ids.push_back(task.id);
+            return true;
+        }), updated.end());
+    }
+    for (const auto& authority : applied_authority_tasks) {
+        if (authority.deleted) continue;
+        auto found = std::find_if(updated.begin(), updated.end(),
+            [&authority](const Task& task) {
+                if (!task.schedule_uuid.empty()) {
+                    return task.schedule_uuid == authority.schedule_uuid;
+                }
+                return authority.local_source && task.sync_state == SyncState::kPending &&
+                    task.source_schedule_id == authority.source_schedule_id;
+            });
+        if (authority.local_source) {
+            for (auto& occurrence : updated_occurrences) {
+                if (occurrence.source_schedule_id == authority.source_schedule_id) {
+                    occurrence.schedule_uuid = authority.schedule_uuid;
+                }
+            }
+            for (auto& overflow : updated_overflow) {
+                if (overflow.occurrence.source_schedule_id == authority.source_schedule_id) {
+                    overflow.occurrence.schedule_uuid = authority.schedule_uuid;
+                }
+            }
+        }
+        if (authority.last_triggered_at > 0) {
+            updated_occurrences.erase(std::remove_if(updated_occurrences.begin(),
+                updated_occurrences.end(), [&authority](const PendingOccurrence& occurrence) {
+                    return occurrence.schedule_uuid == authority.schedule_uuid &&
+                        occurrence.occurrence_at <= authority.last_triggered_at;
+                }), updated_occurrences.end());
+            updated_overflow.erase(std::remove_if(updated_overflow.begin(),
+                updated_overflow.end(), [&authority](const OverflowOccurrence& overflow) {
+                    return overflow.occurrence.schedule_uuid == authority.schedule_uuid &&
+                        overflow.occurrence.occurrence_at <= authority.last_triggered_at;
+                }), updated_overflow.end());
+        }
+        if (found != updated.end() && !found->schedule_uuid.empty() &&
+            (found->schedule_version > authority.version ||
+             (found->sync_state == SyncState::kDirty &&
+              found->schedule_version == authority.version))) {
+            continue;
+        }
+        if (found != updated.end() && found->schedule_uuid == authority.schedule_uuid &&
+            found->schedule_version == authority.version &&
+            found->sync_state == SyncState::kSynced) {
+            continue;
+        }
+        if (found == updated.end() && !authority.enabled) {
+            continue;
+        }
+        if (found == updated.end()) {
+            if (updated.size() >= kMaxTasks) {
+                throw std::runtime_error("共享日程同步后超过16项容量");
+            }
+            Task task;
+            task.id = updated_next_id++;
+            updated.push_back(std::move(task));
+            found = std::prev(updated.end());
+        }
+        found->kind = authority.kind;
+        found->repeat = authority.repeat;
+        found->label = authority.label;
+        found->trigger_at = authority.snoozed_until > 0 && authority.repeat == Repeat::kOnce
+            ? authority.snoozed_until : authority.trigger_at;
+        found->weekdays = authority.weekdays;
+        found->sections = authority.sections;
+        found->location = authority.location;
+        found->source_schedule_id = authority.source_schedule_id;
+        found->schedule_uuid = authority.schedule_uuid;
+        found->schedule_version = authority.version;
+        found->sync_state = SyncState::kSynced;
+        found->enabled = authority.enabled;
+        found->local_source = authority.local_source;
+        if (authority.snoozed_until > 0 && authority.repeat != Repeat::kOnce) {
+            const auto override = std::find_if(updated.begin(), updated.end(),
+                [&](const Task& task) {
+                    return task.schedule_uuid == authority.schedule_uuid &&
+                        task.repeat == Repeat::kOnce &&
+                        task.trigger_at == authority.snoozed_until;
+                });
+            if (override == updated.end()) {
+                if (updated.size() >= kMaxTasks) {
+                    throw std::runtime_error("共享日程同步后超过16项容量");
+                }
+                Task copy = *found;
+                copy.id = updated_next_id++;
+                copy.repeat = Repeat::kOnce;
+                copy.weekdays.clear();
+                copy.trigger_at = authority.snoozed_until;
+                copy.local_source = authority.local_source;
+                updated.push_back(std::move(copy));
+            } else {
+                override->schedule_version = authority.version;
+                override->sync_state = SyncState::kSynced;
+                override->enabled = true;
+            }
+        } else if (authority.repeat != Repeat::kOnce) {
+            const uint32_t canonical_id = found->id;
+            updated.erase(std::remove_if(updated.begin(), updated.end(),
+                [&](const Task& task) {
+                    return task.id != canonical_id &&
+                        task.schedule_uuid == authority.schedule_uuid &&
+                        task.repeat == Repeat::kOnce;
+                }), updated.end());
+        }
+    }
+
+    for (const auto& authority : applied_authority_tasks) {
+        if (!authority.deleted) continue;
+        updated.erase(std::remove_if(updated.begin(), updated.end(), [&](const Task& task) {
+            const bool matches = task.schedule_uuid == authority.schedule_uuid ||
+                (authority.local_source && task.schedule_uuid.empty() &&
+                 task.source_schedule_id == authority.source_schedule_id);
+            if (!matches) return false;
+            result.removed_local_ids.push_back(task.id);
+            return true;
+        }), updated.end());
+        updated_occurrences.erase(std::remove_if(updated_occurrences.begin(),
+            updated_occurrences.end(), [&](const PendingOccurrence& occurrence) {
+                return occurrence.schedule_uuid == authority.schedule_uuid ||
+                    (authority.local_source && occurrence.schedule_uuid.empty() &&
+                     occurrence.source_schedule_id == authority.source_schedule_id);
+        }), updated_occurrences.end());
+        updated_overflow.erase(std::remove_if(updated_overflow.begin(),
+            updated_overflow.end(), [&](const OverflowOccurrence& overflow) {
+                const auto& occurrence = overflow.occurrence;
+                return occurrence.schedule_uuid == authority.schedule_uuid ||
+                    (authority.local_source && occurrence.schedule_uuid.empty() &&
+                     occurrence.source_schedule_id == authority.source_schedule_id);
+            }), updated_overflow.end());
+    }
+    bool updated_snapshot_in_progress = false;
+    if (collecting_full_snapshot && !has_more) {
+        const auto was_seen = [&](const std::string& uuid) {
+            return std::any_of(staged.begin(), staged.end(), [&](const AuthorityTask& item) {
+                return item.schedule_uuid == uuid;
+            });
+        };
+        updated.erase(std::remove_if(updated.begin(), updated.end(), [&](const Task& task) {
+            if (task.schedule_uuid.empty() || was_seen(task.schedule_uuid)) return false;
+            result.removed_local_ids.push_back(task.id);
+            return true;
+        }), updated.end());
+        updated_occurrences.erase(std::remove_if(updated_occurrences.begin(),
+            updated_occurrences.end(), [&](const PendingOccurrence& occurrence) {
+                return !occurrence.schedule_uuid.empty() &&
+                    !was_seen(occurrence.schedule_uuid);
+            }), updated_occurrences.end());
+        updated_overflow.erase(std::remove_if(updated_overflow.begin(),
+            updated_overflow.end(), [&](const OverflowOccurrence& overflow) {
+                return !overflow.occurrence.schedule_uuid.empty() &&
+                    !was_seen(overflow.occurrence.schedule_uuid);
+            }), updated_overflow.end());
+    }
+    while (!updated_overflow.empty() && updated_occurrences.size() < kMaxPendingOccurrences) {
+        updated_occurrences.push_back(updated_overflow.front().occurrence);
+        updated_overflow.erase(updated_overflow.begin());
+    }
+    result.changed = true;
+    tasks_ = std::move(updated);
+    pending_occurrences_ = std::move(updated_occurrences);
+    overflow_occurrences_ = std::move(updated_overflow);
+    next_id_ = updated_next_id;
+    snapshot_revision_ = cursor;
+    full_snapshot_in_progress_ = updated_snapshot_in_progress;
+    full_snapshot_seen_uuids_.clear();
+    full_snapshot_staged_tasks_.clear();
+    return result;
+}
+
+bool Manager::ApplyAuthorityAction(uint64_t revision, const std::string& schedule_uuid,
+                                   uint32_t schedule_version, const std::string& action,
+                                   std::time_t snoozed_until, std::time_t next_trigger_at,
+                                   const Task* active_source) {
+    if (revision == 0 || !IsUuidV4(schedule_uuid) || schedule_version == 0 ||
+        (action != "stop" && action != "complete" && action != "snooze" &&
+         action != "delete")) {
+        throw std::invalid_argument("共享日程动作字段无效");
+    }
+    if (revision <= action_revision_) return false;
+    auto updated = tasks_;
+    uint32_t updated_next_id = next_id_;
+    const auto is_target = [&schedule_uuid](const Task& task) {
+        return task.schedule_uuid == schedule_uuid;
+    };
+    if (std::any_of(updated.begin(), updated.end(), [&](const Task& task) {
+            return is_target(task) && task.schedule_version > schedule_version;
+        })) {
+        throw std::runtime_error("共享日程动作版本早于本地副本");
+    }
+    auto found = std::find_if(updated.begin(), updated.end(), is_target);
+    if (action == "delete" || ((action == "stop" || action == "complete") &&
+                                next_trigger_at <= 0)) {
+        updated.erase(std::remove_if(updated.begin(), updated.end(), is_target), updated.end());
+        RemovePendingOccurrences(schedule_uuid, "", false);
+    } else if (action == "snooze") {
+        if (snoozed_until <= 0) throw std::invalid_argument("稍后提醒缺少统一时间");
+        if (found == updated.end() && active_source != nullptr) {
+            if (updated.size() >= kMaxTasks) {
+                throw std::runtime_error("稍后提醒无法写入已满的本地日程");
+            }
+            Task copy = *active_source;
+            copy.id = updated_next_id++;
+            copy.schedule_uuid = schedule_uuid;
+            updated.push_back(std::move(copy));
+            found = std::prev(updated.end());
+        }
+        if (found == updated.end()) {
+            action_revision_ = revision;
+            return true;
+        }
+        const bool recurring = std::any_of(updated.begin(), updated.end(),
+            [&](const Task& task) { return is_target(task) && task.repeat != Repeat::kOnce; });
+        if (recurring) {
+            auto canonical = std::find_if(updated.begin(), updated.end(),
+                [&](const Task& task) { return is_target(task) && task.repeat != Repeat::kOnce; });
+            if (next_trigger_at > 0) canonical->trigger_at = next_trigger_at;
+            canonical->enabled = true;
+            auto override = std::find_if(updated.begin(), updated.end(),
+                [&](const Task& task) {
+                    return is_target(task) && task.repeat == Repeat::kOnce &&
+                        task.trigger_at == snoozed_until;
+                });
+            if (override == updated.end()) {
+                if (updated.size() >= kMaxTasks) {
+                    throw std::runtime_error("稍后提醒无法写入已满的本地日程");
+                }
+                Task copy = *canonical;
+                copy.id = updated_next_id++;
+                copy.repeat = Repeat::kOnce;
+                copy.weekdays.clear();
+                copy.trigger_at = snoozed_until;
+                updated.push_back(std::move(copy));
+            }
+        } else {
+            found->trigger_at = snoozed_until;
+            found->enabled = true;
+        }
+        for (auto& task : updated) {
+            if (is_target(task)) {
+                task.schedule_version = schedule_version;
+                task.sync_state = SyncState::kSynced;
+            }
+        }
+    } else {
+        updated.erase(std::remove_if(updated.begin(), updated.end(), [&](const Task& task) {
+            return is_target(task) && task.repeat == Repeat::kOnce;
+        }), updated.end());
+        auto canonical = std::find_if(updated.begin(), updated.end(),
+            [&](const Task& task) { return is_target(task) && task.repeat != Repeat::kOnce; });
+        if (canonical != updated.end()) {
+            canonical->trigger_at = next_trigger_at;
+            canonical->schedule_version = schedule_version;
+            canonical->sync_state = SyncState::kSynced;
+            canonical->enabled = true;
+        }
+    }
+    tasks_ = std::move(updated);
+    next_id_ = updated_next_id;
+    action_revision_ = revision;
+    return true;
+}
+
+std::vector<Task> Manager::List(KindFilter filter, bool enabled_only) const {
     std::vector<Task> result;
     for (const auto& task : tasks_) {
-        if (MatchesFilter(task, filter)) result.push_back(task);
+        if ((!enabled_only || task.enabled) && MatchesFilter(task, filter)) {
+            result.push_back(task);
+        }
     }
     return result;
 }
@@ -304,6 +904,10 @@ TickResult Manager::Tick(std::time_t now, bool time_valid) {
         return result;
     }
     for (auto it = tasks_.begin(); it != tasks_.end();) {
+        if (!it->enabled) {
+            ++it;
+            continue;
+        }
         if (it->trigger_at > now) {
             ++it;
             continue;
@@ -318,12 +922,22 @@ TickResult Manager::Tick(std::time_t now, bool time_valid) {
         }
         if (it->repeat == Repeat::kOnce) {
             if (!recovery_pending_ || now - it->trigger_at <= kOnceRecoveryWindowSeconds) {
+                if (!RecordOccurrence(*it, it->trigger_at)) {
+                    result.occurrence_outbox_full = true;
+                    ++it;
+                    continue;
+                }
                 result.triggered.push_back(*it);
             } else {
                 result.missed.push_back(*it);
             }
             it = tasks_.erase(it);
             result.changed = true;
+            continue;
+        }
+        if (!RecordOccurrence(*it, it->trigger_at)) {
+            result.occurrence_outbox_full = true;
+            ++it;
             continue;
         }
         result.triggered.push_back(*it);
@@ -484,6 +1098,18 @@ const Task* AlertQueue::StartNext() {
     active_ = std::move(pending_.front());
     pending_.pop_front();
     return &*active_;
+}
+
+size_t AlertQueue::Remove(const std::string& schedule_uuid,
+                          const std::string& source_schedule_id, bool local_source) {
+    const auto old_size = pending_.size();
+    pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+        [&](const Task& task) {
+            return (!schedule_uuid.empty() && task.schedule_uuid == schedule_uuid) ||
+                (local_source && task.schedule_uuid.empty() && task.local_source &&
+                 task.source_schedule_id == source_schedule_id);
+        }), pending_.end());
+    return old_size - pending_.size();
 }
 
 std::optional<Task> AlertQueue::Stop() {

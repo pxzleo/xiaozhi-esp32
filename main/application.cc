@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <initializer_list>
 #include <sstream>
 #include <string_view>
 
@@ -123,6 +124,75 @@ bool IsAsciiString(const char* value, bool (*predicate)(unsigned char)) {
 bool IsHex(unsigned char value) { return std::isxdigit(value) != 0; }
 bool IsDigit(unsigned char value) { return std::isdigit(value) != 0; }
 
+bool IsUuidV4String(const std::string& value) {
+    if (value.size() != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' ||
+        value[23] != '-' || value[14] != '4' ||
+        std::string_view("89abAB").find(value[19]) == std::string_view::npos) {
+        return false;
+    }
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
+        if (!IsHex(static_cast<unsigned char>(value[i]))) return false;
+    }
+    return true;
+}
+
+bool JsonPositiveInteger(const cJSON* item, uint64_t& value) {
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        std::floor(item->valuedouble) != item->valuedouble || item->valuedouble < 1 ||
+        item->valuedouble > 9007199254740991.0) {
+        return false;
+    }
+    value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+bool JsonNonnegativeInteger(const cJSON* item, uint64_t& value) {
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        std::floor(item->valuedouble) != item->valuedouble || item->valuedouble < 0 ||
+        item->valuedouble > 9007199254740991.0) {
+        return false;
+    }
+    value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+bool JsonEpochMilliseconds(const cJSON* item, std::time_t& value, bool nullable = false) {
+    if (nullable && cJSON_IsNull(item)) {
+        value = 0;
+        return true;
+    }
+    uint64_t milliseconds = 0;
+    if (!JsonPositiveInteger(item, milliseconds)) return false;
+    const uint64_t seconds = milliseconds / 1000;
+    if (seconds > static_cast<uint64_t>(std::numeric_limits<std::time_t>::max())) return false;
+    value = static_cast<std::time_t>(seconds);
+    return true;
+}
+
+bool JsonStringValue(const cJSON* item, std::string& value, size_t maximum,
+                     bool allow_empty = false) {
+    if (!cJSON_IsString(item) || item->valuestring == nullptr ||
+        std::strlen(item->valuestring) > maximum ||
+        (!allow_empty && item->valuestring[0] == '\0')) {
+        return false;
+    }
+    value = item->valuestring;
+    return true;
+}
+
+bool HasExactJsonFields(const cJSON* object,
+                        std::initializer_list<const char*> field_names) {
+    if (!cJSON_IsObject(object) ||
+        cJSON_GetArraySize(object) != static_cast<int>(field_names.size())) {
+        return false;
+    }
+    for (const char* name : field_names) {
+        if (cJSON_GetObjectItemCaseSensitive(object, name) == nullptr) return false;
+    }
+    return true;
+}
+
 std::string JsonString(cJSON* json) {
     char* raw = cJSON_PrintUnformatted(json);
     if (raw == nullptr) {
@@ -196,6 +266,17 @@ cJSON* ScheduleTaskJson(const schedule::Task& task) {
         cJSON* weekdays = cJSON_AddArrayToObject(json, "weekdays");
         for (int day : task.weekdays) cJSON_AddItemToArray(weekdays, cJSON_CreateNumber(day));
     }
+    cJSON_AddStringToObject(json, "source_schedule_id", task.source_schedule_id.c_str());
+    if (!task.schedule_uuid.empty()) {
+        cJSON_AddStringToObject(json, "schedule_uuid", task.schedule_uuid.c_str());
+    }
+    cJSON_AddNumberToObject(json, "schedule_version", task.schedule_version);
+    cJSON_AddBoolToObject(json, "enabled", task.enabled);
+    cJSON_AddBoolToObject(json, "local_source", task.local_source);
+    cJSON_AddStringToObject(json, "sync_state",
+                            task.sync_state == schedule::SyncState::kSynced ? "synced" :
+                            (task.sync_state == schedule::SyncState::kDirty ? "dirty" :
+                                                                             "pending"));
     return json;
 }
 
@@ -723,7 +804,8 @@ void Application::Run() {
             if (!IsProactiveConnectionBusy() && schedule_alert_active_ &&
                 audio_service_.IsPlaybackIdle() &&
                 reminder_delivery_.OnPlaybackDrained()) {
-                if (NotifyReminderTriggered(active_schedule_task_, std::time(nullptr))) {
+                if (NotifyReminderTriggered(active_schedule_task_,
+                                            active_schedule_task_.trigger_at)) {
                     const int timeout_seconds = active_schedule_task_.kind ==
                         schedule::Kind::kBriefing ? kBriefingTtsStartTimeoutSeconds :
                         kReminderTtsStartTimeoutSeconds;
@@ -1201,7 +1283,7 @@ void Application::InitializeProtocol() {
                     if (reminder_delivery_.OnTtsStopped()) {
                         schedule_reminder_tts_deadline_us_ = 0;
                         RestoreScheduleAlertVolumeAfterDelivery();
-                        if (schedule_alert_active_ &&
+    if (schedule_alert_active_ &&
                             active_schedule_task_.kind == schedule::Kind::kAlarm) {
                             ShowScheduleAlertPage();
                         } else if (schedule_alert_active_) {
@@ -1286,7 +1368,9 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
-                if (!HandleNeteaseLyricsNotification(payload)) {
+                if (!HandleNeteaseLyricsNotification(payload) &&
+                    !HandleScheduleSyncNotification(payload) &&
+                    !HandleScheduleActionNotification(payload)) {
                     McpServer::GetInstance().ParseMessage(payload);
                 }
             }
@@ -1330,6 +1414,335 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->Start();
+}
+
+bool Application::HandleScheduleSyncNotification(const cJSON* payload) {
+    const cJSON* method = cJSON_GetObjectItem(payload, "method");
+    if (!cJSON_IsString(method) ||
+        strcmp(method->valuestring, "notifications/schedule/sync") != 0) {
+        return false;
+    }
+    const cJSON* jsonrpc = cJSON_GetObjectItem(payload, "jsonrpc");
+    const cJSON* params = cJSON_GetObjectItem(payload, "params");
+    const cJSON* protocol_version = cJSON_GetObjectItem(params, "protocol_version");
+    const cJSON* full_snapshot = cJSON_GetObjectItem(params, "full_snapshot");
+    const cJSON* cursor = cJSON_GetObjectItem(params, "cursor");
+    const cJSON* has_more = cJSON_GetObjectItem(params, "has_more");
+    const cJSON* changes = cJSON_GetObjectItem(params, "changes");
+    uint64_t cursor_value = 0;
+    uint64_t protocol_version_value = 0;
+    if (!cJSON_IsString(jsonrpc) || strcmp(jsonrpc->valuestring, "2.0") != 0 ||
+        !HasExactJsonFields(payload, {"jsonrpc", "method", "params"}) ||
+        !HasExactJsonFields(params, {"protocol_version", "full_snapshot", "cursor",
+                                     "has_more", "changes"}) ||
+        !JsonPositiveInteger(protocol_version, protocol_version_value) ||
+        protocol_version_value != 1 ||
+        !cJSON_IsBool(full_snapshot) || !JsonNonnegativeInteger(cursor, cursor_value) ||
+        !cJSON_IsBool(has_more) || !cJSON_IsArray(changes) ||
+        cJSON_GetArraySize(changes) > static_cast<int>(schedule::Manager::kMaxTasks)) {
+        ESP_LOGE(TAG, "Rejected malformed shared schedule sync envelope");
+        return true;
+    }
+
+    try {
+        std::vector<schedule::AuthorityTask> parsed;
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, changes) {
+            schedule::AuthorityTask task;
+            std::string operation;
+            std::string source_mac_address;
+            std::string kind;
+            std::string recurrence;
+            std::string state;
+            uint64_t revision = 0;
+            uint64_t schedule_version = 0;
+            std::time_t updated_at = 0;
+            if (!HasExactJsonFields(item, {
+                    "revision", "operation", "schedule_id", "source_mac_address",
+                    "is_local_source", "source_schedule_id", "schedule_version", "kind",
+                    "label", "recurrence", "weekdays", "sections", "location",
+                    "scheduled_at", "next_trigger_at", "state", "last_triggered_at",
+                    "snoozed_until", "active_event_id", "active_delivery_status",
+                    "updated_at"}) ||
+                !JsonPositiveInteger(cJSON_GetObjectItem(item, "revision"), revision) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "operation"), operation, 6) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "schedule_id"), task.schedule_uuid,
+                                 36) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "source_mac_address"),
+                                 source_mac_address, 50) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "source_schedule_id"),
+                                 task.source_schedule_id, 64) ||
+                !JsonPositiveInteger(cJSON_GetObjectItem(item, "schedule_version"),
+                                     schedule_version) ||
+                schedule_version > std::numeric_limits<uint32_t>::max() ||
+                !cJSON_IsBool(cJSON_GetObjectItem(item, "is_local_source")) ||
+                !JsonEpochMilliseconds(cJSON_GetObjectItem(item, "updated_at"), updated_at)) {
+                throw std::invalid_argument("共享日程变更身份字段无效");
+            }
+            task.revision = revision;
+            task.version = static_cast<uint32_t>(schedule_version);
+            task.local_source = cJSON_IsTrue(cJSON_GetObjectItem(item, "is_local_source"));
+            task.deleted = operation == "delete";
+            if (!task.deleted && operation != "upsert") {
+                throw std::invalid_argument("共享日程变更操作无效");
+            }
+            if (task.deleted) {
+                for (const char* name : {"kind", "label", "recurrence", "weekdays",
+                         "sections", "location", "scheduled_at", "next_trigger_at", "state",
+                         "last_triggered_at", "snoozed_until", "active_event_id",
+                         "active_delivery_status"}) {
+                    if (!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(item, name))) {
+                        throw std::invalid_argument("共享日程删除墓碑携带了内容字段");
+                    }
+                }
+                parsed.push_back(std::move(task));
+                continue;
+            }
+            std::time_t next_trigger_at = 0;
+            std::time_t last_triggered_at = 0;
+            std::time_t scheduled_at = 0;
+            std::time_t snoozed_until = 0;
+            const cJSON* active_event_id = cJSON_GetObjectItem(item, "active_event_id");
+            const cJSON* active_delivery_status =
+                cJSON_GetObjectItem(item, "active_delivery_status");
+            if (!JsonStringValue(cJSON_GetObjectItem(item, "kind"), kind, 9) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "recurrence"), recurrence, 8) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "label"), task.label, 480) ||
+                !JsonStringValue(cJSON_GetObjectItem(item, "state"), state, 16) ||
+                !JsonEpochMilliseconds(cJSON_GetObjectItem(item, "next_trigger_at"),
+                                       next_trigger_at, true) ||
+                !JsonEpochMilliseconds(cJSON_GetObjectItem(item, "scheduled_at"),
+                                       scheduled_at) ||
+                !JsonEpochMilliseconds(cJSON_GetObjectItem(item, "last_triggered_at"),
+                                       last_triggered_at, true) ||
+                !JsonEpochMilliseconds(cJSON_GetObjectItem(item, "snoozed_until"),
+                                       snoozed_until, true) ||
+                !(cJSON_IsNull(active_event_id) ||
+                  (cJSON_IsString(active_event_id) && active_event_id->valuestring != nullptr &&
+                   std::strlen(active_event_id->valuestring) <= 96)) ||
+                !(cJSON_IsNull(active_delivery_status) ||
+                  (cJSON_IsString(active_delivery_status) &&
+                   active_delivery_status->valuestring != nullptr &&
+                   std::strlen(active_delivery_status->valuestring) <= 24)) ||
+                !cJSON_IsArray(cJSON_GetObjectItem(item, "weekdays")) ||
+                !cJSON_IsArray(cJSON_GetObjectItem(item, "sections"))) {
+                throw std::invalid_argument("共享日程变更内容字段无效");
+            }
+            task.kind = schedule::Manager::ParseKind(kind);
+            task.repeat = schedule::Manager::ParseRepeat(recurrence);
+            task.enabled = state == "scheduled" || state == "snoozed" ||
+                (state == "triggered" && next_trigger_at > 0 && recurrence != "once");
+            task.stop_active = state == "stopped" || state == "completed" ||
+                state == "snoozed";
+            if (!task.enabled && state != "triggered" && state != "stopped" &&
+                state != "completed") {
+                throw std::invalid_argument("共享日程状态无效");
+            }
+            if ((state == "snoozed") != (snoozed_until > 0)) {
+                throw std::invalid_argument("共享日程稍后提醒时间无效");
+            }
+            (void)scheduled_at;
+            (void)updated_at;
+            (void)source_mac_address;
+            // Terminal records remain as disabled metadata until an explicit delete tombstone.
+            task.trigger_at = next_trigger_at > 0 ? next_trigger_at : 1;
+            task.last_triggered_at = last_triggered_at;
+            task.snoozed_until = snoozed_until;
+            cJSON* day = nullptr;
+            cJSON_ArrayForEach(day, cJSON_GetObjectItem(item, "weekdays")) {
+                uint64_t weekday = 0;
+                if (!JsonPositiveInteger(day, weekday) || weekday > 7) {
+                    throw std::invalid_argument("共享日程weekday无效");
+                }
+                task.weekdays.push_back(static_cast<int>(weekday));
+            }
+            cJSON* section = nullptr;
+            cJSON_ArrayForEach(section, cJSON_GetObjectItem(item, "sections")) {
+                std::string value;
+                if (!JsonStringValue(section, value, 7) ||
+                    (value != "weather" && value != "news")) {
+                    throw std::invalid_argument("共享日程sections无效");
+                }
+                if (!task.sections.empty()) task.sections += ",";
+                task.sections += value;
+            }
+            const cJSON* location = cJSON_GetObjectItem(item, "location");
+            if (!cJSON_IsNull(location) &&
+                !JsonStringValue(location, task.location, 160, true)) {
+                throw std::invalid_argument("共享日程location无效");
+            }
+            parsed.push_back(std::move(task));
+        }
+        const bool full_snapshot_value = cJSON_IsTrue(full_snapshot);
+        const bool has_more_value = cJSON_IsTrue(has_more);
+        Schedule([this, cursor_value, full_snapshot_value, has_more_value,
+                  parsed = std::move(parsed)]() mutable {
+            const auto previous_manager = schedule_manager_;
+            bool persisted = false;
+            try {
+                auto result = schedule_manager_.ApplyAuthorityChanges(
+                    cursor_value, parsed, full_snapshot_value, has_more_value);
+                if (result.changed) {
+                    SaveSchedules();
+                    persisted = true;
+                    bool stop_active = false;
+                    for (const auto& task : parsed) {
+                        if (task.deleted || !task.enabled || task.stop_active) {
+                            schedule_alert_queue_.Remove(task.schedule_uuid,
+                                                         task.source_schedule_id,
+                                                         task.local_source);
+                            if ((task.deleted || task.stop_active) &&
+                                schedule_alert_active_ &&
+                                ((!active_schedule_task_.schedule_uuid.empty() &&
+                                  active_schedule_task_.schedule_uuid == task.schedule_uuid) ||
+                                 (active_schedule_task_.schedule_uuid.empty() &&
+                                  task.local_source &&
+                                  active_schedule_task_.source_schedule_id ==
+                                      task.source_schedule_id))) {
+                                stop_active = true;
+                            }
+                        }
+                    }
+                    for (const auto& removed : previous_manager.tasks()) {
+                        if (std::find(result.removed_local_ids.begin(),
+                                      result.removed_local_ids.end(), removed.id) ==
+                            result.removed_local_ids.end()) {
+                            continue;
+                        }
+                        schedule_alert_queue_.Remove(removed.schedule_uuid,
+                                                     removed.source_schedule_id,
+                                                     removed.local_source);
+                        if (schedule_alert_active_ &&
+                            ((!active_schedule_task_.schedule_uuid.empty() &&
+                              active_schedule_task_.schedule_uuid ==
+                                  removed.schedule_uuid) ||
+                             (active_schedule_task_.schedule_uuid.empty() &&
+                              removed.local_source &&
+                              active_schedule_task_.source_schedule_id ==
+                                  removed.source_schedule_id))) {
+                            stop_active = true;
+                        }
+                    }
+                    if (stop_active) TryStopScheduleAlert();
+                }
+                SendScheduleSyncApplied(cursor_value, false);
+            } catch (const std::exception& error) {
+                if (!persisted) schedule_manager_ = previous_manager;
+                ESP_LOGE(TAG, "Cannot apply shared schedule sync: %s", error.what());
+            }
+        });
+    } catch (const std::exception& error) {
+        ESP_LOGE(TAG, "Rejected shared schedule sync: %s", error.what());
+    }
+    return true;
+}
+
+bool Application::HandleScheduleActionNotification(const cJSON* payload) {
+    const cJSON* jsonrpc = cJSON_GetObjectItem(payload, "jsonrpc");
+    const cJSON* method = cJSON_GetObjectItem(payload, "method");
+    if (!cJSON_IsString(method) ||
+        strcmp(method->valuestring, "notifications/schedule/action") != 0) {
+        return false;
+    }
+    const cJSON* params = cJSON_GetObjectItem(payload, "params");
+    const cJSON* protocol_version = cJSON_GetObjectItem(params, "protocol_version");
+    std::string action;
+    std::string schedule_uuid;
+    std::string source_schedule_id;
+    std::string action_id;
+    std::string source_mac_address;
+    uint64_t revision = 0;
+    uint64_t schedule_version = 0;
+    uint64_t protocol_version_value = 0;
+    std::time_t next_trigger_at = 0;
+    std::time_t snoozed_until = 0;
+    std::time_t created_at = 0;
+    bool local_source = false;
+    if (!cJSON_IsString(jsonrpc) || strcmp(jsonrpc->valuestring, "2.0") != 0 ||
+        !HasExactJsonFields(payload, {"jsonrpc", "method", "params"}) ||
+        !HasExactJsonFields(params, {"protocol_version", "revision", "action_id",
+                                     "schedule_id", "source_mac_address", "is_local_source",
+                                     "source_schedule_id", "schedule_version", "action",
+                                     "snoozed_until", "next_trigger_at", "created_at"}) ||
+        !JsonPositiveInteger(protocol_version, protocol_version_value) ||
+        protocol_version_value != 1 ||
+        !JsonPositiveInteger(cJSON_GetObjectItem(params, "revision"), revision) ||
+        !JsonPositiveInteger(cJSON_GetObjectItem(params, "schedule_version"),
+                             schedule_version) ||
+        schedule_version > std::numeric_limits<uint32_t>::max() ||
+        !JsonStringValue(cJSON_GetObjectItem(params, "action"), action, 8) ||
+        !JsonStringValue(cJSON_GetObjectItem(params, "schedule_id"), schedule_uuid, 36) ||
+        !JsonStringValue(cJSON_GetObjectItem(params, "source_schedule_id"),
+                         source_schedule_id, 64) ||
+        !JsonStringValue(cJSON_GetObjectItem(params, "action_id"), action_id, 36) ||
+        !JsonStringValue(cJSON_GetObjectItem(params, "source_mac_address"),
+                         source_mac_address, 50) ||
+        !cJSON_IsBool(cJSON_GetObjectItem(params, "is_local_source")) ||
+        !JsonEpochMilliseconds(cJSON_GetObjectItem(params, "next_trigger_at"),
+                               next_trigger_at, true) ||
+        !JsonEpochMilliseconds(cJSON_GetObjectItem(params, "snoozed_until"),
+                               snoozed_until, true) ||
+        !JsonEpochMilliseconds(cJSON_GetObjectItem(params, "created_at"), created_at) ||
+        !IsUuidV4String(action_id) || !IsUuidV4String(schedule_uuid) ||
+        !IsAsciiString(source_schedule_id.c_str(), IsDigit) ||
+        (action != "stop" && action != "complete" && action != "snooze" &&
+         action != "delete") ||
+        (action == "snooze" ? snoozed_until <= 0
+                            : snoozed_until != 0)) {
+        ESP_LOGE(TAG, "Rejected malformed shared schedule action");
+        return true;
+    }
+    local_source = cJSON_IsTrue(cJSON_GetObjectItem(params, "is_local_source"));
+    (void)action_id;
+    (void)source_mac_address;
+    (void)created_at;
+    Schedule([this, revision, schedule_version, action = std::move(action),
+              schedule_uuid = std::move(schedule_uuid),
+              source_schedule_id = std::move(source_schedule_id), snoozed_until,
+              next_trigger_at, local_source]() {
+        const auto previous_manager = schedule_manager_;
+        bool persisted = false;
+        try {
+            std::optional<schedule::Task> active_source;
+            if (schedule_alert_active_ &&
+                (active_schedule_task_.schedule_uuid == schedule_uuid ||
+                 (active_schedule_task_.schedule_uuid.empty() &&
+                  local_source && active_schedule_task_.local_source &&
+                  active_schedule_task_.source_schedule_id == source_schedule_id))) {
+                active_source = active_schedule_task_;
+            }
+            const bool changed = schedule_manager_.ApplyAuthorityAction(
+                revision, schedule_uuid, static_cast<uint32_t>(schedule_version), action,
+                snoozed_until, next_trigger_at,
+                active_source ? &*active_source : nullptr);
+            if (changed) {
+                SaveSchedules();
+                persisted = true;
+            schedule_alert_queue_.Remove(schedule_uuid, source_schedule_id,
+                                         local_source);
+                if (active_source) TryStopScheduleAlert();
+            }
+            SendScheduleSyncApplied(revision, true);
+        } catch (const std::exception& error) {
+            if (!persisted) schedule_manager_ = previous_manager;
+            ESP_LOGE(TAG, "Cannot apply shared schedule action: %s", error.what());
+        }
+    });
+    return true;
+}
+
+void Application::SendScheduleSyncApplied(uint64_t through_revision, bool action) {
+    if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) return;
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", action ?
+        "notifications/schedule/action_applied" : "notifications/schedule/sync_applied");
+    cJSON* params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddNumberToObject(params, "version", 1);
+    cJSON_AddNumberToObject(params, "through_revision", through_revision);
+    if (!protocol_->SendMcpMessage(JsonString(root))) {
+        ESP_LOGE(TAG, "Cannot send shared schedule applied acknowledgement");
+    }
 }
 
 bool Application::HandleNeteaseLyricsNotification(const cJSON* payload) {
@@ -2027,10 +2440,11 @@ void Application::SetAecMode(AecMode mode) {
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
 void Application::LoadSchedules() {
+    static constexpr int kMaximumScheduleChunks = 16;
     Settings settings("schedule");
     std::string saved;
     const int chunk_count = settings.GetInt("chunks", 0);
-    if (chunk_count < 0 || chunk_count > 8) {
+    if (chunk_count < 0 || chunk_count > kMaximumScheduleChunks) {
         throw std::runtime_error("NVS中的定时任务分片数无效");
     }
     for (int i = 0; i < chunk_count; ++i) {
@@ -2047,8 +2461,42 @@ void Application::LoadSchedules() {
     if (!cJSON_IsObject(root.get())) throw std::runtime_error("NVS中的定时任务JSON损坏");
     cJSON* next_id = cJSON_GetObjectItem(root.get(), "next_id");
     cJSON* tasks = cJSON_GetObjectItem(root.get(), "tasks");
+    cJSON* snapshot_revision = cJSON_GetObjectItem(root.get(), "snapshot_revision");
+    cJSON* action_revision = cJSON_GetObjectItem(root.get(), "action_revision");
+    cJSON* full_snapshot_in_progress =
+        cJSON_GetObjectItem(root.get(), "full_snapshot_in_progress");
+    cJSON* full_snapshot_seen_uuids =
+        cJSON_GetObjectItem(root.get(), "full_snapshot_seen_uuids");
+    cJSON* full_snapshot_staged_tasks =
+        cJSON_GetObjectItem(root.get(), "full_snapshot_staged_tasks");
+    cJSON* pending_occurrences = cJSON_GetObjectItem(root.get(), "pending_occurrences");
+    cJSON* overflow_occurrences = cJSON_GetObjectItem(root.get(), "overflow_occurrences");
     if (!cJSON_IsNumber(next_id) || next_id->valuedouble < 1 || !cJSON_IsArray(tasks)) {
         throw std::runtime_error("NVS中的定时任务字段无效");
+    }
+    if (snapshot_revision != nullptr &&
+        (!cJSON_IsNumber(snapshot_revision) || snapshot_revision->valuedouble < 0)) {
+        throw std::runtime_error("NVS中的共享日程快照版本无效");
+    }
+    if (action_revision != nullptr &&
+        (!cJSON_IsNumber(action_revision) || action_revision->valuedouble < 0)) {
+        throw std::runtime_error("NVS中的共享日程动作版本无效");
+    }
+    if (pending_occurrences != nullptr && !cJSON_IsArray(pending_occurrences)) {
+        throw std::runtime_error("NVS中的离线触发记录无效");
+    }
+    if (overflow_occurrences != nullptr && !cJSON_IsArray(overflow_occurrences)) {
+        throw std::runtime_error("NVS中的离线触发溢出记录无效");
+    }
+    if ((full_snapshot_in_progress == nullptr) !=
+        (full_snapshot_seen_uuids == nullptr) ||
+        (full_snapshot_in_progress == nullptr) !=
+        (full_snapshot_staged_tasks == nullptr) ||
+        (full_snapshot_in_progress != nullptr &&
+         (!cJSON_IsBool(full_snapshot_in_progress) ||
+          !cJSON_IsArray(full_snapshot_seen_uuids) ||
+          !cJSON_IsArray(full_snapshot_staged_tasks)))) {
+        throw std::runtime_error("NVS中的完整快照代际无效");
     }
     std::vector<schedule::Task> restored;
     cJSON* item = nullptr;
@@ -2061,6 +2509,12 @@ void Application::LoadSchedules() {
         cJSON* weekdays = cJSON_GetObjectItem(item, "weekdays");
         cJSON* sections = cJSON_GetObjectItem(item, "sections");
         cJSON* location = cJSON_GetObjectItem(item, "location");
+        cJSON* source_schedule_id = cJSON_GetObjectItem(item, "source_schedule_id");
+        cJSON* schedule_uuid = cJSON_GetObjectItem(item, "schedule_uuid");
+        cJSON* schedule_version = cJSON_GetObjectItem(item, "schedule_version");
+        cJSON* sync_state = cJSON_GetObjectItem(item, "sync_state");
+        cJSON* enabled = cJSON_GetObjectItem(item, "enabled");
+        cJSON* local_source = cJSON_GetObjectItem(item, "local_source");
         if (!cJSON_IsNumber(id) || id->valuedouble < 1 || !cJSON_IsString(kind) ||
             !cJSON_IsString(repeat) || !cJSON_IsString(label) || !cJSON_IsNumber(trigger_at)) {
             throw std::runtime_error("NVS中的定时任务条目无效");
@@ -2080,6 +2534,48 @@ void Application::LoadSchedules() {
             throw std::runtime_error("NVS中的普通定时任务包含简报字段");
         }
         task.trigger_at = static_cast<std::time_t>(trigger_at->valuedouble);
+        if (source_schedule_id != nullptr) {
+            if (!cJSON_IsString(source_schedule_id)) {
+                throw std::runtime_error("NVS中的源日程ID无效");
+            }
+            task.source_schedule_id = source_schedule_id->valuestring;
+        }
+        if (schedule_uuid != nullptr) {
+            if (!cJSON_IsString(schedule_uuid)) {
+                throw std::runtime_error("NVS中的共享日程UUID无效");
+            }
+            task.schedule_uuid = schedule_uuid->valuestring;
+        }
+        if (schedule_version != nullptr) {
+            if (!cJSON_IsNumber(schedule_version) || schedule_version->valuedouble < 0) {
+                throw std::runtime_error("NVS中的共享日程版本无效");
+            }
+            task.schedule_version = static_cast<uint32_t>(schedule_version->valuedouble);
+        }
+        if (sync_state != nullptr) {
+            if (!cJSON_IsString(sync_state)) {
+                throw std::runtime_error("NVS中的共享日程同步状态无效");
+            }
+            if (strcmp(sync_state->valuestring, "synced") == 0) {
+                task.sync_state = schedule::SyncState::kSynced;
+            } else if (strcmp(sync_state->valuestring, "dirty") == 0) {
+                task.sync_state = schedule::SyncState::kDirty;
+            } else if (strcmp(sync_state->valuestring, "pending") != 0) {
+                throw std::runtime_error("NVS中的共享日程同步状态无效");
+            }
+        }
+        if (enabled != nullptr) {
+            if (!cJSON_IsBool(enabled)) {
+                throw std::runtime_error("NVS中的共享日程启用状态无效");
+            }
+            task.enabled = cJSON_IsTrue(enabled);
+        }
+        if (local_source != nullptr) {
+            if (!cJSON_IsBool(local_source)) {
+                throw std::runtime_error("NVS中的共享日程来源状态无效");
+            }
+            task.local_source = cJSON_IsTrue(local_source);
+        }
         if (weekdays != nullptr) {
             if (!cJSON_IsArray(weekdays)) {
                 throw std::runtime_error("NVS中的weekdays无效");
@@ -2094,23 +2590,276 @@ void Application::LoadSchedules() {
         }
         restored.push_back(std::move(task));
     }
+    std::vector<schedule::PendingOccurrence> restored_occurrences;
+    cJSON* occurrence = nullptr;
+    cJSON_ArrayForEach(occurrence, pending_occurrences) {
+        schedule::PendingOccurrence restored_occurrence;
+        cJSON* local_id = cJSON_GetObjectItem(occurrence, "local_id");
+        cJSON* source_id = cJSON_GetObjectItem(occurrence, "source_schedule_id");
+        cJSON* uuid = cJSON_GetObjectItem(occurrence, "schedule_uuid");
+        cJSON* occurrence_kind = cJSON_GetObjectItem(occurrence, "kind");
+        cJSON* occurrence_label = cJSON_GetObjectItem(occurrence, "label");
+        cJSON* occurrence_sections = cJSON_GetObjectItem(occurrence, "sections");
+        cJSON* occurrence_location = cJSON_GetObjectItem(occurrence, "location");
+        cJSON* occurrence_at = cJSON_GetObjectItem(occurrence, "occurrence_at");
+        if (!cJSON_IsNumber(local_id) || !cJSON_IsString(source_id) ||
+            !cJSON_IsString(uuid) || !cJSON_IsNumber(occurrence_at)) {
+            throw std::runtime_error("NVS中的离线触发记录字段无效");
+        }
+        restored_occurrence.local_id = static_cast<uint32_t>(local_id->valuedouble);
+        restored_occurrence.source_schedule_id = source_id->valuestring;
+        restored_occurrence.schedule_uuid = uuid->valuestring;
+        if (occurrence_kind != nullptr || occurrence_label != nullptr ||
+            occurrence_sections != nullptr || occurrence_location != nullptr) {
+            if (!cJSON_IsString(occurrence_kind) || !cJSON_IsString(occurrence_label) ||
+                !cJSON_IsString(occurrence_sections) || !cJSON_IsString(occurrence_location)) {
+                throw std::runtime_error("NVS中的离线触发内容无效");
+            }
+            restored_occurrence.kind =
+                schedule::Manager::ParseKind(occurrence_kind->valuestring);
+            restored_occurrence.label = occurrence_label->valuestring;
+            restored_occurrence.sections = occurrence_sections->valuestring;
+            restored_occurrence.location = occurrence_location->valuestring;
+        } else {
+            const auto source = std::find_if(restored.begin(), restored.end(),
+                [&](const schedule::Task& task) {
+                    return !restored_occurrence.schedule_uuid.empty()
+                        ? task.schedule_uuid == restored_occurrence.schedule_uuid
+                        : task.id == restored_occurrence.local_id;
+                });
+            if (source == restored.end()) {
+                throw std::runtime_error("NVS中的离线触发缺少内容来源");
+            }
+            restored_occurrence.kind = source->kind;
+            restored_occurrence.label = source->label;
+            restored_occurrence.sections = source->sections;
+            restored_occurrence.location = source->location;
+        }
+        restored_occurrence.occurrence_at =
+            static_cast<std::time_t>(occurrence_at->valuedouble);
+        restored_occurrences.push_back(std::move(restored_occurrence));
+    }
+    std::vector<std::string> restored_seen_uuids;
+    cJSON* seen_uuid = nullptr;
+    cJSON_ArrayForEach(seen_uuid, full_snapshot_seen_uuids) {
+        if (!cJSON_IsString(seen_uuid) || seen_uuid->valuestring == nullptr) {
+            throw std::runtime_error("NVS中的完整快照已见UUID无效");
+        }
+        restored_seen_uuids.emplace_back(seen_uuid->valuestring);
+    }
+    std::vector<schedule::AuthorityTask> restored_staged_tasks;
+    cJSON* staged_item = nullptr;
+    cJSON_ArrayForEach(staged_item, full_snapshot_staged_tasks) {
+        schedule::AuthorityTask authority;
+        cJSON* revision = cJSON_GetObjectItem(staged_item, "revision");
+        cJSON* uuid = cJSON_GetObjectItem(staged_item, "schedule_uuid");
+        cJSON* source_id = cJSON_GetObjectItem(staged_item, "source_schedule_id");
+        cJSON* kind = cJSON_GetObjectItem(staged_item, "kind");
+        cJSON* repeat = cJSON_GetObjectItem(staged_item, "repeat");
+        cJSON* label = cJSON_GetObjectItem(staged_item, "label");
+        cJSON* trigger_at = cJSON_GetObjectItem(staged_item, "trigger_at");
+        cJSON* version = cJSON_GetObjectItem(staged_item, "version");
+        cJSON* local_source = cJSON_GetObjectItem(staged_item, "local_source");
+        cJSON* enabled = cJSON_GetObjectItem(staged_item, "enabled");
+        cJSON* last_triggered_at = cJSON_GetObjectItem(staged_item, "last_triggered_at");
+        cJSON* snoozed_until = cJSON_GetObjectItem(staged_item, "snoozed_until");
+        cJSON* weekdays = cJSON_GetObjectItem(staged_item, "weekdays");
+        cJSON* sections = cJSON_GetObjectItem(staged_item, "sections");
+        cJSON* location = cJSON_GetObjectItem(staged_item, "location");
+        if (!cJSON_IsNumber(revision) || !cJSON_IsString(uuid) ||
+            !cJSON_IsString(source_id) || !cJSON_IsString(kind) ||
+            !cJSON_IsString(repeat) || !cJSON_IsString(label) ||
+            !cJSON_IsNumber(trigger_at) || !cJSON_IsNumber(version) ||
+            !cJSON_IsBool(local_source) || !cJSON_IsBool(enabled) ||
+            !cJSON_IsNumber(last_triggered_at) || !cJSON_IsNumber(snoozed_until) ||
+            !cJSON_IsArray(weekdays) || !cJSON_IsString(sections) ||
+            !cJSON_IsString(location)) {
+            throw std::runtime_error("NVS中的完整快照暂存任务无效");
+        }
+        authority.revision = static_cast<uint64_t>(revision->valuedouble);
+        authority.schedule_uuid = uuid->valuestring;
+        authority.source_schedule_id = source_id->valuestring;
+        authority.kind = schedule::Manager::ParseKind(kind->valuestring);
+        authority.repeat = schedule::Manager::ParseRepeat(repeat->valuestring);
+        authority.label = label->valuestring;
+        authority.trigger_at = static_cast<std::time_t>(trigger_at->valuedouble);
+        authority.version = static_cast<uint32_t>(version->valuedouble);
+        authority.local_source = cJSON_IsTrue(local_source);
+        authority.enabled = cJSON_IsTrue(enabled);
+        authority.last_triggered_at =
+            static_cast<std::time_t>(last_triggered_at->valuedouble);
+        authority.snoozed_until = static_cast<std::time_t>(snoozed_until->valuedouble);
+        authority.sections = sections->valuestring;
+        authority.location = location->valuestring;
+        cJSON* day = nullptr;
+        cJSON_ArrayForEach(day, weekdays) authority.weekdays.push_back(day->valueint);
+        restored_staged_tasks.push_back(std::move(authority));
+    }
+    std::vector<schedule::OverflowOccurrence> restored_overflow;
+    cJSON* overflow = nullptr;
+    cJSON_ArrayForEach(overflow, overflow_occurrences) {
+        schedule::OverflowOccurrence restored_item;
+        cJSON* local_id = cJSON_GetObjectItem(overflow, "local_id");
+        cJSON* source_id = cJSON_GetObjectItem(overflow, "source_schedule_id");
+        cJSON* uuid = cJSON_GetObjectItem(overflow, "schedule_uuid");
+        cJSON* kind = cJSON_GetObjectItem(overflow, "kind");
+        cJSON* label = cJSON_GetObjectItem(overflow, "label");
+        cJSON* sections = cJSON_GetObjectItem(overflow, "sections");
+        cJSON* location = cJSON_GetObjectItem(overflow, "location");
+        cJSON* occurrence_at = cJSON_GetObjectItem(overflow, "occurrence_at");
+        cJSON* first_at = cJSON_GetObjectItem(overflow, "first_at");
+        cJSON* count = cJSON_GetObjectItem(overflow, "count");
+        if (!cJSON_IsNumber(local_id) || !cJSON_IsString(source_id) ||
+            !cJSON_IsString(uuid) ||
+            !cJSON_IsNumber(occurrence_at) || !cJSON_IsNumber(first_at) ||
+            !cJSON_IsNumber(count)) {
+            throw std::runtime_error("NVS中的离线触发溢出条目无效");
+        }
+        auto& occurrence = restored_item.occurrence;
+        occurrence.local_id = static_cast<uint32_t>(local_id->valuedouble);
+        occurrence.source_schedule_id = source_id->valuestring;
+        occurrence.schedule_uuid = uuid->valuestring;
+        if (kind != nullptr || label != nullptr || sections != nullptr || location != nullptr) {
+            if (!cJSON_IsString(kind) || !cJSON_IsString(label) ||
+                !cJSON_IsString(sections) || !cJSON_IsString(location)) {
+                throw std::runtime_error("NVS中的离线触发溢出内容无效");
+            }
+            occurrence.kind = schedule::Manager::ParseKind(kind->valuestring);
+            occurrence.label = label->valuestring;
+            occurrence.sections = sections->valuestring;
+            occurrence.location = location->valuestring;
+        } else {
+            const auto source = std::find_if(restored.begin(), restored.end(),
+                [&](const schedule::Task& task) {
+                    return !occurrence.schedule_uuid.empty()
+                        ? task.schedule_uuid == occurrence.schedule_uuid
+                        : task.id == occurrence.local_id;
+                });
+            if (source == restored.end()) {
+                throw std::runtime_error("NVS中的离线触发溢出缺少内容来源");
+            }
+            occurrence.kind = source->kind;
+            occurrence.label = source->label;
+            occurrence.sections = source->sections;
+            occurrence.location = source->location;
+        }
+        occurrence.occurrence_at = static_cast<std::time_t>(occurrence_at->valuedouble);
+        restored_item.first_at = static_cast<std::time_t>(first_at->valuedouble);
+        restored_item.count = static_cast<uint32_t>(count->valuedouble);
+        restored_overflow.push_back(std::move(restored_item));
+    }
     const uint32_t restored_next_id = static_cast<uint32_t>(next_id->valuedouble);
-    schedule_manager_.Restore(std::move(restored), restored_next_id);
+    schedule_manager_.Restore(
+        std::move(restored), restored_next_id, std::move(restored_occurrences),
+        snapshot_revision == nullptr ? 0 :
+            static_cast<uint64_t>(snapshot_revision->valuedouble),
+        action_revision == nullptr ? 0 :
+            static_cast<uint64_t>(action_revision->valuedouble),
+        full_snapshot_in_progress != nullptr && cJSON_IsTrue(full_snapshot_in_progress),
+        std::move(restored_seen_uuids), std::move(restored_staged_tasks),
+        std::move(restored_overflow));
 }
 
 void Application::SaveSchedules() const {
+    static constexpr int kMaximumScheduleChunks = 16;
     cJSON* root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "next_id", schedule_manager_.next_id());
+    cJSON_AddNumberToObject(root, "snapshot_revision", schedule_manager_.snapshot_revision());
+    cJSON_AddNumberToObject(root, "action_revision", schedule_manager_.action_revision());
+    cJSON_AddBoolToObject(root, "full_snapshot_in_progress",
+                          schedule_manager_.full_snapshot_in_progress());
+    cJSON* full_snapshot_seen_uuids =
+        cJSON_AddArrayToObject(root, "full_snapshot_seen_uuids");
+    for (const auto& uuid : schedule_manager_.full_snapshot_seen_uuids()) {
+        cJSON_AddItemToArray(full_snapshot_seen_uuids, cJSON_CreateString(uuid.c_str()));
+    }
+    cJSON* full_snapshot_staged_tasks =
+        cJSON_AddArrayToObject(root, "full_snapshot_staged_tasks");
+    for (const auto& authority : schedule_manager_.full_snapshot_staged_tasks()) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "revision", authority.revision);
+        cJSON_AddStringToObject(item, "schedule_uuid", authority.schedule_uuid.c_str());
+        cJSON_AddStringToObject(item, "source_schedule_id",
+                                authority.source_schedule_id.c_str());
+        cJSON_AddStringToObject(item, "kind", schedule::Manager::KindName(authority.kind));
+        cJSON_AddStringToObject(item, "repeat",
+                                schedule::Manager::RepeatName(authority.repeat));
+        cJSON_AddStringToObject(item, "label", authority.label.c_str());
+        cJSON_AddNumberToObject(item, "trigger_at", authority.trigger_at);
+        cJSON_AddNumberToObject(item, "version", authority.version);
+        cJSON_AddBoolToObject(item, "local_source", authority.local_source);
+        cJSON_AddBoolToObject(item, "enabled", authority.enabled);
+        cJSON_AddNumberToObject(item, "last_triggered_at", authority.last_triggered_at);
+        cJSON_AddNumberToObject(item, "snoozed_until", authority.snoozed_until);
+        cJSON* weekdays = cJSON_AddArrayToObject(item, "weekdays");
+        for (int day : authority.weekdays) {
+            cJSON_AddItemToArray(weekdays, cJSON_CreateNumber(day));
+        }
+        cJSON_AddStringToObject(item, "sections", authority.sections.c_str());
+        cJSON_AddStringToObject(item, "location", authority.location.c_str());
+        cJSON_AddItemToArray(full_snapshot_staged_tasks, item);
+    }
     cJSON* tasks = cJSON_AddArrayToObject(root, "tasks");
     for (const auto& task : schedule_manager_.tasks()) {
         cJSON* item = ScheduleTaskJson(task);
         cJSON_ReplaceItemInObject(item, "trigger_at", cJSON_CreateNumber(task.trigger_at));
         cJSON_AddItemToArray(tasks, item);
     }
+    cJSON* pending_occurrences = cJSON_AddArrayToObject(root, "pending_occurrences");
+    for (const auto& occurrence : schedule_manager_.pending_occurrences()) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "local_id", occurrence.local_id);
+        cJSON_AddStringToObject(item, "source_schedule_id",
+                                occurrence.source_schedule_id.c_str());
+        cJSON_AddStringToObject(item, "schedule_uuid", occurrence.schedule_uuid.c_str());
+        const auto source = std::find_if(schedule_manager_.tasks().begin(),
+            schedule_manager_.tasks().end(), [&](const schedule::Task& task) {
+                return !occurrence.schedule_uuid.empty()
+                    ? task.schedule_uuid == occurrence.schedule_uuid
+                    : task.id == occurrence.local_id;
+            });
+        if (source == schedule_manager_.tasks().end()) {
+            cJSON_AddStringToObject(item, "kind",
+                                    schedule::Manager::KindName(occurrence.kind));
+            cJSON_AddStringToObject(item, "label", occurrence.label.c_str());
+            cJSON_AddStringToObject(item, "sections", occurrence.sections.c_str());
+            cJSON_AddStringToObject(item, "location", occurrence.location.c_str());
+        }
+        cJSON_AddNumberToObject(item, "occurrence_at", occurrence.occurrence_at);
+        cJSON_AddItemToArray(pending_occurrences, item);
+    }
+    cJSON* overflow_occurrences = cJSON_AddArrayToObject(root, "overflow_occurrences");
+    for (const auto& overflow : schedule_manager_.overflow_occurrences()) {
+        const auto& occurrence = overflow.occurrence;
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "local_id", occurrence.local_id);
+        cJSON_AddStringToObject(item, "source_schedule_id",
+                                occurrence.source_schedule_id.c_str());
+        cJSON_AddStringToObject(item, "schedule_uuid", occurrence.schedule_uuid.c_str());
+        const auto source = std::find_if(schedule_manager_.tasks().begin(),
+            schedule_manager_.tasks().end(), [&](const schedule::Task& task) {
+                return !occurrence.schedule_uuid.empty()
+                    ? task.schedule_uuid == occurrence.schedule_uuid
+                    : task.id == occurrence.local_id;
+            });
+        if (source == schedule_manager_.tasks().end()) {
+            cJSON_AddStringToObject(item, "kind",
+                                    schedule::Manager::KindName(occurrence.kind));
+            cJSON_AddStringToObject(item, "label", occurrence.label.c_str());
+            cJSON_AddStringToObject(item, "sections", occurrence.sections.c_str());
+            cJSON_AddStringToObject(item, "location", occurrence.location.c_str());
+        }
+        cJSON_AddNumberToObject(item, "occurrence_at", occurrence.occurrence_at);
+        cJSON_AddNumberToObject(item, "first_at", overflow.first_at);
+        cJSON_AddNumberToObject(item, "count", overflow.count);
+        cJSON_AddItemToArray(overflow_occurrences, item);
+    }
     const std::string saved = JsonString(root);
     static constexpr size_t kChunkSize = 1800;
     const int chunk_count = static_cast<int>((saved.size() + kChunkSize - 1) / kChunkSize);
-    if (chunk_count > 8) throw std::runtime_error("定时任务JSON超过NVS容量限制");
+    if (chunk_count > kMaximumScheduleChunks) {
+        throw std::runtime_error("定时任务JSON超过NVS容量限制");
+    }
     Settings settings("schedule", true);
     const int old_chunk_count = settings.GetInt("chunks", 0);
     settings.SetInt("chunks", chunk_count);
@@ -2118,7 +2867,7 @@ void Application::SaveSchedules() const {
         settings.SetString("data" + std::to_string(i),
                            saved.substr(i * kChunkSize, kChunkSize));
     }
-    for (int i = chunk_count; i < old_chunk_count && i < 8; ++i) {
+    for (int i = chunk_count; i < old_chunk_count && i < kMaximumScheduleChunks; ++i) {
         settings.EraseKey("data" + std::to_string(i));
     }
     settings.EraseKey("tasks");
@@ -3040,7 +3789,8 @@ void Application::CheckProactiveEvents() {
     if (changed) TrySaveProactive("proactive tick");
 }
 
-bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_t now) {
+bool Application::NotifyReminderTriggered(const schedule::Task& task,
+                                           std::time_t occurrence_at, bool speak) {
     if (IsProactiveConnectionBusy()) {
         DeferProactiveAction("reminder playback drained", [this]() {
             xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
@@ -3068,6 +3818,11 @@ bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_
     cJSON* params = cJSON_AddObjectToObject(root, "params");
     cJSON_AddNumberToObject(params, "version", 1);
     cJSON_AddNumberToObject(params, "id", task.id);
+    cJSON_AddStringToObject(params, "source_schedule_id", task.source_schedule_id.c_str());
+    if (!task.schedule_uuid.empty()) {
+        cJSON_AddStringToObject(params, "schedule_uuid", task.schedule_uuid.c_str());
+    }
+    cJSON_AddNumberToObject(params, "occurrence_at", occurrence_at);
     if (briefing) {
         const std::string triggered_at = FormatLocalDateTime(task.trigger_at);
         std::string event_timestamp = triggered_at;
@@ -3090,15 +3845,24 @@ bool Application::NotifyReminderTriggered(const schedule::Task& task, std::time_
     } else {
         cJSON_AddStringToObject(params, "kind", schedule::Manager::KindName(task.kind));
         cJSON_AddStringToObject(params, "label", task.label.c_str());
-        cJSON_AddStringToObject(params, "triggered_at", FormatLocalDateTime(now).c_str());
+        cJSON_AddStringToObject(params, "triggered_at",
+                                FormatLocalDateTime(occurrence_at).c_str());
     }
-    cJSON_AddBoolToObject(params, "speak", true);
+    cJSON_AddBoolToObject(params, "speak", speak);
     return protocol_->SendMcpMessage(JsonString(root));
 }
 
 void Application::CheckSchedules() {
     const std::time_t now = std::time(nullptr);
     auto result = schedule_manager_.Tick(now, has_server_time_.load());
+    if (result.occurrence_outbox_full && !schedule_outbox_full_reported_) {
+        ESP_LOGE(TAG, "Shared schedule occurrence outbox is full; local alert remains active");
+        schedule_outbox_full_reported_ = true;
+    } else if (!result.occurrence_outbox_full &&
+               schedule_manager_.pending_occurrences().size() <
+                   schedule::Manager::kMaxPendingOccurrences) {
+        schedule_outbox_full_reported_ = false;
+    }
     if (result.changed) SaveSchedules();
     if (!result.missed.empty()) {
         cJSON* missed = cJSON_CreateArray();
@@ -3126,7 +3890,27 @@ void Application::CheckSchedules() {
         reminder_delivery_.state() == schedule::ReminderDeliveryState::kInactive) {
         StartNextScheduleAlert();
     }
-    if (!schedule_alert_active_) return;
+    if (!schedule_alert_active_) {
+        const int64_t current_us = esp_timer_get_time();
+        if (!schedule_manager_.pending_occurrences().empty() &&
+            network_connected_.load() && GetDeviceState() == kDeviceStateIdle &&
+            !IsProactiveConnectionBusy() && audio_service_.IsPlaybackIdle() &&
+            current_us >= schedule_replay_retry_after_us_) {
+            const auto& pending = schedule_manager_.pending_occurrences().front();
+            schedule::Task replay;
+            replay.id = pending.local_id;
+            replay.kind = pending.kind;
+            replay.label = pending.label;
+            replay.trigger_at = pending.occurrence_at;
+            replay.sections = pending.sections;
+            replay.location = pending.location;
+            replay.source_schedule_id = pending.source_schedule_id;
+            replay.schedule_uuid = pending.schedule_uuid;
+            NotifyReminderTriggered(replay, pending.occurrence_at, false);
+            schedule_replay_retry_after_us_ = current_us + 30LL * 1000000;
+        }
+        return;
+    }
     if (now_us >= schedule_alert_deadline_us_) {
         const bool reminder_delivery_pending =
             active_schedule_task_.kind != schedule::Kind::kAlarm &&
@@ -3293,17 +4077,36 @@ std::string Application::DeleteSchedule(uint32_t id) {
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "deleted_id", id);
+    cJSON_AddStringToObject(data, "source_schedule_id", deleted.source_schedule_id.c_str());
+    if (!deleted.schedule_uuid.empty()) {
+        cJSON_AddStringToObject(data, "schedule_uuid", deleted.schedule_uuid.c_str());
+    }
     cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(deleted.kind));
     return ResponseEnvelope("已删除" + schedule::Manager::DescribeTask(deleted) + "。", data);
 }
 
 std::string Application::ClearSchedules(const std::string& kind) {
     const auto filter = schedule::Manager::ParseKindFilter(kind);
+    const auto deleting = schedule_manager_.List(filter, false);
     const size_t count = schedule_manager_.Clear(filter);
     SaveSchedules();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddStringToObject(data, "kind", kind.c_str());
     cJSON_AddNumberToObject(data, "cleared", count);
+    cJSON* deleted_ids = cJSON_AddArrayToObject(data, "deleted_ids");
+    cJSON* deleted_tasks = cJSON_AddArrayToObject(data, "deleted_tasks");
+    for (const auto& task : deleting) {
+        cJSON_AddItemToArray(deleted_ids, cJSON_CreateNumber(task.id));
+        cJSON* deleted_task = cJSON_CreateObject();
+        cJSON_AddNumberToObject(deleted_task, "id", task.id);
+        cJSON_AddStringToObject(deleted_task, "source_schedule_id",
+                                task.source_schedule_id.c_str());
+        if (!task.schedule_uuid.empty()) {
+            cJSON_AddStringToObject(deleted_task, "schedule_uuid",
+                                    task.schedule_uuid.c_str());
+        }
+        cJSON_AddItemToArray(deleted_tasks, deleted_task);
+    }
     return ResponseEnvelope("已清空" + std::to_string(count) + "个未触发的" +
                                 KindFilterChinese(filter) + "。",
                             data);
@@ -3315,6 +4118,10 @@ std::string Application::StopScheduleAlert() {
     if (!TryStopScheduleAlert()) throw std::runtime_error("当前没有正在触发的定时任务");
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "stopped_id", stopped.id);
+    cJSON_AddStringToObject(data, "source_schedule_id", stopped.source_schedule_id.c_str());
+    if (!stopped.schedule_uuid.empty()) {
+        cJSON_AddStringToObject(data, "schedule_uuid", stopped.schedule_uuid.c_str());
+    }
     cJSON_AddStringToObject(data, "kind", schedule::Manager::KindName(stopped.kind));
     return ResponseEnvelope("已停止任务ID " + std::to_string(stopped.id) + "，类型" +
                                 (stopped.kind == schedule::Kind::kAlarm ? "闹铃" :
@@ -3354,6 +4161,10 @@ std::string Application::SnoozeScheduleAlert(int minutes) {
     StartNextScheduleAlert();
     cJSON* data = cJSON_CreateObject();
     cJSON_AddNumberToObject(data, "source_id", previous.id);
+    cJSON_AddStringToObject(data, "source_schedule_id", previous.source_schedule_id.c_str());
+    if (!previous.schedule_uuid.empty()) {
+        cJSON_AddStringToObject(data, "schedule_uuid", previous.schedule_uuid.c_str());
+    }
     cJSON_AddItemToObject(data, "task", ScheduleTaskJson(snoozed));
     return ResponseEnvelope("已延后" + std::to_string(minutes) + "分钟。", data);
 }

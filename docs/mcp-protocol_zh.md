@@ -281,7 +281,7 @@ sequenceDiagram
 - `self.schedule.stop`：停止当前提醒或闹铃。
 - `self.schedule.snooze`：当前提醒稍后再响，`minutes` 默认 5，范围 1–60。
 
-当日期、时间、上午/下午、重复方式、内容或待删除目标存在歧义时，主模型必须先追问，不能猜测；信息完整后直接调用工具，不应先播报“我来处理一下”。普通提醒触发时，设备发送无 `id` 的 JSON-RPC 通知：
+当日期、时间、上午/下午、重复方式、内容或待删除目标存在歧义时，主模型必须先追问，不能猜测；信息完整后直接调用工具，不应先播报“我来处理一下”。普通提醒触发时，设备发送 JSON-RPC notification（无请求层 `id`）：
 
 ```json
 {
@@ -299,6 +299,22 @@ sequenceDiagram
 ```
 
 该通知通过共享 `Protocol::SendMcpMessage` 发送，因此 WebSocket 与 MQTT/UDP 使用相同语义。
+
+共享日程通知还携带稳定的 `source_schedule_id`、已绑定时的 `schedule_uuid`、
+Unix 秒 `occurrence_at` 和 `speak`。断线补报使用同一 occurrence 且 `speak=false`，
+服务端必须按 UUID（未绑定时按来源 ID）与 occurrence 幂等。
+
+服务端经现有 MCP 外壳下发 `notifications/schedule/sync` 增量变更和
+`notifications/schedule/action` 动作。时间字段使用 Unix 毫秒；普通增量只以 delete
+tombstone 删除任务。`full_snapshot=true` 会开始一个跨页持久代际：`has_more=true`
+时只累计本轮见过的权威 UUID，末页成功持久化后才一次清除缺席的已绑定副本及对应
+离线触发记录，未绑定本地任务保留；任何一页失败或中断都不得半清理。设备完成 NVS 持久化后分别回发
+`notifications/schedule/sync_applied`、`notifications/schedule/action_applied`，参数为
+`{"version":1,"through_revision":...}`。服务端收到 applied 前不得推进持久游标或
+确认动作队列。
+
+同步中的 `label` 与本地创建契约一致，最多 80 个 Unicode 字符；超限页面必须拒绝且
+不得推进游标，以保证设备离线副本能够在固定 NVS 预算内原子持久化。
 
 所有调度工具 envelope 中的 `response` 都必须是可直接向用户播报的权威结果，不能要求主模型再次读取 `data` 才能确认。创建和稍后提醒结果包含任务 id、规范化本地时间、重复规则与内容；查询会自然枚举这些字段或明确说明为空；删除、清空和停止结果包含具体 id、类型或数量。`data` 仍保留供结构化处理。
 

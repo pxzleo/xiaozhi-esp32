@@ -11,6 +11,67 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduleManagerTest(unittest.TestCase):
+    def test_schedule_worst_legal_states_fit_chunk_budget(self):
+        label = "测" * 80
+        location = "地" * 40
+        uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995"
+        task = {"id": 1, "kind": "briefing", "repeat": "weekly", "label": label,
+                "trigger_at": 1999999999, "weekdays": [1, 2, 3, 4, 5, 6, 7],
+                "sections": "weather,news", "location": location,
+                "source_schedule_id": "9" * 64, "schedule_uuid": uuid,
+                "schedule_version": 4294967295, "sync_state": "synced",
+                "enabled": True, "local_source": True}
+        pending = {"local_id": 1, "source_schedule_id": "9" * 64,
+                   "schedule_uuid": uuid, "kind": "briefing", "label": label,
+                   "sections": "weather,news", "location": location,
+                   "occurrence_at": 1999999999}
+        staged = {"revision": 999999999999, "schedule_uuid": uuid,
+                  "source_schedule_id": "9" * 64, "kind": "briefing",
+                  "repeat": "weekly", "label": label, "trigger_at": 1999999999,
+                  "version": 4294967295, "local_source": True, "enabled": True,
+                  "last_triggered_at": 1999999999, "snoozed_until": 1999999999,
+                  "weekdays": [1, 2, 3, 4, 5, 6, 7], "sections": "weather,news",
+                  "location": location}
+        # Overflow entries backed by a still-present repeating task persist only
+        # identity/time counters; task text is restored from the task record.
+        overflow = {"local_id": 1, "source_schedule_id": "9" * 64,
+                    "schedule_uuid": uuid, "occurrence_at": 1999999999,
+                    "first_at": 1999999999, "count": 4294967295}
+        base = {"next_id": 99, "snapshot_revision": 999999999999,
+                "action_revision": 999999999999, "full_snapshot_in_progress": False,
+                "full_snapshot_seen_uuids": []}
+        uuids = [f"00000000-0000-4000-8000-{index:012x}" for index in range(16)]
+        tasks = [dict(task, id=index + 1, schedule_uuid=uuids[index],
+                      source_schedule_id=str(index + 1)) for index in range(16)]
+        staged_tasks = [dict(staged, schedule_uuid=uuids[index],
+                             source_schedule_id=str(index + 1), revision=index + 1)
+                        for index in range(16)]
+        cases = [
+            dict(base, full_snapshot_in_progress=True,
+                 full_snapshot_seen_uuids=uuids, tasks=tasks,
+                 full_snapshot_staged_tasks=staged_tasks,
+                 pending_occurrences=[], overflow_occurrences=[]),
+            dict(base, tasks=tasks, full_snapshot_staged_tasks=[],
+                 pending_occurrences=[pending] * 16, overflow_occurrences=[overflow] * 16),
+        ]
+        for state in cases:
+            encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+            self.assertLessEqual(len(encoded), 16 * 1800)
+
+    def test_recurring_pending_compact_restart_restores_briefing_content(self):
+        uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995"
+        task = {"id": 7, "schedule_uuid": uuid, "kind": "briefing",
+                "label": "晨间简报", "sections": "weather,news", "location": "广州"}
+        compact = {"local_id": 7, "source_schedule_id": "7",
+                   "schedule_uuid": uuid, "occurrence_at": 1786690800}
+        restored = next(item for item in [task]
+                        if item["schedule_uuid"] == compact["schedule_uuid"])
+        self.assertEqual((restored["kind"], restored["label"], restored["sections"],
+                          restored["location"]),
+                         ("briefing", "晨间简报", "weather,news", "广州"))
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        self.assertIn("NVS中的离线触发缺少内容来源", application)
+
     def test_deferred_edge_actions_preserve_fifo(self):
         actions = deque()
         expected = ["stop", "start", "toggle", "toggle", "wake:first", "wake:second"]
@@ -664,6 +725,40 @@ class ScheduleManagerTest(unittest.TestCase):
         self.assertIn("session_id_.clear()", open_channel)
         self.assertIn("xEventGroupClearBits", open_channel)
         self.assertIn("connection_generation_", open_channel)
+
+    def test_shared_schedule_sync_and_action_contract(self):
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        manager = (
+            ROOT / "main" / "schedule" / "schedule_manager.cc"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"notifications/schedule/sync"', application)
+        self.assertIn('"notifications/schedule/action"', application)
+        self.assertIn('"notifications/schedule/sync_applied"', application)
+        self.assertIn('"notifications/schedule/action_applied"', application)
+        self.assertIn('cJSON_AddStringToObject(params, "source_schedule_id"', application)
+        self.assertIn('cJSON_AddStringToObject(params, "schedule_uuid"', application)
+        self.assertIn('cJSON_AddNumberToObject(params, "occurrence_at"', application)
+        self.assertIn('NotifyReminderTriggered(replay, pending.occurrence_at, false)', application)
+        self.assertIn("NotifyReminderTriggered(active_schedule_task_,\n"
+                      "                                            active_schedule_task_.trigger_at)",
+                      application)
+        self.assertIn('cJSON* deleted_tasks = cJSON_AddArrayToObject', application)
+
+        sync = application.split("bool Application::HandleScheduleSyncNotification", 1)[1]
+        sync = sync.split("bool Application::HandleScheduleActionNotification", 1)[0]
+        self.assertLess(sync.index("SaveSchedules();"),
+                        sync.index("TryStopScheduleAlert();"))
+        action = application.split("bool Application::HandleScheduleActionNotification", 1)[1]
+        action = action.split("void Application::SendScheduleSyncApplied", 1)[0]
+        self.assertLess(action.index("ApplyAuthorityAction("),
+                        action.index("TryStopScheduleAlert();"))
+        self.assertLess(action.index("SaveSchedules();"),
+                        action.index("TryStopScheduleAlert();"))
+        self.assertIn("if (revision <= action_revision_) return false;", manager)
+        self.assertIn("if (!collecting_full_snapshot && cursor <= snapshot_revision_) return {};",
+                      manager)
+        self.assertIn("full_snapshot_in_progress", application)
+        self.assertIn("full_snapshot_seen_uuids", application)
 
 
 if __name__ == "__main__":

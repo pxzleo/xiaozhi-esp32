@@ -1,6 +1,6 @@
 # 设备主动助理每日简报（v1）
 
-每日简报复用设备本地 `schedule::Manager`。设备是时间和重复规则的权威来源，NVS 保存任务；到点后发送 `notifications/assistant/triggered`，服务端获取天气/新闻并用 TTS 播报。
+每日简报复用设备本地 `schedule::Manager`。服务端是账号级日程、时间和重复规则的权威来源，设备在 NVS 保存离线执行副本；断网到点仍触发，恢复连接后按共享 UUID 与 occurrence 时间幂等补报。到点后发送 `notifications/assistant/triggered`，服务端获取天气/新闻并用 TTS 播报。
 
 - `self.schedule.create` 使用 `kind=briefing`；`sections` 只能是 `weather`、`news` 或 `weather,news`，包含天气时 `location` 必须是明确的 1 到 40 个 Unicode 字符。
 - 时间、重复规则和 `weekdays` 与闹铃/提醒一致。日期、时间、重复方式或地点有歧义时必须追问，不能猜测。

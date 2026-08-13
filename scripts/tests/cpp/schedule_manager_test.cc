@@ -1,5 +1,6 @@
 #include "schedule_manager.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <stdexcept>
@@ -329,6 +330,409 @@ void TestRepeatingSuggestionUsesRealTasks() {
         seconds_manager.tasks(), different_second));
 }
 
+void TestSharedScheduleMetadataAndLegacyMigration() {
+    const auto when = At(2026, 8, 14, 8);
+    Manager manager;
+    auto created = Add(manager, Kind::kReminder, Repeat::kOnce, when);
+    assert(created.source_schedule_id == "1");
+    assert(created.schedule_uuid.empty());
+    assert(created.schedule_version == 0);
+    assert(created.sync_state == SyncState::kPending);
+
+    assert(manager.BindAuthority(created.id,
+                                 "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995", 3));
+    const auto* bound = manager.Find(created.id);
+    assert(bound != nullptr);
+    assert(bound->schedule_uuid == "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995");
+    assert(bound->schedule_version == 3);
+    assert(bound->sync_state == SyncState::kSynced);
+
+    Manager legacy;
+    legacy.Restore({{7, Kind::kAlarm, Repeat::kOnce, "旧闹铃", when, {}, "", ""}}, 8);
+    const auto* migrated = legacy.Find(7);
+    assert(migrated != nullptr);
+    assert(migrated->source_schedule_id == "7");
+    assert(migrated->schedule_uuid.empty());
+    assert(migrated->schedule_version == 0);
+    assert(migrated->sync_state == SyncState::kPending);
+}
+
+void TestOfflineOccurrenceOutboxAndAuthorityAck() {
+    const auto when = At(2026, 8, 14, 9);
+    Manager manager;
+    manager.Tick(when - 10, true);
+    auto task = Add(manager, Kind::kAlarm, Repeat::kOnce, when);
+    auto due = manager.Tick(when, true);
+    assert(due.triggered.size() == 1);
+    assert(manager.pending_occurrences().size() == 1);
+    const auto& pending = manager.pending_occurrences().front();
+    assert(pending.source_schedule_id == std::to_string(task.id));
+    assert(pending.occurrence_at == when);
+
+    // Retrying the same local occurrence must not create another durable record.
+    manager.RecordOccurrence(due.triggered.front(), when);
+    assert(manager.pending_occurrences().size() == 1);
+    assert(!manager.AcknowledgeOccurrence("", task.id + 100, when));
+    assert(manager.AcknowledgeOccurrence("", task.id, when));
+    assert(manager.pending_occurrences().empty());
+}
+
+void TestCompleteAuthoritySnapshotReconciliation() {
+    const auto first_time = At(2026, 8, 14, 10);
+    Manager manager;
+    auto pending = Add(manager, Kind::kReminder, Repeat::kOnce, first_time);
+
+    AuthorityTask own;
+    own.schedule_uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995";
+    own.source_schedule_id = std::to_string(pending.id);
+    own.kind = Kind::kReminder;
+    own.repeat = Repeat::kOnce;
+    own.label = "服务端修改后的提醒";
+    own.trigger_at = first_time + 60;
+    own.version = 2;
+    own.local_source = true;
+    own.revision = 6;
+
+    AuthorityTask imported;
+    imported.schedule_uuid = "b79cecd0-1c67-47db-a676-fffc37e24f17";
+    imported.source_schedule_id = "88";
+    imported.kind = Kind::kAlarm;
+    imported.repeat = Repeat::kDaily;
+    imported.label = "共享闹铃";
+    imported.trigger_at = first_time + 120;
+    imported.version = 1;
+    imported.local_source = false;
+    imported.revision = 7;
+
+    auto first = manager.ApplyAuthorityChanges(7, {own, imported});
+    assert(first.changed);
+    assert(manager.snapshot_revision() == 7);
+    assert(manager.tasks().size() == 2);
+    const auto* rebound = manager.Find(pending.id);
+    assert(rebound != nullptr && rebound->label == "服务端修改后的提醒");
+    assert(rebound->schedule_uuid == own.schedule_uuid);
+    assert(rebound->schedule_version == 2);
+    assert(rebound->sync_state == SyncState::kSynced);
+
+    // A stale snapshot is ignored, and a newer complete snapshot removes only
+    // authoritative copies absent from it. Unsynced local work remains offline-safe.
+    assert(!manager.ApplyAuthorityChanges(7, {}).changed);
+    auto local_only = Add(manager, Kind::kReminder, Repeat::kOnce, first_time + 180);
+    AuthorityTask removed = imported;
+    removed.deleted = true;
+    removed.revision = 8;
+    removed.version = 2;
+    auto second = manager.ApplyAuthorityChanges(8, {removed});
+    assert(second.changed);
+    assert(manager.Find(local_only.id) != nullptr);
+    assert(manager.tasks().size() == 2);
+    assert(manager.FindByScheduleUuid(imported.schedule_uuid) == nullptr);
+
+    AuthorityTask recurring_snooze;
+    recurring_snooze.revision = 9;
+    recurring_snooze.schedule_uuid = "d2719f87-5bc2-40c9-8978-c3904334019a";
+    recurring_snooze.source_schedule_id = "99";
+    recurring_snooze.kind = Kind::kReminder;
+    recurring_snooze.repeat = Repeat::kDaily;
+    recurring_snooze.label = "重复提醒";
+    recurring_snooze.trigger_at = first_time + 86400;
+    recurring_snooze.snoozed_until = first_time + 300;
+    recurring_snooze.version = 2;
+    assert(manager.ApplyAuthorityChanges(9, {recurring_snooze}).changed);
+    assert(std::count_if(manager.tasks().begin(), manager.tasks().end(),
+        [&](const Task& task) {
+            return task.schedule_uuid == recurring_snooze.schedule_uuid;
+        }) == 2);
+}
+
+void TestAuthorityActionIsIdempotentAndSnoozesTriggeredTask() {
+    const auto when = At(2026, 8, 14, 11);
+    Manager manager;
+    auto active = Add(manager, Kind::kAlarm, Repeat::kOnce, when);
+    assert(manager.BindAuthority(active.id,
+        "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995", 1));
+    const std::string schedule_uuid = manager.Find(active.id)->schedule_uuid;
+    manager.Tick(when - 1, true);
+    auto due = manager.Tick(when, true);
+    assert(due.triggered.size() == 1 && manager.tasks().empty());
+    assert(manager.ApplyAuthorityAction(9, schedule_uuid, 2, "snooze",
+                                        when + 300, 0, &due.triggered.front()));
+    const auto* snoozed = manager.FindByScheduleUuid(schedule_uuid);
+    assert(snoozed != nullptr && snoozed->trigger_at == when + 300);
+    assert(snoozed->repeat == Repeat::kOnce && snoozed->enabled);
+    assert(!manager.ApplyAuthorityAction(9, schedule_uuid, 2, "snooze",
+                                         when + 300, 0, nullptr));
+    assert(manager.ApplyAuthorityAction(10, schedule_uuid, 3, "stop", 0, 0));
+    assert(manager.FindByScheduleUuid(schedule_uuid) == nullptr);
+    assert(manager.List(KindFilter::kAlarm).empty());
+    assert(manager.List(KindFilter::kAlarm, false).empty());
+
+    Manager recurring;
+    auto daily = Add(recurring, Kind::kAlarm, Repeat::kDaily, when);
+    assert(recurring.BindAuthority(daily.id,
+        "b79cecd0-1c67-47db-a676-fffc37e24f17", 1));
+    const auto tomorrow = when + 86400;
+    assert(recurring.ApplyAuthorityAction(
+        1, "b79cecd0-1c67-47db-a676-fffc37e24f17", 2, "stop", 0, tomorrow));
+    const auto* next = recurring.FindByScheduleUuid(
+        "b79cecd0-1c67-47db-a676-fffc37e24f17");
+    assert(next != nullptr && next->enabled && next->trigger_at == tomorrow);
+
+    Manager recurring_snooze;
+    auto recurring_task = Add(recurring_snooze, Kind::kReminder, Repeat::kDaily, when);
+    const std::string recurring_uuid = "d2719f87-5bc2-40c9-8978-c3904334019a";
+    assert(recurring_snooze.BindAuthority(recurring_task.id, recurring_uuid, 1));
+    assert(recurring_snooze.ApplyAuthorityAction(
+        1, recurring_uuid, 2, "snooze", when + 300, tomorrow));
+    assert(recurring_snooze.tasks().size() == 2);
+    assert(std::any_of(recurring_snooze.tasks().begin(), recurring_snooze.tasks().end(),
+        [&](const Task& task) {
+            return task.schedule_uuid == recurring_uuid && task.repeat == Repeat::kDaily &&
+                task.trigger_at == tomorrow;
+        }));
+    assert(std::any_of(recurring_snooze.tasks().begin(), recurring_snooze.tasks().end(),
+        [&](const Task& task) {
+            return task.schedule_uuid == recurring_uuid && task.repeat == Repeat::kOnce &&
+                task.trigger_at == when + 300;
+        }));
+}
+
+void TestSnoozeKeepsAuthorityIdentityDirty() {
+    const auto when = At(2026, 8, 14, 12);
+    Manager manager;
+    auto task = Add(manager, Kind::kReminder, Repeat::kOnce, when);
+    assert(manager.BindAuthority(task.id,
+        "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995", 4));
+    const auto source = *manager.Find(task.id);
+    const auto snoozed = manager.Snooze(source, 5, when);
+    assert(snoozed.source_schedule_id == source.source_schedule_id);
+    assert(snoozed.schedule_uuid == source.schedule_uuid);
+    assert(snoozed.schedule_version == source.schedule_version);
+    assert(snoozed.sync_state == SyncState::kDirty);
+}
+
+void TestRemoteSourceIdCannotBindOrRemoveLocalTask() {
+    const auto when = At(2026, 8, 14, 13);
+    Manager manager;
+    auto local = Add(manager, Kind::kReminder, Repeat::kOnce, when);
+    AuthorityTask remote;
+    remote.revision = 1;
+    remote.schedule_uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995";
+    remote.source_schedule_id = local.source_schedule_id;
+    remote.kind = Kind::kAlarm;
+    remote.repeat = Repeat::kOnce;
+    remote.label = "其他音箱任务";
+    remote.trigger_at = when + 60;
+    remote.version = 1;
+    remote.local_source = false;
+    assert(manager.ApplyAuthorityChanges(1, {remote}).changed);
+    assert(manager.tasks().size() == 2);
+    assert(manager.Find(local.id)->schedule_uuid.empty());
+
+    AlertQueue queue;
+    queue.Enqueue(*manager.Find(local.id));
+    assert(queue.Remove(remote.schedule_uuid, remote.source_schedule_id, false) == 0);
+    assert(queue.StartNext()->id == local.id);
+}
+
+void TestOccurrenceOutboxBackpressureAndTerminalCleanup() {
+    const auto when = At(2026, 8, 14, 14);
+    Task due{1, Kind::kAlarm, Repeat::kOnce, "不能丢的闹铃", when, {}, "", ""};
+    due.source_schedule_id = "1";
+    std::vector<PendingOccurrence> full;
+    for (uint32_t id = 10; id < 10 + Manager::kMaxPendingOccurrences; ++id) {
+        full.push_back({id, std::to_string(id), "", Kind::kReminder, "离线提醒", "", "",
+                        when - static_cast<std::time_t>(id)});
+    }
+    Manager manager;
+    manager.Restore({due}, 2, full);
+    auto blocked = manager.Tick(when, true);
+    assert(!blocked.occurrence_outbox_full);
+    assert(blocked.triggered.size() == 1);
+    assert(manager.Find(1) == nullptr);
+    assert(manager.pending_occurrences().size() == Manager::kMaxPendingOccurrences);
+    assert(manager.overflow_occurrences().size() == 1);
+
+    assert(manager.AcknowledgeOccurrence("", 10, when));
+    assert(manager.overflow_occurrences().empty());
+
+    Manager cleanup;
+    auto task = Add(cleanup, Kind::kReminder, Repeat::kOnce, when + 100);
+    assert(cleanup.BindAuthority(task.id,
+        "b79cecd0-1c67-47db-a676-fffc37e24f17", 1));
+    cleanup.Tick(when, true);
+    auto triggered = cleanup.Tick(when + 100, true);
+    assert(triggered.triggered.size() == 1 && cleanup.pending_occurrences().size() == 1);
+    assert(cleanup.ApplyAuthorityAction(
+        1, "b79cecd0-1c67-47db-a676-fffc37e24f17", 2, "complete", 0, 0));
+    assert(cleanup.pending_occurrences().empty());
+}
+
+void TestPagedFullSnapshotOnlyReconcilesOnFinalPage() {
+    const auto when = At(2026, 8, 14, 15);
+    Manager manager;
+    auto absent = Add(manager, Kind::kAlarm, Repeat::kOnce, when);
+    const std::string absent_uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995";
+    assert(manager.BindAuthority(absent.id, absent_uuid, 1));
+    auto local_pending = Add(manager, Kind::kReminder, Repeat::kOnce, when + 60);
+
+    AuthorityTask first;
+    first.revision = 1;
+    first.schedule_uuid = "b79cecd0-1c67-47db-a676-fffc37e24f17";
+    first.source_schedule_id = "81";
+    first.kind = Kind::kReminder;
+    first.repeat = Repeat::kOnce;
+    first.label = "第一页";
+    first.trigger_at = when + 120;
+    first.version = 1;
+    auto page_one = manager.ApplyAuthorityChanges(1, {first}, true, true);
+    assert(page_one.changed && page_one.removed_local_ids.empty());
+    assert(manager.full_snapshot_in_progress());
+    assert(manager.FindByScheduleUuid(absent_uuid) != nullptr);
+
+    Manager restored;
+    restored.Restore(manager.tasks(), manager.next_id(), manager.pending_occurrences(),
+                     manager.snapshot_revision(), manager.action_revision(),
+                     manager.full_snapshot_in_progress(),
+                     manager.full_snapshot_seen_uuids(),
+                     manager.full_snapshot_staged_tasks());
+    assert(restored.full_snapshot_in_progress());
+    assert(restored.full_snapshot_seen_uuids().size() == 1);
+
+    AuthorityTask second = first;
+    second.revision = 2;
+    second.schedule_uuid = "d2719f87-5bc2-40c9-8978-c3904334019a";
+    second.source_schedule_id = "82";
+    second.label = "末页";
+    auto page_two = restored.ApplyAuthorityChanges(2, {second}, false, false);
+    assert(page_two.changed);
+    assert(!restored.full_snapshot_in_progress());
+    assert(restored.full_snapshot_seen_uuids().empty());
+    assert(restored.FindByScheduleUuid(absent_uuid) == nullptr);
+    assert(restored.Find(local_pending.id) != nullptr);
+    assert(restored.FindByScheduleUuid(first.schedule_uuid) != nullptr);
+    assert(restored.FindByScheduleUuid(second.schedule_uuid) != nullptr);
+}
+
+void TestEmptyFullSnapshotDropsOldAccountButKeepsLocalPending() {
+    const auto when = At(2026, 8, 14, 16);
+    Manager manager;
+    auto old_account = Add(manager, Kind::kAlarm, Repeat::kOnce, when);
+    assert(manager.BindAuthority(old_account.id,
+        "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995", 1));
+    auto local_pending = Add(manager, Kind::kReminder, Repeat::kOnce, when + 60);
+
+    auto result = manager.ApplyAuthorityChanges(0, {}, true, false);
+    assert(result.changed && result.removed_local_ids.size() == 1);
+    assert(manager.Find(old_account.id) == nullptr);
+    assert(manager.Find(local_pending.id) != nullptr);
+    assert(manager.snapshot_revision() == 0);
+}
+
+void TestFailedFullSnapshotPageDoesNotPartiallyClean() {
+    const auto when = At(2026, 8, 14, 17);
+    Manager manager;
+    auto retained = Add(manager, Kind::kAlarm, Repeat::kOnce, when);
+    const std::string retained_uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995";
+    assert(manager.BindAuthority(retained.id, retained_uuid, 1));
+    for (size_t i = manager.tasks().size(); i < Manager::kMaxTasks; ++i) {
+        Add(manager, Kind::kReminder, Repeat::kOnce,
+            when + static_cast<std::time_t>(i + 1) * 60);
+    }
+
+    AuthorityTask seen;
+    seen.revision = 1;
+    seen.schedule_uuid = retained_uuid;
+    seen.source_schedule_id = retained.source_schedule_id;
+    seen.kind = Kind::kAlarm;
+    seen.repeat = Repeat::kOnce;
+    seen.label = retained.label;
+    seen.trigger_at = retained.trigger_at;
+    seen.version = 1;
+    seen.local_source = true;
+    assert(manager.ApplyAuthorityChanges(1, {seen}, true, true).changed);
+    const auto before_tasks = manager.tasks();
+    const auto before_seen = manager.full_snapshot_seen_uuids();
+
+    AuthorityTask overflow = seen;
+    overflow.revision = 2;
+    overflow.schedule_uuid = "b79cecd0-1c67-47db-a676-fffc37e24f17";
+    overflow.source_schedule_id = "99";
+    overflow.local_source = false;
+    bool rejected = false;
+    try {
+        manager.ApplyAuthorityChanges(2, {overflow}, false, false);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    assert(rejected);
+    assert(manager.tasks().size() == before_tasks.size());
+    assert(manager.FindByScheduleUuid(retained_uuid) != nullptr);
+    assert(manager.full_snapshot_in_progress());
+    assert(manager.snapshot_revision() == 1);
+    assert(manager.full_snapshot_seen_uuids() == before_seen);
+}
+
+void TestFullSnapshotCanReplaceFullOldAccount() {
+    const auto when = At(2026, 8, 14, 18);
+    Manager manager;
+    for (size_t i = 0; i < Manager::kMaxTasks; ++i) {
+        auto old = Add(manager, Kind::kReminder, Repeat::kOnce,
+                       when + static_cast<std::time_t>(i) * 60);
+        char uuid[37];
+        snprintf(uuid, sizeof(uuid), "00000000-0000-4000-8000-%012zx", i + 1);
+        assert(manager.BindAuthority(old.id, uuid, 1));
+    }
+    AuthorityTask replacement;
+    replacement.revision = 1;
+    replacement.schedule_uuid = "4d8b9aec-1e54-4d3e-a9f4-c37a7f21c995";
+    replacement.source_schedule_id = "901";
+    replacement.kind = Kind::kAlarm;
+    replacement.repeat = Repeat::kOnce;
+    replacement.label = "新账号闹铃";
+    replacement.trigger_at = when + 3600;
+    replacement.version = 1;
+    auto result = manager.ApplyAuthorityChanges(1, {replacement}, true, false);
+    assert(result.changed && result.removed_local_ids.size() == Manager::kMaxTasks);
+    assert(manager.tasks().size() == 1);
+    assert(manager.FindByScheduleUuid(replacement.schedule_uuid) != nullptr);
+}
+
+void TestOccurrenceOverflowStillRingsAndSurvivesRestart() {
+    const auto when = At(2026, 8, 14, 19);
+    Task due{1, Kind::kBriefing, Repeat::kOnce, "溢出简报仍响", when, {},
+             "weather,news", "广州"};
+    due.source_schedule_id = "1";
+    std::vector<PendingOccurrence> full;
+    for (uint32_t id = 100; id < 100 + Manager::kMaxPendingOccurrences; ++id) {
+        full.push_back({id, std::to_string(id), "", Kind::kReminder, "待补报", "", "",
+                        when - static_cast<std::time_t>(id)});
+    }
+    Manager manager;
+    manager.Restore({due}, 2, full);
+    auto triggered = manager.Tick(when, true);
+    assert(triggered.triggered.size() == 1);
+    assert(!triggered.occurrence_outbox_full);
+    assert(manager.tasks().empty());
+    assert(manager.overflow_occurrences().size() == 1);
+
+    Manager restored;
+    restored.Restore(manager.tasks(), manager.next_id(), manager.pending_occurrences(),
+                     manager.snapshot_revision(), manager.action_revision(), false, {}, {},
+                     manager.overflow_occurrences());
+    assert(restored.Tick(when + 1, true).triggered.empty());
+    assert(restored.AcknowledgeOccurrence("", 100, when));
+    assert(restored.overflow_occurrences().empty());
+    assert(restored.pending_occurrences().size() == Manager::kMaxPendingOccurrences);
+    const auto promoted = std::find_if(restored.pending_occurrences().begin(),
+        restored.pending_occurrences().end(), [](const auto& occurrence) {
+            return occurrence.local_id == 1;
+        });
+    assert(promoted != restored.pending_occurrences().end());
+    assert(promoted->kind == Kind::kBriefing);
+    assert(promoted->sections == "weather,news" && promoted->location == "广州");
+}
+
 int main() {
     setenv("TZ", "UTC", 1);
     tzset();
@@ -345,5 +749,17 @@ int main() {
     TestReminderDeliverySequence();
     TestBriefingValidationAndFilter();
     TestRepeatingSuggestionUsesRealTasks();
+    TestSharedScheduleMetadataAndLegacyMigration();
+    TestOfflineOccurrenceOutboxAndAuthorityAck();
+    TestCompleteAuthoritySnapshotReconciliation();
+    TestAuthorityActionIsIdempotentAndSnoozesTriggeredTask();
+    TestSnoozeKeepsAuthorityIdentityDirty();
+    TestRemoteSourceIdCannotBindOrRemoveLocalTask();
+    TestOccurrenceOutboxBackpressureAndTerminalCleanup();
+    TestPagedFullSnapshotOnlyReconcilesOnFinalPage();
+    TestEmptyFullSnapshotDropsOldAccountButKeepsLocalPending();
+    TestFailedFullSnapshotPageDoesNotPartiallyClean();
+    TestFullSnapshotCanReplaceFullOldAccount();
+    TestOccurrenceOverflowStillRingsAndSurvivesRestart();
     return 0;
 }
